@@ -18,3 +18,12 @@ __pycache__/
 .vscode/
 *.swp
 .DS_Store
+
+# AI assistant / agent tooling
+.claude/
+.codex/
+.cursor/
+.aider*
+.continue/
+.windsurf/
+.gemini/
