@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BFM Viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; font-family: -apple-system, sans-serif; background: #1c1c1f; color: #ddd; }
+  #app       { display: flex; height: 100vh; }
+  #canvas    { flex: 1; background: #111; }
+  #panel     { width: 320px; overflow-y: auto; padding: 14px 16px; box-sizing: border-box; background: #222; }
+  h2         { margin: 18px 0 8px; font-size: 13px; text-transform: uppercase; color: #888; letter-spacing: .07em; }
+  h1         { margin: 0 0 4px; font-size: 16px; }
+  .row       { display: grid; grid-template-columns: 36px 1fr 42px; gap: 8px; align-items: center; margin: 2px 0; font-size: 12px; }
+  .row span  { color: #888; }
+  .row .val  { text-align: right; color: #4a9eff; font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; accent-color: #4a9eff; }
+  button     { background: #333; border: 1px solid #444; color: #eee; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  button:hover { background: #3a3a3a; }
+  #status    { color: #6f6; font-size: 11px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="canvas"></div>
+  <div id="panel">
+    <h1>BFM Viewer</h1>
+    <div id="status">loading…</div>
+    <div style="margin-top: 10px;">
+      <button id="reset">Reset all to 0</button>
+      <button id="random">Randomize</button>
+    </div>
+    <h2>Identity (α)</h2>     <div id="alpha"></div>
+    <h2>Expression (δ)</h2>   <div id="delta"></div>
+    <h2>Albedo (β)</h2>       <div id="beta"></div>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+// ── three.js scene ────────────────────────────────────────────────────────
+const container = document.getElementById("canvas");
+const renderer  = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(container.clientWidth, container.clientHeight);
+container.appendChild(renderer.domElement);
+
+const scene  = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(35, container.clientWidth / container.clientHeight, 1, 5000);
+camera.position.set(0, 0, 600);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+dirLight.position.set(1, 1, 2);
+scene.add(dirLight);
+
+const material = new THREE.MeshStandardMaterial({
+  vertexColors: true, flatShading: false, roughness: 0.7, metalness: 0.0,
+});
+const geometry = new THREE.BufferGeometry();
+const mesh     = new THREE.Mesh(geometry, material);
+scene.add(mesh);
+
+window.addEventListener("resize", () => {
+  renderer.setSize(container.clientWidth, container.clientHeight);
+  camera.aspect = container.clientWidth / container.clientHeight;
+  camera.updateProjectionMatrix();
+});
+
+(function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+})();
+
+// ── Sliders & API ─────────────────────────────────────────────────────────
+// state holds the latest slider values; dirty flags track which channel needs
+// to be refetched. One in-flight request per channel; if changes pile up while
+// a request is in flight, we just keep the latest values and fire one more
+// when it completes — old/stale requests are never sent.
+const state = { alpha: [], delta: [], beta: [] };
+let dirtyGeom = false, dirtyColor = false;
+let busyGeom  = false, busyColor  = false;
+
+// ALPHA and DELTA both affect vertex positions; BETA affects colors.
+const GEOM_CHANNELS  = new Set(["alpha", "delta"]);
+const COLOR_CHANNELS = new Set(["beta"]);
+
+function makeSliders(name, count, parentId) {
+  const parent = document.getElementById(parentId);
+  parent.innerHTML = "";
+  state[name] = new Array(count).fill(0);
+  for (let i = 0; i < count; ++i) {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `<span>${i}</span>
+                     <input type="range" min="-3" max="3" step="0.05" value="0" data-i="${i}">
+                     <span class="val">0.00</span>`;
+    parent.appendChild(row);
+    const slider = row.querySelector("input");
+    const valEl  = row.querySelector(".val");
+    slider.addEventListener("input", e => {
+      const v = parseFloat(e.target.value);
+      state[name][i] = v;
+      valEl.textContent = v.toFixed(2);
+      markDirty(name);
+    });
+  }
+}
+
+function markDirty(channel) {
+  if (GEOM_CHANNELS.has(channel))  { dirtyGeom = true;  pumpGeom();  }
+  if (COLOR_CHANNELS.has(channel)) { dirtyColor = true; pumpColor(); }
+}
+
+// Pre-allocated typed-array views are reused so we don't churn the GC.
+let posAttr = null, colAttr = null;
+
+async function pumpGeom() {
+  if (busyGeom || !dirtyGeom) return;
+  busyGeom = true;
+  while (dirtyGeom) {
+    dirtyGeom = false;
+    const t0 = performance.now();
+    const buf = await fetchBinary("/api/vertices", { alpha: state.alpha, delta: state.delta });
+    const arr = new Float32Array(buf);
+    if (!posAttr) {
+      posAttr = new THREE.BufferAttribute(arr, 3);
+      geometry.setAttribute("position", posAttr);
+    } else {
+      posAttr.array.set(arr);
+      posAttr.needsUpdate = true;
+    }
+    geometry.computeVertexNormals();
+    setStatus(`vertices · ${(performance.now() - t0).toFixed(0)} ms`);
+  }
+  busyGeom = false;
+}
+
+async function pumpColor() {
+  if (busyColor || !dirtyColor) return;
+  busyColor = true;
+  while (dirtyColor) {
+    dirtyColor = false;
+    const t0 = performance.now();
+    const buf = await fetchBinary("/api/colors", { beta: state.beta });
+    const arr = new Float32Array(buf);
+    if (!colAttr) {
+      colAttr = new THREE.BufferAttribute(arr, 3);
+      geometry.setAttribute("color", colAttr);
+    } else {
+      colAttr.array.set(arr);
+      colAttr.needsUpdate = true;
+    }
+    setStatus(`colors · ${(performance.now() - t0).toFixed(0)} ms`);
+  }
+  busyColor = false;
+}
+
+async function fetchBinary(url, body) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return await r.arrayBuffer();
+}
+
+function setStatus(text) {
+  document.getElementById("status").textContent = text;
+}
+
+function resetAll() {
+  for (const name of ["alpha", "delta", "beta"]) {
+    state[name].fill(0);
+    document.querySelectorAll(`#${name} input`).forEach((s) => {
+      s.value = 0;
+      s.parentElement.querySelector(".val").textContent = "0.00";
+    });
+  }
+  dirtyGeom = dirtyColor = true;
+  pumpGeom(); pumpColor();
+}
+
+function randomizeAll() {
+  for (const name of ["alpha", "delta", "beta"]) {
+    document.querySelectorAll(`#${name} input`).forEach((s, i) => {
+      const v = (Math.random() * 2 - 1) * 1.5;
+      s.value = v;
+      s.parentElement.querySelector(".val").textContent = v.toFixed(2);
+      state[name][i] = v;
+    });
+  }
+  dirtyGeom = dirtyColor = true;
+  pumpGeom(); pumpColor();
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────
+(async () => {
+  const init = await (await fetch("/api/init")).json();
+  document.getElementById("status").textContent =
+    `${init.n_vertices.toLocaleString()} vertices · ${init.n_triangles.toLocaleString()} triangles · K=(${init.k_id}, ${init.k_exp}, ${init.k_alb})`;
+
+  // Triangle indices are static; set them once.
+  geometry.setIndex(init.triangles);
+
+  makeSliders("alpha", init.n_alpha, "alpha");
+  makeSliders("delta", init.n_delta, "delta");
+  makeSliders("beta",  init.n_beta,  "beta");
+
+  document.getElementById("reset").addEventListener("click", resetAll);
+  document.getElementById("random").addEventListener("click", randomizeAll);
+
+  // Initial fetch — both channels in parallel.
+  dirtyGeom = dirtyColor = true;
+  await Promise.all([pumpGeom(), pumpColor()]);
+
+  // Fit camera to the mean face (BFM is in mm, ~200 mm tall)
+  geometry.computeBoundingBox();
+  const c = new THREE.Vector3();
+  geometry.boundingBox.getCenter(c);
+  controls.target.copy(c);
+  camera.position.set(c.x, c.y, c.z + 600);
+  controls.update();
+})();
+</script>
+</body>
+</html>
