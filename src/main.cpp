@@ -42,6 +42,7 @@ int main(int argc, char** argv)
 
     // ---- BFM: load + generate faces ----
     BFMLoader bfm(model);
+    bfm.summariseBFM(model);                         // full overview of the .h5 contents
     Eigen::MatrixX3f meanV  = bfm.mean_shape();
     Eigen::MatrixX3f albedo = bfm.albedo();          // mean per-vertex colour (no beta yet)
     std::cout << "BFM: " << meanV.rows() << " vertices, " << bfm.faces().rows() << " triangles\n";
