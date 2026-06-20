@@ -46,7 +46,7 @@ CXXFLAGS = $(STD) $(OPT) $(WARN) -Iinclude $(HIGHFIVE_INC) $(PKG_CFLAGS) $(HDF5_
 LDLIBS   = $(PKG_LIBS) $(HDF5_LIBS)
 
 # ---- sources ----------------------------------------------------------------
-SRCS = src/main.cpp src/BFMLoader.cpp src/PandoraLoader.cpp src/IPhoneLoader.cpp
+SRCS = src/main.cpp src/BFMLoader.cpp src/PandoraLoader.cpp src/IPhoneLoader.cpp src/render/Renderer.cpp src/render/ProjectionUtils.cpp src/render/Lighting.cpp
 HDRS = $(wildcard include/*.h)
 BIN  = build/face_recon
 
@@ -61,7 +61,7 @@ $(BIN): $(SRCS) $(HDRS) | $(HIGHFIVE_DIR)
 	$(CXX) $(CXXFLAGS) $(SRCS) -o $@ $(LDLIBS)
 
 run: $(BIN)
-	./$(BIN) --images $(NUM_IMAGES) --rgbd $(RGBD)
+	./$(BIN)
 
 # fetch the header-only HighFive once (needs git + network; ~one-time)
 $(HIGHFIVE_DIR):

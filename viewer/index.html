@@ -29,6 +29,20 @@
       <button id="reset">Reset all to 0</button>
       <button id="random">Randomize</button>
     </div>
+    <div style="margin-top: 8px; font-size: 12px;">
+      <label>Mesh source:
+        <select id="meshSource" style="width: 100%; margin-top: 4px;
+                background:#222; color:#ddd; border:1px solid #444;
+                padding:3px;">
+          <option value="">Live BFM (sliders)</option>
+        </select>
+      </label>
+    </div>
+    <div id="colorModeWrap" style="margin-top:6px; font-size:12px; opacity:0.4;">
+      Snapshot colour:
+      <label style="margin-left:6px;"><input type="radio" name="colorMode" value="albedo" checked> albedo</label>
+      <label style="margin-left:6px;"><input type="radio" name="colorMode" value="normals" disabled> normals</label>
+    </div>
     <h2>Identity (α)</h2>     <div id="alpha"></div>
     <h2>Expression (δ)</h2>   <div id="delta"></div>
     <h2>Albedo (β)</h2>       <div id="beta"></div>
@@ -96,6 +110,13 @@ let busyGeom  = false, busyColor  = false;
 const GEOM_CHANNELS  = new Set(["alpha", "delta"]);
 const COLOR_CHANNELS = new Set(["beta"]);
 
+// "" = Live BFM (sliders drive everything); otherwise the .obj filename
+// chosen from the dropdown — sliders are ignored, geometry & colors come
+// from /api/snapshot.
+let snapshotName    = "";
+let snapshotHasNormals = false;     // updated when a snapshot is loaded
+let snapshotColorMode  = "albedo";  // "albedo" or "normals"
+
 function makeSliders(name, count, parentId) {
   const parent = document.getElementById(parentId);
   parent.innerHTML = "";
@@ -119,6 +140,8 @@ function makeSliders(name, count, parentId) {
 }
 
 function markDirty(channel) {
+  // In snapshot mode sliders don't drive anything.
+  if (snapshotName) return;
   if (GEOM_CHANNELS.has(channel))  { dirtyGeom = true;  pumpGeom();  }
   if (COLOR_CHANNELS.has(channel)) { dirtyColor = true; pumpColor(); }
 }
@@ -132,9 +155,14 @@ async function pumpGeom() {
   while (dirtyGeom) {
     dirtyGeom = false;
     const t0 = performance.now();
-    const buf = await fetchBinary("/api/vertices", { alpha: state.alpha, delta: state.delta });
+    const url = snapshotName
+      ? `/api/snapshot/vertices?name=${encodeURIComponent(snapshotName)}`
+      : "/api/vertices";
+    const buf = snapshotName
+      ? await (await fetch(url)).arrayBuffer()
+      : await fetchBinary(url, { alpha: state.alpha, delta: state.delta });
     const arr = new Float32Array(buf);
-    if (!posAttr) {
+    if (!posAttr || posAttr.array.length !== arr.length) {
       posAttr = new THREE.BufferAttribute(arr, 3);
       geometry.setAttribute("position", posAttr);
     } else {
@@ -153,16 +181,37 @@ async function pumpColor() {
   while (dirtyColor) {
     dirtyColor = false;
     const t0 = performance.now();
-    const buf = await fetchBinary("/api/colors", { beta: state.beta });
-    const arr = new Float32Array(buf);
-    if (!colAttr) {
+    let arr;
+    if (snapshotName) {
+      // Snapshot mode: pick the endpoint based on colour mode.
+      const useNormals = (snapshotColorMode === "normals" && snapshotHasNormals);
+      const url = useNormals
+        ? `/api/snapshot/normals?name=${encodeURIComponent(snapshotName)}`
+        : `/api/snapshot/colors?name=${encodeURIComponent(snapshotName)}`;
+      const buf = await (await fetch(url)).arrayBuffer();
+      if (useNormals) {
+        // Map unit normal (-1..1) → RGB (0..1) for vertexColors.
+        const n = new Float32Array(buf);
+        arr = new Float32Array(n.length);
+        for (let i = 0; i < n.length; ++i) arr[i] = 0.5 * (n[i] + 1.0);
+      } else {
+        arr = new Float32Array(buf);
+      }
+    } else {
+      // Live BFM: β slider drives it.
+      const buf = await fetchBinary("/api/colors", { beta: state.beta });
+      arr = new Float32Array(buf);
+    }
+    if (!colAttr || colAttr.array.length !== arr.length) {
       colAttr = new THREE.BufferAttribute(arr, 3);
       geometry.setAttribute("color", colAttr);
     } else {
       colAttr.array.set(arr);
       colAttr.needsUpdate = true;
     }
-    setStatus(`colors · ${(performance.now() - t0).toFixed(0)} ms`);
+    const label = (snapshotName && snapshotColorMode === "normals" && snapshotHasNormals)
+                  ? "normals" : "colors";
+    setStatus(`${label} · ${(performance.now() - t0).toFixed(0)} ms`);
   }
   busyColor = false;
 }
@@ -211,8 +260,10 @@ function randomizeAll() {
   document.getElementById("status").textContent =
     `${init.n_vertices.toLocaleString()} vertices · ${init.n_triangles.toLocaleString()} triangles · K=(${init.k_id}, ${init.k_exp}, ${init.k_alb})`;
 
-  // Triangle indices are static; set them once.
-  geometry.setIndex(init.triangles);
+  // BFM triangle indices — kept around so we can restore them after viewing
+  // a snapshot that overrode the index buffer with its own topology.
+  var bfmTriangles = init.triangles;
+  geometry.setIndex(bfmTriangles);
 
   makeSliders("alpha", init.n_alpha, "alpha");
   makeSliders("delta", init.n_delta, "delta");
@@ -220,6 +271,67 @@ function randomizeAll() {
 
   document.getElementById("reset").addEventListener("click", resetAll);
   document.getElementById("random").addEventListener("click", randomizeAll);
+
+  // ── snapshot dropdown ────────────────────────────────────────────────────
+  const select = document.getElementById("meshSource");
+  async function refreshSnapshotList() {
+    const list = await (await fetch("/api/snapshots")).json();
+    // remove all options except the live one (index 0)
+    while (select.options.length > 1) select.remove(1);
+    for (const s of list) {
+      const opt = document.createElement("option");
+      opt.value = s.name;
+      opt.textContent = `${s.name}  (${(s.bytes / 1024).toFixed(0)} KB)`;
+      select.appendChild(opt);
+    }
+  }
+  await refreshSnapshotList();
+
+  async function switchTo(name) {
+    snapshotName = name;
+    const sliderInputs = document.querySelectorAll("#alpha input, #delta input, #beta input");
+    sliderInputs.forEach(i => i.disabled = !!name);
+
+    if (name) {
+      // Snapshot mode: load its topology + flags, then vertices + colors.
+      const meta = await (await fetch(
+        `/api/snapshot?name=${encodeURIComponent(name)}`)).json();
+      if (meta.error) { setStatus(meta.error); return; }
+      geometry.setIndex(meta.triangles);
+      snapshotHasNormals = !!meta.has_normals;
+    } else {
+      // Back to live BFM: restore the BFM topology that was set at boot.
+      geometry.setIndex(bfmTriangles);
+      snapshotHasNormals = false;
+    }
+    updateColorModeUI();
+    dirtyGeom = dirtyColor = true;
+    await Promise.all([pumpGeom(), pumpColor()]);
+  }
+  select.addEventListener("change", e => switchTo(e.target.value));
+
+  // ── colour-mode radio (only meaningful for snapshots with normals) ───────
+  const colorModeWrap   = document.getElementById("colorModeWrap");
+  const normalsRadio    = document.querySelector('input[name="colorMode"][value="normals"]');
+  const albedoRadio     = document.querySelector('input[name="colorMode"][value="albedo"]');
+
+  function updateColorModeUI() {
+    const enabled = !!snapshotName && snapshotHasNormals;
+    colorModeWrap.style.opacity = enabled ? "1.0" : "0.4";
+    normalsRadio.disabled = !enabled;
+    if (!enabled) {
+      albedoRadio.checked = true;
+      snapshotColorMode = "albedo";
+    }
+  }
+  for (const r of document.querySelectorAll('input[name="colorMode"]')) {
+    r.addEventListener("change", e => {
+      snapshotColorMode = e.target.value;
+      dirtyColor = true;
+      pumpColor();
+    });
+  }
+  updateColorModeUI();
 
   // Initial fetch — both channels in parallel.
   dirtyGeom = dirtyColor = true;
