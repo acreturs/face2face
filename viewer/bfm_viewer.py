@@ -69,6 +69,7 @@ class BFM:
         return c.astype(np.float32, copy=False).tobytes()
 
 
+
 # ── Flask app ────────────────────────────────────────────────────────────────
 
 app = Flask(__name__, static_folder=None)
@@ -123,6 +124,129 @@ def colors():
     """Slider change in β → fresh per-vertex colors (binary float32)."""
     beta = _coef("beta")
     return Response(bfm.colors_bytes(beta), mimetype=OCTET)
+
+
+# ── Snapshot loader ──────────────────────────────────────────────────────────
+# A "snapshot" is a saved mesh on disk: a .obj file with vertex colours, in the
+# extended format `v x y z r g b` + `f i0 i1 i2` (1-indexed). The C++ pipeline
+# already writes these via writeObj(). Anything in data/snapshots/ (or data/out/)
+# is offered to the viewer as an alternate mesh source via the dropdown.
+
+SNAPSHOT_DIRS = [Path("data/snapshots"), Path("data/out")]
+
+
+def _load_obj(path: Path) -> dict:
+    """Parse extended .obj — supports vertex colours, normals, and faces with
+    optional normal indices.
+
+        v  x y z [r g b]
+        vn nx ny nz
+        f  v|v//vn|v/vt|v/vt/vn (×3)   (1-indexed)
+    """
+    verts, cols, norms, faces = [], [], [], []
+    with open(path) as f:
+        for line in f:
+            if len(line) < 2:
+                continue
+            if line[0] == "v" and line[1].isspace():
+                parts = line.split()
+                verts.append([float(parts[1]), float(parts[2]), float(parts[3])])
+                if len(parts) >= 7:
+                    cols.append([float(parts[4]), float(parts[5]), float(parts[6])])
+            elif line[0] == "v" and line[1] == "n":
+                parts = line.split()
+                norms.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            elif line[0] == "f" and line[1].isspace():
+                ids = [int(p.split("/")[0]) - 1 for p in line.split()[1:4]]
+                faces.append(ids)
+
+    V = np.asarray(verts, dtype=np.float32)
+    F = np.asarray(faces, dtype=np.int32)
+    C = (np.asarray(cols, dtype=np.float32)
+         if cols else np.full_like(V, 0.7))
+    N = np.asarray(norms, dtype=np.float32) if norms else None
+    return {
+        "vertices":  V,
+        "triangles": F,
+        "colors":    np.clip(C, 0.0, 1.0),
+        "normals":   N,   # may be None
+    }
+
+
+def _list_snapshots() -> list[dict]:
+    out = []
+    for d in SNAPSHOT_DIRS:
+        if not d.exists():
+            continue
+        for p in sorted(d.glob("*.obj")):
+            try:
+                size = p.stat().st_size
+                out.append({"name": p.name, "path": str(p), "bytes": size})
+            except OSError:
+                pass
+    return out
+
+
+def _find_snapshot(name: str) -> Path | None:
+    for s in _list_snapshots():
+        if s["name"] == name:
+            return Path(s["path"])
+    return None
+
+
+@app.route("/api/snapshots")
+def snapshots():
+    """List available .obj files in data/snapshots/ and data/out/."""
+    return jsonify(_list_snapshots())
+
+
+@app.route("/api/snapshot")
+def snapshot():
+    """One-shot payload for a named snapshot: triangles + flags."""
+    name = request.args.get("name", "")
+    p = _find_snapshot(name)
+    if p is None:
+        return jsonify({"error": f"snapshot not found: {name}"}), 404
+    m = _load_obj(p)
+    return jsonify({
+        "n_vertices":  int(m["vertices"].shape[0]),
+        "n_triangles": int(m["triangles"].shape[0]),
+        "triangles":   m["triangles"].flatten().tolist(),
+        "has_normals": m["normals"] is not None,
+    })
+
+
+@app.route("/api/snapshot/vertices")
+def snapshot_vertices():
+    """Binary float32 vertices for a named snapshot."""
+    name = request.args.get("name", "")
+    p = _find_snapshot(name)
+    if p is None:
+        return Response(b"", status=404, mimetype=OCTET)
+    return Response(_load_obj(p)["vertices"].tobytes(), mimetype=OCTET)
+
+
+@app.route("/api/snapshot/colors")
+def snapshot_colors():
+    """Binary float32 per-vertex colors for a named snapshot."""
+    name = request.args.get("name", "")
+    p = _find_snapshot(name)
+    if p is None:
+        return Response(b"", status=404, mimetype=OCTET)
+    return Response(_load_obj(p)["colors"].tobytes(), mimetype=OCTET)
+
+
+@app.route("/api/snapshot/normals")
+def snapshot_normals():
+    """Binary float32 per-vertex normals (when present in the .obj)."""
+    name = request.args.get("name", "")
+    p = _find_snapshot(name)
+    if p is None:
+        return Response(b"", status=404, mimetype=OCTET)
+    n = _load_obj(p)["normals"]
+    if n is None:
+        return Response(b"", status=404, mimetype=OCTET)
+    return Response(n.tobytes(), mimetype=OCTET)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
