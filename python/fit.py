@@ -35,9 +35,12 @@ def axis_angle_to_R(r):
 
 
 class Fitter:
-    def __init__(self, bfm, n_shape=30, reg=2.0, n_model_pts=6000):
+    def __init__(self, bfm, n_shape=30, reg=2.0, n_model_pts=6000,
+                 sparse_landmark_weight=1.8):
         self.n_shape = n_shape
         self.reg = reg
+        self.sparse_landmark_weight = sparse_landmark_weight
+        self.bfm = bfm
 
         # Subsample the model vertices for speed (full mesh = 53k vertices).
         stride = max(1, bfm.n_vertices // n_model_pts)
@@ -64,47 +67,114 @@ class Fitter:
         s = np.exp(p[6])
         return (s * (R @ (self.R_init @ V.T))).T + p[3:6]
 
+    # ---- apply the current pose transform to a set of 3D points ----------
+    def transform_points(self, pts, p):
+        R = axis_angle_to_R(p[:3])
+        s = np.exp(p[6])
+        return (s * (R @ (self.R_init @ (pts - self.c0).T))).T + p[3:6]
+
+    # ---- project camera-frame points into pixels ---------------------------
+    @staticmethod
+    def project(points, K):
+        X, Y, Z = points[:, 0], points[:, 1], points[:, 2]
+        Z_safe = np.maximum(Z, 1e-6)
+        u = K["fx"] * X / Z_safe + K["cx"]
+        v = -K["fy"] * Y / Z_safe + K["cy"]
+        return np.stack([u, v], axis=1)
+
     # ---- run the fit ---------------------------------------------------------
-    def fit(self, target, n_iters=12, trim_percentile=80):
+    def fit(self, target, K, landmark_2d=None, landmark_vertex_indices=None,
+            n_iters=12, trim_percentile=80, use_dense=True):
         target = np.asarray(target)
-        K = self.n_shape
+        K = {k: float(v) for k, v in dict(K).items()}
+        required = ("fx", "fy", "cx", "cy")
+        if not all(name in K for name in required):
+            raise ValueError("Intrinsics K must contain fx, fy, cx, cy")
 
-        # Initialise: translation = target centroid, scale = 1, no rotation, mean shape.
-        p = np.r_[0.0, 0.0, 0.0, target.mean(axis=0), 0.0, np.zeros(K)]
+        if landmark_2d is not None and landmark_vertex_indices is not None:
+            landmark_2d = np.asarray(landmark_2d, dtype=np.float64).reshape(-1, 2)
+            landmark_vertex_indices = np.asarray(landmark_vertex_indices, dtype=np.int32)
+            if landmark_2d.shape[0] != landmark_vertex_indices.shape[0]:
+                raise ValueError("landmark_2d and landmark_vertex_indices must have same length")
+        else:
+            landmark_2d = None
+            landmark_vertex_indices = None
 
-        # Plausible bounds keep the problem well-posed (this is what stops the
-        # model from ballooning or alpha from overfitting):
-        #   scale in [0.8, 1.3],  each alpha in [-3 sigma, +3 sigma].
-        lo = np.r_[[-np.pi] * 3, [-np.inf] * 3, np.log(0.8), [-3.0] * K]
-        hi = np.r_[[np.pi] * 3, [np.inf] * 3, np.log(1.3), [3.0] * K]
+        Kshape = self.n_shape
+        p = np.r_[0.0, 0.0, 0.0, target.mean(axis=0), 0.0, np.zeros(Kshape)]
+
+        lo = np.r_[[-np.pi] * 3, [-np.inf] * 3, np.log(0.8), [-3.0] * Kshape]
+        hi = np.r_[[np.pi] * 3, [np.inf] * 3, np.log(1.3), [3.0] * Kshape]
+
+        def compute_landmark_rmse(p_):
+            if landmark_2d is None:
+                return None
+            lm3d = self.bfm.shape(p_[7:])[landmark_vertex_indices]
+            lm3d = self.transform_points(lm3d, p_)
+            uv = self.project(lm3d, K)
+            return float(np.sqrt(np.mean(np.sum((uv - landmark_2d) ** 2, axis=1))))
+
+        initial_lm_rmse = compute_landmark_rmse(p)
+        if initial_lm_rmse is not None:
+            print(f"[fit] landmark RMSE before optimization: {initial_lm_rmse:.2f} px")
 
         print(f"[fit] target points: {len(target)},  params: {len(p)}")
         for it in range(n_iters):
-            # 1+2. correspondences: nearest model vertex per target point
             dist, idx = cKDTree(self.model_points(p)).query(target)
-
-            # robust ICP: drop the worst correspondences (neck / outliers)
             thresh = np.percentile(dist, trim_percentile)
             keep = dist <= thresh
             tgt, idx_k = target[keep], idx[keep]
 
-            # 3. Levenberg-Marquardt step with these fixed correspondences
-            def residual(p_):
-                mp = self.model_points(p_)[idx_k]
-                r_data = (mp - tgt).ravel()
-                r_reg = np.sqrt(self.reg) * p_[7:]   # E_reg: pull alpha towards 0
-                return np.concatenate([r_data, r_reg])
+            def r_data(p_):
+                model_pts = self.model_points(p_)
+                return (model_pts[idx_k] - tgt).ravel()
 
-            sol = least_squares(residual, p, method="trf", bounds=(lo, hi), max_nfev=200)
+            def r_lm(p_):
+                lm3d = self.bfm.shape(p_[7:])[landmark_vertex_indices]
+                lm3d = self.transform_points(lm3d, p_)
+                uv = self.project(lm3d, K)
+                return np.sqrt(self.sparse_landmark_weight) * (uv - landmark_2d).ravel()
+
+            def r_reg(p_):
+                return np.sqrt(self.reg) * p_[7:]
+
+            def residual(p_):
+                residual_blocks = []
+                if use_dense:
+                    residual_blocks.append(r_data(p_))
+                if landmark_2d is not None:
+                    residual_blocks.append(r_lm(p_))
+                residual_blocks.append(r_reg(p_))
+                return np.concatenate(residual_blocks)
+
+            sol = least_squares(residual, p, method="trf", bounds=(lo, hi),
+                                loss="soft_l1", f_scale=10.0, max_nfev=300)
+            if not sol.success:
+                print(f"[fit] optimizer warning: {sol.message}")
+                print(f"cost: {sol.cost:.4f}, "
+                      f"evaluations: {sol.nfev}, "
+                      f"optimality: {sol.optimality:.4e}")
             p = sol.x
 
-            rmse_mm = np.sqrt(np.mean(dist[keep] ** 2))   # mm, on kept points
-            ang = np.degrees(np.linalg.norm(p[:3]))
-            print(f"  iter {it:2d} | RMSE {rmse_mm:5.1f} mm | "
-                  f"scale {np.exp(p[6]):.3f} | rot {ang:5.1f} deg | "
-                  f"|alpha| {np.linalg.norm(p[7:]):5.2f}")
-        return p
+            if use_dense:
+                dist_after, _ = cKDTree(self.model_points(p)).query(target)
+                threshold_after = np.percentile(dist_after, trim_percentile)
+                keep_after = dist_after <= threshold_after
+                rmse_mm = np.sqrt(np.mean(dist_after[keep_after] ** 2))
+                rmse_mm_str = f"{rmse_mm:5.1f} mm"
+            else:
+                rmse_mm_str = "n/a"
 
+            lm_rmse = compute_landmark_rmse(p)
+            lm_str = f" | lm {lm_rmse:5.2f} px" if lm_rmse is not None else ""
+            ang = np.degrees(np.linalg.norm(p[:3]))
+            print(f"  iter {it:2d} | RMSE {rmse_mm_str} | "
+                  f"scale {np.exp(p[6]):.3f} | rot {ang:5.1f} deg | "
+                  f"|alpha| {np.linalg.norm(p[7:]):5.2f}{lm_str}")
+
+        if lm_rmse is not None:
+            print(f"[fit] final landmark RMSE: {lm_rmse:.2f} px")
+        return p
 
 def _extent(points):
     return float(np.linalg.norm(points.max(0) - points.min(0)))
