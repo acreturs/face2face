@@ -15,9 +15,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import yaml
 
+import cv2
+
 from bfm import BFM
-from dataset import PandoraFrame, backproject, crop_head, keep_front, head_center
+from dataset import PandoraFrame, backproject, crop_head, keep_front, head_center, rgb_at_depth_resolution
 from fit import Fitter
+from landmarks import (
+    create_landmark_detector,
+    detect_landmarks,
+    bfm_correspondences,
+    landmark_correspondence_pairs,
+    draw_landmark_labels,
+)
 from render import render, colorize_depth
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -50,11 +59,60 @@ def main():
     face_mm = face * 1000.0
     print(f"[data] face cloud: {len(face)} points around {np.round(center, 3)} m")
 
+    facemark = create_landmark_detector()
+    landmark_image = rgb_at_depth_resolution(frame)
+
+    faces = detect_landmarks(landmark_image,facemark,rgb=True,)   
+    if len(faces) == 0:
+        print("[landmarks] no face landmarks detected; continuing without sparse term")
+        landmark_2d = None
+        landmark_vertex_indices = None
+        correspondences = {}
+    else:
+        landmarks2d = faces[0]
+        correspondences = bfm_correspondences(bfm)
+        landmark_2d, landmark_vertex_indices = landmark_correspondence_pairs(
+            landmarks2d, correspondences)
+        print(f"[landmarks] using {len(landmark_2d)} sparse landmark constraints")
+
+    if len(faces) > 0 and not correspondences:
+        raise RuntimeError(
+            "No BFM landmark correspondences were resolved. "
+            "Check the BFM landmark metadata parser and names.")
+
+    out_dir = os.path.join(ROOT, cfg["output"]["dir"])
+    os.makedirs(out_dir, exist_ok=True)
+
     # 4. fit the parameters (analysis-by-synthesis loop)
     fitter = Fitter(bfm,
                     n_shape=cfg["fit"]["n_shape_coeffs"],
-                    reg=cfg["fit"]["regularization"])
-    p = fitter.fit(face_mm, n_iters=cfg["fit"]["n_iters"])
+                    reg=cfg["fit"]["regularization"],
+                    sparse_landmark_weight=cfg["fit"].get("sparse_landmark_weight", 1.0))
+    p = fitter.fit(face_mm, K,
+                 landmark_2d=landmark_2d,
+                 landmark_vertex_indices=landmark_vertex_indices,
+                 n_iters=cfg["fit"]["n_iters"],use_dense=cfg["fit"].get("use_dense", True),)
+
+    if len(faces) > 0 and len(landmark_2d) > 0:
+        label_vis = draw_landmark_labels(landmark_image, landmarks2d, correspondences, rgb=True)
+        label_path = os.path.join(out_dir, "landmarks_detected.png")
+        cv2.imwrite(label_path, cv2.cvtColor(label_vis, cv2.COLOR_RGB2BGR))
+        print(f"[landmarks] wrote labeled detection overlay to {label_path}")
+
+        # Reproject the fitted BFM landmark points back into the same RGB-scaled image.
+        lm3d = bfm.shape(p[7:])[landmark_vertex_indices]
+        lm3d = fitter.transform_points(lm3d, p)
+        uv = fitter.project(lm3d, K)
+        reproj_vis = cv2.cvtColor(landmark_image.copy(), cv2.COLOR_RGB2BGR)
+        for gt, pr in zip(landmark_2d, uv):
+            gt_xy = (int(round(gt[0])), int(round(gt[1])))
+            pr_xy = (int(round(pr[0])), int(round(pr[1])))
+            cv2.line(reproj_vis, gt_xy, pr_xy, (0, 255, 255), 1, lineType=cv2.LINE_AA)
+            cv2.circle(reproj_vis, gt_xy, 3, (0, 255, 0), thickness=-1, lineType=cv2.LINE_AA)
+            cv2.circle(reproj_vis, pr_xy, 3, (0, 0, 255), thickness=-1, lineType=cv2.LINE_AA)
+        reproj_path = os.path.join(out_dir, "landmark_reprojection.png")
+        cv2.imwrite(reproj_path, reproj_vis)
+        print(f"[landmarks] wrote reprojection overlay to {reproj_path}")
 
     # 5. render the fitted FULL-resolution mesh with its albedo.
     #    Apply the same transform the fitter used, but to all 53k vertices (mm):

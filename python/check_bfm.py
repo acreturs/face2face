@@ -33,6 +33,52 @@ def main():
         print(f"  shape components      = {var.shape[0]}")
         print(f"  sigma = sqrt(var)[:5] = {np.round(np.sqrt(var[:5]), 2)}")
         print("  (sigma is the std-dev you divide by in the regulariser E_reg)")
+        
+        print("\n=== required datasets ===")
+        required = [
+            "shape/model/mean",
+            "shape/model/pcaBasis",
+            "shape/model/pcaVariance",
+            "color/model/mean",
+            "shape/representer/cells",
+        ]
+
+        for key in required:
+            status = (
+                f"OK {file[key].shape}"
+                if key in file
+                else "MISSING"
+            )
+            print(f"  {key:34s} {status}")
+
+        print("\n=== landmark metadata ===")
+        for key in (
+            "metadata/landmarks/json",
+            "metadata/landmarks/text",
+        ):
+            print(
+                f"  {key:34s} "
+                f"{'OK' if key in file else 'MISSING'}"
+            )
+
+        mean = file["shape/model/mean"][:]
+        basis = file["shape/model/pcaBasis"][:]
+        variance = file["shape/model/pcaVariance"][:]
+
+        if basis.shape[0] != mean.shape[0]:
+            raise AssertionError(
+                "Shape basis appears transposed: "
+                f"mean={mean.shape}, basis={basis.shape}"
+            )
+
+        print("\n=== summary ===")
+        print(f"  vertices         : {mean.size // 3}")
+        print(f"  shape components : {variance.size}")
+        print(
+            "  first sigma values:",
+            np.round(np.sqrt(variance[:5]), 3),
+        )
+
 
 
 if __name__ == "__main__":

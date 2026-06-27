@@ -23,9 +23,14 @@ dataset:
 
 fit:
   n_iters: 30             # ICP outer iterations -> "predict params in N iterations"
-  n_shape_coeffs: 40      # number of BFM identity (alpha) PCA coefficients to solve for
+  n_shape_coeffs: 0       # number of BFM identity (alpha) PCA coefficients to solve for
   regularization: 15.0    # weight pulling alpha toward 0 (the PCA mean) -> E_reg
                           # (in mm^2 units ~ depth-noise^2; larger = smoother/closer to mean)
+  sparse_landmark_weight: 100.0
+  use_dense: false
+  trim_percentile: 80
+  maximum_target_points: 2500
+
 
 output:
   dir: data/out
