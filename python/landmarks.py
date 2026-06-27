@@ -12,19 +12,36 @@ DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "lb
 
 # Correspondence from OpenCV 68-point LBF indices to BFM named landmark points.
 # Indices are 0-based, following the dlib/OpenCV 68-landmark convention.
+# LBF68_TO_BFM = {
+#     30: "center.nose.tip",
+#     # OpenCV/dlib 68-point indices are anatomical with respect to the subject's
+#     # face, while the BFM landmark names are also anatomical. Avoid swapping
+#     # left/right based on viewer-side image layout.
+#     36: "left.eye.corner_outer",
+#     39: "left.eye.corner_inner",
+#     42: "right.eye.corner_inner",
+#     45: "right.eye.corner_outer",
+#     48: "left.lips.corner",
+#     54: "right.lips.corner",
+#     51: "center.lips.upper.inner",
+#     57: "center.lips.lower.inner",
+# }
+
+
+#right and left were inverted
 LBF68_TO_BFM = {
     30: "center.nose.tip",
-    # OpenCV/dlib 68-point indices are anatomical with respect to the subject's
-    # face, while the BFM landmark names are also anatomical. Avoid swapping
-    # left/right based on viewer-side image layout.
-    36: "left.eye.corner_outer",
-    39: "left.eye.corner_inner",
-    42: "right.eye.corner_inner",
-    45: "right.eye.corner_outer",
-    48: "left.lips.corner",
-    54: "right.lips.corner",
-    51: "center.lips.upper.inner",
-    57: "center.lips.lower.inner",
+
+    36: "right.eye.corner_outer",
+    39: "right.eye.corner_inner",
+    42: "left.eye.corner_inner",
+    45: "left.eye.corner_outer",
+
+    48: "right.lips.corner",
+    54: "left.lips.corner",
+
+    62: "center.lips.upper.inner",
+    66: "center.lips.lower.inner",
 }
 
 
