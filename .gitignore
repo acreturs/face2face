@@ -20,6 +20,9 @@ __pycache__/
 *.swp
 .DS_Store
 
+# For My personal doc (Alex needs some extra explanation)
+DOKUMENTATION.md
+
 # AI assistant / agent tooling
 .claude/
 .codex/

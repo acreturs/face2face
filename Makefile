@@ -46,7 +46,7 @@ CXXFLAGS = $(STD) $(OPT) $(WARN) -Iinclude $(HIGHFIVE_INC) $(PKG_CFLAGS) $(HDF5_
 LDLIBS   = $(PKG_LIBS) $(HDF5_LIBS) -lceres -lglog -lpthread
 
 # ---- sources ----------------------------------------------------------------
-SRCS = src/main.cpp src/BFMLoader.cpp src/PandoraLoader.cpp src/IPhoneLoader.cpp src/render/Renderer.cpp src/render/ProjectionUtils.cpp src/render/Lighting.cpp src/CeresFitter.cpp
+SRCS = src/main.cpp src/BFMLoader.cpp src/PandoraLoader.cpp src/iPhoneLoader.cpp src/render/Renderer.cpp src/render/ProjectionUtils.cpp src/render/Lighting.cpp src/CeresFitter.cpp
 HDRS = $(wildcard include/*.h)
 BIN  = build/face_recon
 
