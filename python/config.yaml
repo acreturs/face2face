@@ -23,7 +23,9 @@ dataset:
 
 fit:
   n_iters: 30             # ICP outer iterations -> "predict params in N iterations"
-  n_shape_coeffs: 0       # number of BFM identity (alpha) PCA coefficients to solve for
+  n_shape_coeffs: 30      # number of BFM identity (alpha) PCA coefficients to solve for
+                          # NOTE: must be > 0 — 0 leaves the shape basis empty and the
+                          # Fitter crashes on reshape (ValueError: ... size 0 into (3,0)).
   regularization: 15.0    # weight pulling alpha toward 0 (the PCA mean) -> E_reg
                           # (in mm^2 units ~ depth-noise^2; larger = smoother/closer to mean)
   sparse_landmark_weight: 100.0

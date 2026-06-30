@@ -3,6 +3,7 @@
 #include "Renderer.h"
 #include "ProjectionUtils.h"
 #include "Lighting.h"
+#include "CeresFitter.h"
 
 #include <Eigen/Dense>
 #include <opencv2/core.hpp>
@@ -166,46 +167,184 @@ static void overlayRenderOnPhoto(const RenderOutput& r,
               << "  (" << overlay.cols << "x" << overlay.rows << ")\n";
 }
 
+static void writeFitOutputs(
+    const std::string& suffix,
+    const cv::Mat& photo,
+    const BFMLoader& bfm,
+    const Eigen::MatrixX3f& shape,
+    const Eigen::MatrixX3f& albedo,
+    const Eigen::Matrix3f& intrinsics,
+    const PoseParameters& pose
+)
+{
+    const Eigen::Matrix3f rotation =
+        pose.rotationMatrix();
+
+    const Eigen::Vector3f translation =
+        pose.translation.cast<float>();
+
+    const proj::Pixels projectedVertices =
+        proj::projectMesh(
+            shape,
+            rotation,
+            translation,
+            intrinsics
+        );
+
+    const cv::Mat wireframe =
+        overlayWireframe(
+            photo,
+            projectedVertices,
+            bfm.faces(),
+            albedo,
+            2
+        );
+
+    const std::string wireframePath =
+        kOutDir + "/iphone_overlay_" + suffix + ".png";
+
+    cv::imwrite(wireframePath, wireframe);
+
+    std::cout << "Wrote wireframe overlay: "
+              << wireframePath << '\n';
+
+    RenderInput renderInput{
+        .shape = shape,
+        .albedo = albedo,
+        .R = rotation,
+        .t = translation,
+        .K = intrinsics,
+        .sh = light::defaultWhite(),
+    };
+
+    const RenderOutput renderOutput =
+        Renderer(
+            photo.rows,
+            photo.cols,
+            bfm.faces()
+        ).render(renderInput);
+
+    const std::string renderPath =
+        kOutDir + "/render_overlay_" + suffix + ".png";
+
+    overlayRenderOnPhoto(
+        renderOutput,
+        photo,
+        renderPath
+    );
+}
+
 // Project the BFM mesh onto the first iPhone photo and save a wireframe overlay.
 // No-op (with a message) if the session or its frames are missing.
-static void overlayMeshOnPhoto(const BFMLoader&         bfm,
-                               const Eigen::MatrixX3f&  shape,
-                               const Eigen::MatrixX3f&  albedo)
+
+static void overlayMeshOnPhoto(
+    const BFMLoader& bfm,
+    const Eigen::MatrixX3f& meanShape,
+    const Eigen::MatrixX3f& albedo
+)
 {
     try {
         IPhoneLoader iphone(kIPhoneDir, 1);
+
         const auto frames = iphone.getFrames();
+
         if (frames.empty()) {
-            std::cout << "iPhone: no frames in " << kIPhoneDir << "\n";
+            std::cout
+                << "iPhone: no frames in "
+                << kIPhoneDir
+                << '\n';
+
             return;
         }
 
         const cv::Mat& photo = frames[0].rgb;
-        const Eigen::Matrix3f R = Eigen::Matrix3f::Identity();
-        const Eigen::Vector3f t = defaultTranslation();
 
-        // 1) Wireframe overlay (cheap, projection-only).
-        const proj::Pixels uv = proj::projectMesh(shape, R, t, iphone.K());
-        const cv::Mat wire = overlayWireframe(photo, uv, bfm.faces(), albedo,
-                                              /*stride=*/2);
-        cv::imwrite(kOutDir + "/iphone_overlay.png", wire);
-        std::cout << "iPhone: wireframe overlay → " << kOutDir
-                  << "/iphone_overlay.png  (" << photo.cols << "x" << photo.rows << ")\n";
+        const std::string landmarkPath =
+            kIPhoneDir + "/landmarks_000000.txt";
 
-        // 2) Shaded render overlay — render at the PHOTO's resolution with the
-        //    iPhone's own intrinsics so the result aligns with the photo.
-        RenderInput input{
-            .shape  = shape,
-            .albedo = albedo,
-            .R      = R,
-            .t      = t,
-            .K      = iphone.K(),
-            .sh     = light::defaultWhite(),
-        };
-        const RenderOutput r = Renderer(photo.rows, photo.cols, bfm.faces()).render(input);
-        overlayRenderOnPhoto(r, photo, kOutDir + "/render_overlay.png");
-    } catch (const std::exception& e) {
-        std::cerr << "iPhone projection skipped: " << e.what() << "\n";
+        const std::vector<LandmarkObservation> observations =
+            loadLandmarkObservations(landmarkPath);
+
+        PoseParameters initialPose;
+        initialPose.translation =
+            defaultTranslation().cast<double>();
+
+        // Stage 1: optimize only rotation and translation.
+        const PoseParameters poseOnly =
+            CeresFitter::fitPose(
+                meanShape,
+                observations,
+                iphone.K(),
+                initialPose
+            );
+
+        // Stage 2: refine pose and optimize shape coefficients.
+        const FitParameters poseAndShape =
+            CeresFitter::fitPoseAndShape(
+                meanShape,
+                bfm.shape_basis_raw(),
+                bfm.shape_sigma(),
+                observations,
+                iphone.K(),
+                poseOnly,
+                10.0
+            );
+
+        const Eigen::VectorXf alpha =
+            poseAndShape.shapeCoefficients.cast<float>();
+
+        const Eigen::MatrixX3f fittedShape =
+            bfm.shape(alpha);
+
+        // Save the personalized 3D mesh.
+        saveCurrentModel(
+            kOutDir + "/fitted_face.obj",
+            fittedShape,
+            bfm.faces(),
+            albedo
+        );
+
+        // Print how much the optimized shape differs from the mean shape.
+        const Eigen::VectorXf vertexDisplacement =
+            (fittedShape - meanShape).rowwise().norm();
+
+        std::cout
+            << "Mean shape displacement: "
+            << vertexDisplacement.mean()
+            << " mm\n";
+
+        std::cout
+            << "Maximum shape displacement: "
+            << vertexDisplacement.maxCoeff()
+            << " mm\n";
+
+        // Output 1: mean shape with pose-only optimization.
+        writeFitOutputs(
+            "pose_only",
+            photo,
+            bfm,
+            meanShape,
+            albedo,
+            iphone.K(),
+            poseOnly
+        );
+
+        // Output 2: fitted shape with pose-and-shape optimization.
+        writeFitOutputs(
+            "pose_and_shape",
+            photo,
+            bfm,
+            fittedShape,
+            albedo,
+            iphone.K(),
+            poseAndShape.pose
+        );
+    }
+    catch (const std::exception& exception) {
+        std::cerr
+            << "iPhone projection skipped: "
+            << exception.what()
+            << '\n';
     }
 }
 

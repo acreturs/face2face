@@ -12,6 +12,8 @@ from landmarks import (
     draw_landmarks,
 )
 
+from landmarks import landmark_correspondence_pairs
+
 
 def main() -> None:
     here = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +64,25 @@ def main() -> None:
 
     bfm = BFM(bfm_path)
     correspondence = bfm_correspondences(bfm)
+    points_2d, vertex_indices = landmark_correspondence_pairs(
+    landmarks,
+    correspondence,
+    )
+
+    output_path = os.path.join(
+        root,
+        "data",
+        "iphone",
+        "default",
+        "landmarks_000000.txt",
+    )
+
+    with open(output_path, "w", encoding="utf-8") as file:
+        for vertex_index, point in zip(vertex_indices, points_2d):
+            u, v = point
+            file.write(f"{vertex_index} {u:.6f} {v:.6f}\n")
+
+    print(f"[landmarks] wrote C++ input to {output_path}")
     if len(correspondence) < 6:
         raise AssertionError(
             f"Only {len(correspondence)} BFM correspondences resolved"

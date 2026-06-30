@@ -8,6 +8,7 @@ third_party/
 
 # Datasets & models -- LICENSED, must never be committed (BFM + Pandora forbid redistribution)
 data/
+models/
 
 # Python
 __pycache__/
@@ -19,6 +20,9 @@ __pycache__/
 *.swp
 .DS_Store
 
+# For My personal doc (Alex needs some extra explanation)
+DOKUMENTATION.md
+
 # AI assistant / agent tooling
 .claude/
 .codex/
@@ -27,3 +31,9 @@ __pycache__/
 .continue/
 .windsurf/
 .gemini/
+
+#test files
+ceres_projection_test
+ceres_projection_test.cpp
+ceres_test
+ceres_test.cpp
