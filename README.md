@@ -10,8 +10,12 @@ Needs the BFM in `data/bfm/` (see SETUP.md) and Biwi (below).
 
 ## Get the Biwi dataset
 
+The container already has cv2/numpy/h5py; the downloader only needs two extra
+packages. Inside the container Python is PEP-668-managed, so pass the override:
+
 ```bash
-pip install -r requirements.txt
+pip install --break-system-packages remotezip requests   # container
+# (on the host with a normal/conda env: pip install -r requirements.txt)
 python3 python/get_biwi.py --list     # list sequences (24 total)
 python3 python/get_biwi.py 01 07      # download some (~200-450 MB each)
 python3 python/get_biwi.py --all      # or all (~7.2 GB)
