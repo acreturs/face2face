@@ -341,7 +341,10 @@ static void overlayMeshOnPhoto(
     // the 9-landmark set (0.9 mm displacement, plausible); the 25-point set on a
     // high-res photo needs a much higher λ or it depth-overfits — see the study
     // in report_figures/leon_landmark_reg_study/.
-    double sparseReg = 100.0
+    double sparseReg = 100.0,
+    // When true, refine the sparse result with the dense PHOTOMETRIC term
+    // (RGB-only, no depth) and write an extra "photometric" overlay + mesh.
+    bool refinePhotometric = false
 )
 {
     try {
@@ -451,6 +454,88 @@ static void overlayMeshOnPhoto(
             "iphone",
             &observations
         );
+
+        // Output 3 (optional): dense PHOTOMETRIC refinement — RGB only, no depth.
+        // Alternates estimating SH lighting + BFM albedo (both linear) with a
+        // per-pixel geometry refinement, so the render matches the selfie's
+        // colour AND lighting. Progress overlays → data/out/iphone_photo_progress/.
+        if (refinePhotometric) {
+            const std::string progressDir = kOutDir + "/iphone_photo_progress";
+            std::filesystem::create_directories(progressDir);
+            const Renderer photoRenderer(photo.rows, photo.cols, bfm.faces());
+
+            // Rebuild the per-vertex albedo from a fit's estimated β coeffs
+            // (empty ⇒ fall back to the mean albedo).
+            const auto albedoOf = [&](const FitParameters& fp) -> Eigen::MatrixX3f {
+                if (fp.albedoCoefficients.size() == 0) return albedo;
+                Eigen::VectorXf betaFull =
+                    Eigen::VectorXf::Zero(bfm.color_sigma().size());
+                const int n = std::min<int>(fp.albedoCoefficients.size(),
+                                            betaFull.size());
+                betaFull.head(n) = fp.albedoCoefficients.head(n).cast<float>();
+                return bfm.albedo(betaFull);
+            };
+
+            const DenseIterationCallback writeProgress =
+                [&](int iteration, const FitParameters& current, double rmse) {
+                    const RenderInput in{
+                        .shape  = bfm.shape(current.shapeCoefficients.cast<float>()),
+                        .albedo = albedoOf(current),        // estimated albedo
+                        .R      = current.pose.rotationMatrix(),
+                        .t      = current.pose.translation.cast<float>(),
+                        .K      = iphone.K(),
+                        .sh     = current.sh,               // estimated lighting
+                    };
+                    cv::Mat prog = blendRenderOnPhoto(photoRenderer.render(in), photo);
+                    std::ostringstream label;
+                    label << "photo " << std::setw(2) << std::setfill('0')
+                          << iteration << " | colRMSE " << std::fixed
+                          << std::setprecision(3) << rmse;
+                    cv::putText(prog, label.str(), {8, 28},
+                                cv::FONT_HERSHEY_SIMPLEX, 0.7, {0, 200, 0}, 2,
+                                cv::LINE_AA);
+                    std::ostringstream name;
+                    name << progressDir << "/photo_" << std::setw(2)
+                         << std::setfill('0') << iteration << ".png";
+                    cv::imwrite(name.str(), prog);
+                };
+
+            const FitParameters photoFit = CeresFitter::fitPhotometric(
+                meanShape, bfm.shape_basis_raw(), bfm.shape_sigma(), bfm.faces(),
+                albedo, bfm.color_basis_raw(), bfm.color_sigma(),
+                photo, iphone.K(), poseAndShape,
+                /*shapeRegWeight=*/sparseReg,
+                /*albedoRegWeight=*/100.0,
+                /*numIterations=*/10,
+                /*pixelStride=*/1,
+                /*photometricWeight=*/1.0,
+                /*optimizeShape=*/true,
+                /*optimizeLighting=*/true,
+                /*optimizeAlbedo=*/true,
+                writeProgress);
+
+            const Eigen::MatrixX3f photoShape =
+                bfm.shape(photoFit.shapeCoefficients.cast<float>());
+            const Eigen::MatrixX3f photoAlbedo = albedoOf(photoFit);
+            saveCurrentModel(kOutDir + "/fitted_face_photometric.obj",
+                             photoShape, bfm.faces(), photoAlbedo);
+
+            // Final overlay rendered with the ESTIMATED lighting + albedo.
+            const RenderInput finalIn{
+                .shape  = photoShape,
+                .albedo = photoAlbedo,
+                .R      = photoFit.pose.rotationMatrix(),
+                .t      = photoFit.pose.translation.cast<float>(),
+                .K      = iphone.K(),
+                .sh     = photoFit.sh,
+            };
+            overlayRenderOnPhoto(
+                photoRenderer.render(finalIn), photo,
+                kOutDir + "/render_overlay_iphone_photometric_appearance.png");
+
+            writeFitOutputs("photometric", photo, bfm, photoShape, photoAlbedo,
+                            iphone.K(), photoFit.pose, "iphone", &observations);
+        }
     }
     catch (const std::exception& exception) {
         std::cerr
@@ -869,6 +954,11 @@ int main(int argc, char** argv)
         std::cout << "\n== Stage 2/2: dense (ICP, Biwi depth) ==\n";
         fitDenseOnBiwi(bfm, meanShape, albedo,
                        sparse ? &*sparse : nullptr, icpIters);
+    } else if (mode == "photometric") {
+        // RGB-only analysis-by-synthesis: sparse landmark init → photometric
+        // refinement. No depth needed, so it runs on the iPhone selfie.
+        overlayMeshOnPhoto(bfm, meanShape, albedo, sparseReg,
+                           /*refinePhotometric=*/true);
     } else if (dataset == "biwi") {
         fitSparseOnBiwi(bfm, meanShape, albedo);         // Biwi RGB landmarks → fitted_face_biwi_sparse.obj
     } else {

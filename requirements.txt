@@ -7,8 +7,10 @@ scipy>=1.7.0
 matplotlib>=3.5.0
 
 # Image processing
-opencv-python>=4.5.0
-opencv-contrib-python>=4.5.0  # needed for cv2.face.createFacemarkLBF()
+# NOTE: install ONLY opencv-contrib-python — it is a superset that includes the
+# base cv2 AND the contrib modules (cv2.face.createFacemarkLBF, used by
+# python/landmarks.py). Installing opencv-python alongside it breaks cv2.face.
+opencv-contrib-python>=4.5.0
 Pillow>=8.0.0
 pillow-heif>=0.10.0
 
