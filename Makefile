@@ -14,6 +14,8 @@
 # ---- runtime options (forwarded to the program as CLI args) -----------------
 NUM_IMAGES ?= 1
 RGBD       ?= true
+MODE       ?= sparse          # sparse = Landmark-Fit | dense = Tiefen-ICP | full = sparse→dense
+DATASET    ?= biwi            # biwi = Biwi RGB-D (Standard) | iphone (nur sparse, kein Depth)
 
 # ---- toolchain --------------------------------------------------------------
 CXX  ?= g++
@@ -46,7 +48,7 @@ CXXFLAGS = $(STD) $(OPT) $(WARN) -Iinclude $(HIGHFIVE_INC) $(PKG_CFLAGS) $(HDF5_
 LDLIBS   = $(PKG_LIBS) $(HDF5_LIBS) -lceres -lglog -lpthread
 
 # ---- sources ----------------------------------------------------------------
-SRCS = src/main.cpp src/BFMLoader.cpp src/PandoraLoader.cpp src/iPhoneLoader.cpp src/render/Renderer.cpp src/render/ProjectionUtils.cpp src/render/Lighting.cpp src/CeresFitter.cpp
+SRCS = src/main.cpp src/BFMLoader.cpp src/BiwiLoader.cpp src/iPhoneLoader.cpp src/render/Renderer.cpp src/render/ProjectionUtils.cpp src/render/Lighting.cpp src/CeresFitter.cpp
 HDRS = $(wildcard include/*.h)
 BIN  = build/face_recon
 
@@ -61,7 +63,7 @@ $(BIN): $(SRCS) $(HDRS) | $(HIGHFIVE_DIR)
 	$(CXX) $(CXXFLAGS) $(SRCS) -o $@ $(LDLIBS)
 
 run: $(BIN)
-	./$(BIN)
+	./$(BIN) --mode $(MODE) --dataset $(DATASET)
 
 # fetch the header-only HighFive once (needs git + network; ~one-time)
 $(HIGHFIVE_DIR):

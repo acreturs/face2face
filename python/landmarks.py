@@ -28,8 +28,23 @@ DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "lb
 # }
 
 
-#right and left were inverted
-LBF68_TO_BFM = {
+# dlib/LBF 68-point index -> BFM named landmark. subject-anatomical left/right
+# (dlib 36 = image-left eye = the subject's RIGHT eye), matching the BFM names.
+#
+# TWO sets, chosen per scenario (gen_landmarks.py --set small|dense):
+#
+# LBF68_TO_BFM_SMALL — the DEFAULT (9 reliable points: nose tip, 4 eye corners,
+#   2 lip corners, 2 lip-centre). Use for the iPhone / sparse-only fit. On a
+#   high-resolution photo (iPhone, ~2300 px face) more landmarks push the
+#   identity into DEPTH-overfitting (2D landmarks carry no depth; displacement
+#   0.9 mm -> ~12 mm), so keep it small there — the pose is what 2D landmarks
+#   pin, not the identity.
+#
+# LBF68_TO_BFM_DENSE — 25 points, for the Biwi / dense scenario. There the
+#   dense depth term supplies the identity, so the extra landmarks only help
+#   the Stage-1 pose and the overfitting risk is gone.
+#   (Jawline 0-16 stays unmapped in both: contour points have no fixed vertex.)
+LBF68_TO_BFM_SMALL = {
     30: "center.nose.tip",
 
     36: "right.eye.corner_outer",
@@ -43,6 +58,41 @@ LBF68_TO_BFM = {
     62: "center.lips.upper.inner",
     66: "center.lips.lower.inner",
 }
+
+LBF68_TO_BFM_DENSE = {
+    8:  "center.chin.tip",     # chin tip is stable when the face is ~frontal
+
+    30: "center.nose.tip",
+    31: "right.nose.wing.outer",
+    33: "center.nose.attachement_to_philtrum",
+    35: "left.nose.wing.outer",
+
+    19: "right.eyebrow.bend.upper",
+    21: "right.eyebrow.inner_upper",
+    22: "left.eyebrow.inner_upper",
+    24: "left.eyebrow.bend.upper",
+
+    36: "right.eye.corner_outer",
+    38: "right.eye.top",
+    39: "right.eye.corner_inner",
+    40: "right.eye.bottom",
+    42: "left.eye.corner_inner",
+    43: "left.eye.top",
+    45: "left.eye.corner_outer",
+    47: "left.eye.bottom",
+
+    48: "right.lips.corner",
+    50: "right.lips.philtrum_ridge",
+    51: "center.lips.upper.outer",
+    52: "left.lips.philtrum_ridge",
+    54: "left.lips.corner",
+    57: "center.lips.lower.outer",
+    62: "center.lips.upper.inner",
+    66: "center.lips.lower.inner",
+}
+
+# Default mapping (backwards-compatible name).
+LBF68_TO_BFM = LBF68_TO_BFM_SMALL
 
 
 def ensure_lbf_model(model_path=None):
@@ -194,10 +244,10 @@ def draw_landmark_labels(image, landmarks, correspondences, rgb=True,
     return img
 
 
-def bfm_correspondences(bfm):
+def bfm_correspondences(bfm, mapping=LBF68_TO_BFM):
     out = {}
 
-    for idx, name in LBF68_TO_BFM.items():
+    for idx, name in mapping.items():
         vertex_idx = bfm.landmark_index(name)
 
         if vertex_idx < 0:
@@ -210,7 +260,7 @@ def bfm_correspondences(bfm):
             "bfm_vertex_idx": vertex_idx,
         }
 
-    print(f"[landmarks] resolved {len(out)}/{len(LBF68_TO_BFM)} correspondences")
+    print(f"[landmarks] resolved {len(out)}/{len(mapping)} correspondences")
 
     for idx, info in sorted(out.items()):
         print(
