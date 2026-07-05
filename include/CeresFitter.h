@@ -22,13 +22,18 @@ struct PoseParameters {
 };
 
 constexpr int kShapeCoefficientCount = 30;
-constexpr int kAlbedoCoefficientCount = 30;   // BFM colour (albedo) PCA coeffs
+constexpr int kAlbedoCoefficientCount = 30;       // BFM colour (albedo) PCA coeffs
+constexpr int kExpressionCoefficientCount = 30;   // BFM expression PCA coeffs
 
 struct FitParameters {
     PoseParameters pose;
 
     Eigen::VectorXd shapeCoefficients =
         Eigen::VectorXd::Zero(kShapeCoefficientCount);
+
+    // Expression coeffs (delta), solved by the contour landmark fit. Empty ⇒
+    // neutral face.
+    Eigen::VectorXd exprCoefficients;
 
     // Appearance, estimated by fitPhotometric (ignored by the geometry-only
     // fits). albedoCoefficients is empty ⇒ use the mean albedo; sh defaults to
@@ -68,6 +73,36 @@ public:
       double zMin = 200.0,
       double zMax = 600.0
   );
+
+    // Stage 2b: pose + shape with a CONTOUR (silhouette) term. Observations with
+    // vertexIndex >= 0 are fixed named landmarks (interior); observations with
+    // vertexIndex == -1 are contour points (jawline) with NO fixed model vertex.
+    // Because the BFM has no jaw landmarks and the silhouette vertex slides with
+    // pose, we run an ICP-style outer loop: each iteration re-assigns every
+    // contour point to the nearest projected MODEL SILHOUETTE vertex (a vertex
+    // seen near-edge-on, |n_cam.z| small, on the matching side), then Ceres-solves
+    // pose+shape. This is what constrains face WIDTH/outline — the interior
+    // landmarks cannot. Use a lower regularizationWeight than the interior-only
+    // fit so the identity can actually widen.
+    // Also solves EXPRESSION (delta): the expr basis is added to every landmark
+    // residual as a 4th parameter block, so mouth/brow/lip landmarks move the
+    // expression. Returned in result.exprCoefficients.
+    static FitParameters fitPoseAndShapeContour(
+        const Eigen::MatrixX3f&                  meanShape,
+        const Eigen::MatrixXf&                   shapeBasis,
+        const Eigen::VectorXf&                   shapeSigma,
+        const Eigen::MatrixXf&                   exprBasis,
+        const Eigen::VectorXf&                   exprSigma,
+        const Eigen::MatrixX3i&                  triangles,
+        const std::vector<LandmarkObservation>&  observations,
+        const Eigen::Matrix3f&                   intrinsics,
+        const PoseParameters&                    initialPose,
+        double                                   regularizationWeight = 30.0,
+        double                                   exprRegWeight        = 30.0,
+        double                                   zMin                 = 200.0,
+        double                                   zMax                 = 600.0,
+        int                                      numOuterIterations   = 6
+    );
 
     // Dense fit: outer ICP loop (re-find nearest-vertex correspondences →
     // Ceres-solve pose+shape → repeat) against a camera-frame depth cloud (mm).

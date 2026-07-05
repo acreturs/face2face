@@ -455,6 +455,85 @@ private:
     std::array<double, kShapeCoefficientCount> basisZ_;
 };
 
+// Landmark reprojection with BOTH identity AND expression coefficients. Four
+// parameter blocks: angleAxis(3), translation(3), identity(kShape), expr(kExpr).
+//   modelPoint = mean + Σ idBasis·alpha + Σ exprBasis·delta   (then pose+project)
+// This is how the contour fit gets an expression gradient: mouth/brow landmarks
+// move when delta changes.
+struct LandmarkShapeExprReprojectionResidual {
+    LandmarkShapeExprReprojectionResidual(
+        const Eigen::Vector3f& meanPoint, int vertexIndex,
+        const Eigen::MatrixXf& shapeBasis, const Eigen::VectorXf& shapeSigma,
+        const Eigen::MatrixXf& exprBasis,  const Eigen::VectorXf& exprSigma,
+        const Eigen::Vector2d& imagePoint, const Eigen::Matrix3f& intrinsics)
+        : observedU_(imagePoint.x()), observedV_(imagePoint.y()),
+          fx_(intrinsics(0, 0)), fy_(intrinsics(1, 1)),
+          cx_(intrinsics(0, 2)), cy_(intrinsics(1, 2))
+    {
+        const Eigen::Matrix3d M = proj::BFM_TO_CAM.cast<double>();
+        const Eigen::Vector3d m = M * meanPoint.cast<double>();
+        meanX_ = m.x(); meanY_ = m.y(); meanZ_ = m.z();
+        for (int k = 0; k < kShapeCoefficientCount; ++k) {
+            const Eigen::Vector3d a = M * Eigen::Vector3d(
+                shapeBasis(3 * vertexIndex + 0, k) * shapeSigma(k),
+                shapeBasis(3 * vertexIndex + 1, k) * shapeSigma(k),
+                shapeBasis(3 * vertexIndex + 2, k) * shapeSigma(k));
+            idX_[k] = a.x(); idY_[k] = a.y(); idZ_[k] = a.z();
+        }
+        for (int j = 0; j < kExpressionCoefficientCount; ++j) {
+            const Eigen::Vector3d a = M * Eigen::Vector3d(
+                exprBasis(3 * vertexIndex + 0, j) * exprSigma(j),
+                exprBasis(3 * vertexIndex + 1, j) * exprSigma(j),
+                exprBasis(3 * vertexIndex + 2, j) * exprSigma(j));
+            exX_[j] = a.x(); exY_[j] = a.y(); exZ_[j] = a.z();
+        }
+    }
+
+    template <typename T>
+    bool operator()(const T* const angleAxis, const T* const translation,
+                    const T* const idCoeff, const T* const exprCoeff,
+                    T* residuals) const {
+        T p[3] = { T(meanX_), T(meanY_), T(meanZ_) };
+        for (int k = 0; k < kShapeCoefficientCount; ++k) {
+            p[0] += T(idX_[k]) * idCoeff[k];
+            p[1] += T(idY_[k]) * idCoeff[k];
+            p[2] += T(idZ_[k]) * idCoeff[k];
+        }
+        for (int j = 0; j < kExpressionCoefficientCount; ++j) {
+            p[0] += T(exX_[j]) * exprCoeff[j];
+            p[1] += T(exY_[j]) * exprCoeff[j];
+            p[2] += T(exZ_[j]) * exprCoeff[j];
+        }
+        T r[3];
+        ceres::AngleAxisRotatePoint(angleAxis, p, r);
+        const T X = r[0] + translation[0];
+        const T Y = r[1] + translation[1];
+        const T Z = r[2] + translation[2];
+        residuals[0] = T(fx_) * X / Z + T(cx_) - T(observedU_);
+        residuals[1] = T(fy_) * Y / Z + T(cy_) - T(observedV_);
+        return true;
+    }
+
+private:
+    double meanX_, meanY_, meanZ_;
+    std::array<double, kShapeCoefficientCount>      idX_, idY_, idZ_;
+    std::array<double, kExpressionCoefficientCount> exX_, exY_, exZ_;
+    double observedU_, observedV_, fx_, fy_, cx_, cy_;
+};
+
+// Generic L2 prior (√w · coeff) on a compile-time-sized coefficient block — used
+// for the expression prior, mirroring ShapeRegularizationResidual for identity.
+template <int Count>
+struct CoeffPriorResidual {
+    explicit CoeffPriorResidual(double weight) : sqrtWeight_(std::sqrt(weight)) {}
+    template <typename T>
+    bool operator()(const T* const coeff, T* residuals) const {
+        for (int k = 0; k < Count; ++k) residuals[k] = T(sqrtWeight_) * coeff[k];
+        return true;
+    }
+    double sqrtWeight_;
+};
+
 } // namespace
 
 Eigen::Matrix3f PoseParameters::rotationMatrix() const
@@ -817,6 +896,191 @@ FitParameters CeresFitter::fitPoseAndShape(
               << result.shapeCoefficients.transpose()
               << '\n';
 
+    return result;
+}
+
+FitParameters CeresFitter::fitPoseAndShapeContour(
+    const Eigen::MatrixX3f&                  meanShape,
+    const Eigen::MatrixXf&                   shapeBasis,
+    const Eigen::VectorXf&                   shapeSigma,
+    const Eigen::MatrixXf&                   exprBasis,
+    const Eigen::VectorXf&                   exprSigma,
+    const Eigen::MatrixX3i&                  triangles,
+    const std::vector<LandmarkObservation>&  observations,
+    const Eigen::Matrix3f&                   intrinsics,
+    const PoseParameters&                    initialPose,
+    double                                   regularizationWeight,
+    double                                   exprRegWeight,
+    double                                   zMin,
+    double                                   zMax,
+    int                                      numOuterIterations
+)
+{
+    if (shapeBasis.cols() < kShapeCoefficientCount ||
+        shapeSigma.size() < kShapeCoefficientCount ||
+        exprBasis.cols() < kExpressionCoefficientCount ||
+        exprSigma.size() < kExpressionCoefficientCount)
+        throw std::runtime_error("fitPoseAndShapeContour: BFM basis/sigma too small");
+
+    // Split interior (fixed vertex) vs contour (vertexIndex == -1) observations.
+    std::vector<LandmarkObservation> fixed, contour;
+    for (const LandmarkObservation& o : observations)
+        (o.vertexIndex >= 0 ? fixed : contour).push_back(o);
+
+    double angleAxis[3]   = { initialPose.angleAxis.x(),
+                              initialPose.angleAxis.y(),
+                              initialPose.angleAxis.z() };
+    double translation[3] = { initialPose.translation.x(),
+                              initialPose.translation.y(),
+                              initialPose.translation.z() };
+    double shapeCoefficients[kShapeCoefficientCount]      = {0.0};
+    double exprCoefficients[kExpressionCoefficientCount]  = {0.0};
+
+    const int N = static_cast<int>(meanShape.rows());
+    const float imgW = 2.0f * intrinsics(0, 2);   // ≈ image width (cx ≈ W/2)
+
+    std::cout << "\nStarting pose+shape+EXPR CONTOUR fit: " << fixed.size()
+              << " interior + " << contour.size() << " contour points, reg="
+              << regularizationWeight << " exprReg=" << exprRegWeight << '\n';
+
+    for (int outer = 0; outer < numOuterIterations; ++outer) {
+        // (a) reconstruct current shape (identity + expression), pose; project.
+        Eigen::VectorXf coeff(kShapeCoefficientCount);
+        for (int k = 0; k < kShapeCoefficientCount; ++k)
+            coeff(k) = static_cast<float>(shapeCoefficients[k]);
+        const Eigen::VectorXf dispFlat = shapeBasis.leftCols(kShapeCoefficientCount) *
+            shapeSigma.head(kShapeCoefficientCount).cwiseProduct(coeff);
+        Eigen::VectorXf ecoeff(kExpressionCoefficientCount);
+        for (int j = 0; j < kExpressionCoefficientCount; ++j)
+            ecoeff(j) = static_cast<float>(exprCoefficients[j]);
+        const Eigen::VectorXf exprFlat = exprBasis.leftCols(kExpressionCoefficientCount) *
+            exprSigma.head(kExpressionCoefficientCount).cwiseProduct(ecoeff);
+        Eigen::MatrixX3f shape = meanShape;
+        for (int v = 0; v < N; ++v)
+            shape.row(v) += (dispFlat.segment(3 * v, 3) +
+                             exprFlat.segment(3 * v, 3)).transpose();
+
+        const double angle = std::sqrt(angleAxis[0] * angleAxis[0] +
+                                       angleAxis[1] * angleAxis[1] +
+                                       angleAxis[2] * angleAxis[2]);
+        Eigen::Matrix3f R = Eigen::Matrix3f::Identity();
+        if (angle > 1e-12) {
+            const Eigen::Vector3d axis(angleAxis[0] / angle, angleAxis[1] / angle,
+                                       angleAxis[2] / angle);
+            R = Eigen::AngleAxisd(angle, axis).toRotationMatrix().cast<float>();
+        }
+        const Eigen::Vector3f t(static_cast<float>(translation[0]),
+                                static_cast<float>(translation[1]),
+                                static_cast<float>(translation[2]));
+
+        const Eigen::MatrixX3f Vcam = proj::toCameraFrame(shape, R, t);
+        const proj::Pixels     uv   = proj::project(Vcam, intrinsics);
+        const Eigen::MatrixX3f nCam =
+            proj::normalsToCameraFrame(Renderer::computeNormals(shape, triangles), R);
+
+        double sumU = 0.0; int cnt = 0;
+        for (int v = 0; v < N; ++v)
+            if (Vcam(v, 2) > 1e-3f && uv(v, 0) >= 0) { sumU += uv(v, 0); ++cnt; }
+        const double centerU = cnt ? sumU / cnt : intrinsics(0, 2);
+
+        ceres::Problem problem;
+
+        // (b) interior landmarks → fixed reprojection residuals (pose+id+expr).
+        for (const LandmarkObservation& o : fixed) {
+            if (o.vertexIndex < 0 || o.vertexIndex >= N) continue;
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<LandmarkShapeExprReprojectionResidual,
+                    2, 3, 3, kShapeCoefficientCount, kExpressionCoefficientCount>(
+                    new LandmarkShapeExprReprojectionResidual(
+                        meanShape.row(o.vertexIndex).transpose(), o.vertexIndex,
+                        shapeBasis, shapeSigma, exprBasis, exprSigma,
+                        o.imagePoint, intrinsics)),
+                nullptr, angleAxis, translation, shapeCoefficients, exprCoefficients);
+        }
+
+        // (c) contour points → nearest projected SILHOUETTE vertex (re-matched
+        //     every outer iteration = the sliding-contour correspondence).
+        int matched = 0;
+        for (const LandmarkObservation& o : contour) {
+            const double lu = o.imagePoint.x(), lv = o.imagePoint.y();
+            const bool lateral   = std::abs(lu - centerU) > 0.03 * imgW;
+            const bool leftSide  = lu < centerU;
+            int best = -1; double bestD2 = 1e30;
+            for (int v = 0; v < N; ++v) {
+                if (Vcam(v, 2) <= 1e-3f) continue;                 // behind camera
+                if (std::abs(nCam(v, 2)) > 0.5f) continue;         // not near-edge-on
+                const double du = uv(v, 0), dv = uv(v, 1);
+                if (du < 0 || dv < 0) continue;
+                if (std::abs(dv - lv) > 0.12 * imgW) continue;     // same scanline band
+                if (lateral && (du < centerU) != leftSide) continue; // same side
+                const double d2 = (du - lu) * (du - lu) + (dv - lv) * (dv - lv);
+                if (d2 < bestD2) { bestD2 = d2; best = v; }
+            }
+            if (best < 0 || std::sqrt(bestD2) > 0.12 * imgW) continue;  // gate outliers
+            ++matched;
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<LandmarkShapeExprReprojectionResidual,
+                    2, 3, 3, kShapeCoefficientCount, kExpressionCoefficientCount>(
+                    new LandmarkShapeExprReprojectionResidual(
+                        meanShape.row(best).transpose(), best,
+                        shapeBasis, shapeSigma, exprBasis, exprSigma,
+                        o.imagePoint, intrinsics)),
+                new ceres::HuberLoss(0.02 * imgW), // robust to bad contour matches
+                angleAxis, translation, shapeCoefficients, exprCoefficients);
+        }
+
+        // (d) identity + expression priors, and bounds on every block.
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<ShapeRegularizationResidual,
+                kShapeCoefficientCount, kShapeCoefficientCount>(
+                new ShapeRegularizationResidual(regularizationWeight)),
+            nullptr, shapeCoefficients);
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<CoeffPriorResidual<kExpressionCoefficientCount>,
+                kExpressionCoefficientCount, kExpressionCoefficientCount>(
+                new CoeffPriorResidual<kExpressionCoefficientCount>(exprRegWeight)),
+            nullptr, exprCoefficients);
+        problem.SetParameterLowerBound(translation, 2, zMin);
+        problem.SetParameterUpperBound(translation, 2, zMax);
+        for (int a = 0; a < 3; ++a) {
+            problem.SetParameterLowerBound(angleAxis, a, -0.7);
+            problem.SetParameterUpperBound(angleAxis, a,  0.7);
+        }
+        for (int k = 0; k < kShapeCoefficientCount; ++k) {
+            problem.SetParameterLowerBound(shapeCoefficients, k, -3.0);
+            problem.SetParameterUpperBound(shapeCoefficients, k,  3.0);
+        }
+        for (int j = 0; j < kExpressionCoefficientCount; ++j) {
+            problem.SetParameterLowerBound(exprCoefficients, j, -3.0);
+            problem.SetParameterUpperBound(exprCoefficients, j,  3.0);
+        }
+
+        ceres::Solver::Options options;
+        options.linear_solver_type = ceres::DENSE_QR;
+        options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+        options.max_num_iterations = 60;
+        options.minimizer_progress_to_stdout = false;
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
+
+        std::cout << "  contour outer " << outer << " | matched " << matched
+                  << "/" << contour.size() << " | " << summary.BriefReport() << '\n';
+    }
+
+    FitParameters result;
+    result.pose.angleAxis =
+        Eigen::Vector3d(angleAxis[0], angleAxis[1], angleAxis[2]);
+    result.pose.translation =
+        Eigen::Vector3d(translation[0], translation[1], translation[2]);
+    result.shapeCoefficients.resize(kShapeCoefficientCount);
+    for (int k = 0; k < kShapeCoefficientCount; ++k)
+        result.shapeCoefficients(k) = shapeCoefficients[k];
+    result.exprCoefficients.resize(kExpressionCoefficientCount);
+    for (int j = 0; j < kExpressionCoefficientCount; ++j)
+        result.exprCoefficients(j) = exprCoefficients[j];
+    std::cout << "Contour fit done. translation="
+              << result.pose.translation.transpose()
+              << "\n  exprCoeff=" << result.exprCoefficients.transpose() << '\n';
     return result;
 }
 

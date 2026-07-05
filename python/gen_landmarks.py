@@ -6,10 +6,15 @@ Two landmark sets, chosen per scenario:
   --set small  (default) 9 reliable points — for the iPhone / sparse-only fit
   --set dense            25 points          — for the Biwi / dense scenario
 
+Add --contour to also emit the dlib jawline points as CONTOUR observations,
+written with vertex index -1 (the C++ solver assigns each to the nearest model
+silhouette vertex dynamically, since the BFM has no named jaw landmarks). These
+constrain the face width/outline, which the interior points cannot.
+
 Usage (from project root):
   python3 python/gen_landmarks.py <image.png> <out_landmarks.txt> [debug.png]
-  python3 python/gen_landmarks.py --set dense data/biwi/01/frame_00003_rgb.png \
-          data/biwi/01/landmarks_00003.txt
+  python3 python/gen_landmarks.py --set small --contour data/iphone/default/RGB/000000_RGB.png \
+          data/iphone/default/landmarks_000000.txt
 """
 import os
 import sys
@@ -31,16 +36,31 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BFM_PATH = os.path.join(ROOT, "data", "bfm", "model2017-1_bfm_nomouth.h5")
 
 
+# dlib/LBF 68-pt jawline is indices 0..16 (0 = right ear side, 8 = chin,
+# 16 = left ear side). We emit the sides (skip the ear-adjacent endpoints and
+# the chin, which the named set already covers) as contour observations.
+JAW_CONTOUR_LBF = [1, 3, 5, 7, 9, 11, 13, 15]
+
+
 def main() -> None:
     args = sys.argv[1:]
     mapping = LBF68_TO_BFM_SMALL
-    if args and args[0] == "--set":
-        choice = args[1]
-        mapping = {"small": LBF68_TO_BFM_SMALL, "dense": LBF68_TO_BFM_DENSE}[choice]
-        args = args[2:]
+    emit_contour = False
+    # additive flags in any order before the positional args
+    while args and args[0].startswith("--"):
+        if args[0] == "--set":
+            mapping = {"small": LBF68_TO_BFM_SMALL,
+                       "dense": LBF68_TO_BFM_DENSE}[args[1]]
+            args = args[2:]
+        elif args[0] == "--contour":
+            emit_contour = True
+            args = args[1:]
+        else:
+            raise SystemExit(f"unknown flag: {args[0]}")
     if len(args) < 2:
         raise SystemExit(
-            "usage: gen_landmarks.py [--set small|dense] <image.png> <out.txt> [debug.png]")
+            "usage: gen_landmarks.py [--set small|dense] [--contour] "
+            "<image.png> <out.txt> [debug.png]")
     image_path, out_path = args[0], args[1]
     debug_path = args[2] if len(args) > 2 else None
 
@@ -62,7 +82,14 @@ def main() -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         for vi, (u, v) in zip(vertex_indices, pts2d):
             f.write(f"{vi} {u:.6f} {v:.6f}\n")
-    print(f"[landmarks] {len(pts2d)} points -> {out_path}")
+        n_contour = 0
+        if emit_contour:
+            for idx in JAW_CONTOUR_LBF:
+                u, v = landmarks[idx]
+                f.write(f"-1 {u:.6f} {v:.6f}\n")   # -1 = contour, matched in C++
+                n_contour += 1
+    print(f"[landmarks] {len(pts2d)} fixed + {n_contour if emit_contour else 0} "
+          f"contour points -> {out_path}")
 
     if debug_path:
         labeled = draw_landmark_labels(rgb, landmarks, correspondence, rgb=True)

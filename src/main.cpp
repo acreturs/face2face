@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -276,10 +277,16 @@ static void writeFitOutputs(
     if (observations) {
         const int radius = std::max(4, photo.cols / 400);
         double sumSquaredError = 0.0;
+        int fixedCount = 0;
         for (const LandmarkObservation& obs : *observations) {
             const cv::Point detected(
                 static_cast<int>(obs.imagePoint.x() + 0.5),
                 static_cast<int>(obs.imagePoint.y() + 0.5));
+            if (obs.vertexIndex < 0) {
+                // contour point (dynamic correspondence) — cyan, no fixed model vertex
+                cv::circle(wireframe, detected, radius, {255, 255, 0}, -1, cv::LINE_AA);
+                continue;
+            }
             const cv::Point model(
                 static_cast<int>(projectedVertices(obs.vertexIndex, 0) + 0.5f),
                 static_cast<int>(projectedVertices(obs.vertexIndex, 1) + 0.5f));
@@ -289,11 +296,12 @@ static void writeFitOutputs(
             const double du = projectedVertices(obs.vertexIndex, 0) - obs.imagePoint.x();
             const double dv = projectedVertices(obs.vertexIndex, 1) - obs.imagePoint.y();
             sumSquaredError += du * du + dv * dv;
+            ++fixedCount;
         }
-        const double rms =
-            std::sqrt(sumSquaredError / static_cast<double>(observations->size()));
-        std::cout << tag << ' ' << suffix << ": landmark reprojection RMS "
-                  << rms << " px (gruen = detektiert, rot = Modell)\n";
+        const double rms = fixedCount
+            ? std::sqrt(sumSquaredError / static_cast<double>(fixedCount)) : 0.0;
+        std::cout << tag << ' ' << suffix << ": interior reprojection RMS "
+                  << rms << " px (green = detected, red = model, cyan = contour)\n";
     }
 
     const std::string wireframePath =
@@ -344,68 +352,88 @@ static void overlayMeshOnPhoto(
     double sparseReg = 100.0,
     // When true, refine the sparse result with the dense PHOTOMETRIC term
     // (RGB-only, no depth) and write an extra "photometric" overlay + mesh.
-    bool refinePhotometric = false
+    bool refinePhotometric = false,
+    // Which iPhone frame to solve (--iphone-frame). Frame N uses RGB/00000N_RGB.png
+    // and landmarks_00000N.txt.
+    int frameIndex = 0
 )
 {
     try {
-        IPhoneLoader iphone(kIPhoneDir, 1);
+        // Load frames 0..frameIndex; we then pick frameIndex.
+        IPhoneLoader iphone(kIPhoneDir, frameIndex + 1);
 
         const auto frames = iphone.getFrames();
 
-        if (frames.empty()) {
-            std::cout
-                << "iPhone: no frames in "
-                << kIPhoneDir
-                << '\n';
-
+        if (static_cast<int>(frames.size()) <= frameIndex) {
+            std::cout << "iPhone: frame " << frameIndex << " not found in "
+                      << kIPhoneDir << " (have " << frames.size() << ")\n";
             return;
         }
 
-        const cv::Mat& photo = frames[0].rgb;
+        const cv::Mat& photo = frames[frameIndex].rgb;
 
+        std::ostringstream stem;
+        stem << std::setw(6) << std::setfill('0') << frameIndex;
         const std::string landmarkPath =
-            kIPhoneDir + "/landmarks_000000.txt";
+            kIPhoneDir + "/landmarks_" + stem.str() + ".txt";
+        std::cout << "iPhone: solving frame " << frameIndex
+                  << " (landmarks " << landmarkPath << ")\n";
 
         const std::vector<LandmarkObservation> observations =
             loadLandmarkObservations(landmarkPath);
+
+        // Interior-only subset (drop the -1 contour points) — Stage 1 pose needs
+        // fixed model vertices.
+        std::vector<LandmarkObservation> interiorObs;
+        std::copy_if(observations.begin(), observations.end(),
+                     std::back_inserter(interiorObs),
+                     [](const LandmarkObservation& o) { return o.vertexIndex >= 0; });
 
         PoseParameters initialPose;
         initialPose.translation =
             defaultTranslation().cast<double>();
 
-        // Stage 1: optimize only rotation and translation.
+        // Stage 1: optimize only rotation and translation (interior points only).
         const PoseParameters poseOnly =
             CeresFitter::fitPose(
                 meanShape,
-                observations,
+                interiorObs,
                 iphone.K(),
                 initialPose
             );
 
         // Stage 2: refine pose and optimize shape coefficients.
-        // Strong regulariser on purpose (100): only 9 landmarks (18 residuals)
-        // for 6 pose + 30 shape params, and 2D landmarks say nothing about depth.
-        // A weak reg improves the 2D reprojection but distorts the 3D geometry at
-        // the unobserved vertices; reg=100 keeps the shape near the mean (<1 mm).
-        // Real identity comes from the DENSE term, not from 9 landmarks.
-        const FitParameters poseAndShape =
-            CeresFitter::fitPoseAndShape(
-                meanShape,
-                bfm.shape_basis_raw(),
-                bfm.shape_sigma(),
-                observations,
-                iphone.K(),
-                poseOnly,
-                sparseReg
-            );
-        std::cout << "iPhone sparse: " << observations.size()
-                  << " Landmarks, reg=" << sparseReg << '\n';
+        // If the landmark file includes CONTOUR points (vertexIndex == -1, the
+        // jawline emitted by `gen_landmarks.py --contour`), use the contour fit:
+        // its sliding-silhouette term constrains face WIDTH, so a lower reg is
+        // used so the identity can actually widen. Otherwise fall back to the
+        // interior-only fit (strong reg — 9 interior landmarks say nothing about
+        // depth, so a weak reg would distort the 3D geometry).
+        const bool hasContour = std::any_of(
+            observations.begin(), observations.end(),
+            [](const LandmarkObservation& o) { return o.vertexIndex < 0; });
+
+        // The contour fit also solves EXPRESSION (delta) from the landmarks.
+        const FitParameters poseAndShape = hasContour
+            ? CeresFitter::fitPoseAndShapeContour(
+                  meanShape, bfm.shape_basis_raw(), bfm.shape_sigma(),
+                  bfm.expr_basis_raw(), bfm.expr_sigma(), bfm.faces(),
+                  observations, iphone.K(), poseOnly, sparseReg)
+            : CeresFitter::fitPoseAndShape(
+                  meanShape, bfm.shape_basis_raw(), bfm.shape_sigma(),
+                  observations, iphone.K(), poseOnly, sparseReg);
+        std::cout << "iPhone sparse: " << observations.size() << " landmarks ("
+                  << (hasContour ? "with contour+expr" : "interior only")
+                  << "), reg=" << sparseReg << '\n';
 
         const Eigen::VectorXf alpha =
             poseAndShape.shapeCoefficients.cast<float>();
 
+        // Full fitted geometry = identity + expression (neutral if no expr coeffs).
         const Eigen::MatrixX3f fittedShape =
-            bfm.shape(alpha);
+            poseAndShape.exprCoefficients.size()
+                ? bfm.shape(alpha, poseAndShape.exprCoefficients.cast<float>())
+                : bfm.shape(alpha);
 
         // Save the personalized 3D mesh.
         saveCurrentModel(
@@ -479,7 +507,7 @@ static void overlayMeshOnPhoto(
             const DenseIterationCallback writeProgress =
                 [&](int iteration, const FitParameters& current, double rmse) {
                     const RenderInput in{
-                        .shape  = bfm.shape(current.shapeCoefficients.cast<float>()),
+                        .shape  = fittedShape,              // frozen geometry (id+expr)
                         .albedo = albedoOf(current),        // estimated albedo
                         .R      = current.pose.rotationMatrix(),
                         .t      = current.pose.translation.cast<float>(),
@@ -500,22 +528,32 @@ static void overlayMeshOnPhoto(
                     cv::imwrite(name.str(), prog);
                 };
 
+            // Bake the full fitted geometry (identity + expression) into the base
+            // mesh and zero the identity coeffs, so the frozen Stage-3 geometry
+            // keeps BOTH the widened jaw and the expression.
+            FitParameters photoInit = poseAndShape;
+            photoInit.shapeCoefficients =
+                Eigen::VectorXd::Zero(kShapeCoefficientCount);
+
             const FitParameters photoFit = CeresFitter::fitPhotometric(
-                meanShape, bfm.shape_basis_raw(), bfm.shape_sigma(), bfm.faces(),
+                fittedShape, bfm.shape_basis_raw(), bfm.shape_sigma(), bfm.faces(),
                 albedo, bfm.color_basis_raw(), bfm.color_sigma(),
-                photo, iphone.K(), poseAndShape,
+                photo, iphone.K(), photoInit,
                 /*shapeRegWeight=*/sparseReg,
-                /*albedoRegWeight=*/100.0,
+                /*albedoRegWeight=*/50.0,
                 /*numIterations=*/10,
                 /*pixelStride=*/1,
                 /*photometricWeight=*/1.0,
-                /*optimizeShape=*/true,
+                // Freeze SHAPE here: identity/width already came from the contour
+                // landmark fit. The photometric term has no silhouette signal, so
+                // re-optimising shape only lets its mean-pulling prior erode the
+                // jaw width. Photometric refines pose + lighting + albedo only.
+                /*optimizeShape=*/false,
                 /*optimizeLighting=*/true,
                 /*optimizeAlbedo=*/true,
                 writeProgress);
 
-            const Eigen::MatrixX3f photoShape =
-                bfm.shape(photoFit.shapeCoefficients.cast<float>());
+            const Eigen::MatrixX3f photoShape = fittedShape;  // geometry frozen (id+expr)
             const Eigen::MatrixX3f photoAlbedo = albedoOf(photoFit);
             saveCurrentModel(kOutDir + "/fitted_face_photometric.obj",
                              photoShape, bfm.faces(), photoAlbedo);
@@ -911,6 +949,7 @@ int main(int argc, char** argv)
     std::string dataset = "biwi";
     double sparseReg = 100.0;
     int icpIters = 30;          // --icp-iters: outer ICP rounds of the dense fit
+    int iphoneFrame = 0;        // --iphone-frame: which iPhone RGB frame to solve
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--mode" && i + 1 < argc) mode = argv[++i];
@@ -922,6 +961,7 @@ int main(int argc, char** argv)
             kBiwiDir = "data/biwi/" + seq;
         }
         else if (arg == "--icp-iters" && i + 1 < argc) icpIters = std::stoi(argv[++i]);
+        else if (arg == "--iphone-frame" && i + 1 < argc) iphoneFrame = std::stoi(argv[++i]);
     }
 
     std::filesystem::create_directories(kOutDir);
@@ -958,11 +998,12 @@ int main(int argc, char** argv)
         // RGB-only analysis-by-synthesis: sparse landmark init → photometric
         // refinement. No depth needed, so it runs on the iPhone selfie.
         overlayMeshOnPhoto(bfm, meanShape, albedo, sparseReg,
-                           /*refinePhotometric=*/true);
+                           /*refinePhotometric=*/true, iphoneFrame);
     } else if (dataset == "biwi") {
         fitSparseOnBiwi(bfm, meanShape, albedo);         // Biwi RGB landmarks → fitted_face_biwi_sparse.obj
     } else {
-        overlayMeshOnPhoto(bfm, meanShape, albedo, sparseReg);  // iPhone RGB landmarks → fitted_face.obj
+        overlayMeshOnPhoto(bfm, meanShape, albedo, sparseReg,   // iPhone RGB landmarks → fitted_face.obj
+                           /*refinePhotometric=*/false, iphoneFrame);
     }
 
     renderMeanFace(bfm, meanShape, albedo);
