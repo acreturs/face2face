@@ -1036,6 +1036,20 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
     const int N = static_cast<int>(meanShape.rows());
     const float imgW = 2.0f * intrinsics(0, 2);   // ≈ image width (cx ≈ W/2)
 
+    // Face-size normalisation for the reprojection residuals. Their pixel
+    // magnitude scales with resolution / face size, but the L2 priors do not —
+    // so without this the fit over-articulates on a high-res (iPhone) frame and
+    // under-fits a low-res (Biwi) one. Weighting each reprojection residual by
+    // (refSize / faceSize)² makes the data-vs-prior balance resolution-free.
+    // (Depth residuals are metric mm — already scale-free — so left un-weighted.)
+    double uMin = 1e30, uMax = -1e30, vMin = 1e30, vMax = -1e30;
+    for (const LandmarkObservation& o : observations) {
+        uMin = std::min(uMin, o.imagePoint.x()); uMax = std::max(uMax, o.imagePoint.x());
+        vMin = std::min(vMin, o.imagePoint.y()); vMax = std::max(vMax, o.imagePoint.y());
+    }
+    const double faceSize = std::max(1.0, std::hypot(uMax - uMin, vMax - vMin));
+    const double reprojW  = std::pow(200.0 / faceSize, 2.0);  // 200 px reference face
+
     std::cout << "\nStarting pose+shape+EXPR CONTOUR fit: " << fixed.size()
               << " interior + " << contour.size() << " contour points"
               << (useDepth ? " + DEPTH (" + std::to_string(targetCloud->size()) +
@@ -1095,7 +1109,8 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
                         meanShape.row(o.vertexIndex).transpose(), o.vertexIndex,
                         shapeBasis, shapeSigma, exprBasis, exprSigma,
                         o.imagePoint, intrinsics)),
-                nullptr, angleAxis, translation, shapeCoefficients, exprCoefficients);
+                new ceres::ScaledLoss(nullptr, reprojW, ceres::TAKE_OWNERSHIP),
+                angleAxis, translation, shapeCoefficients, exprCoefficients);
         }
 
         // (c) contour points → nearest projected SILHOUETTE vertex (re-matched
@@ -1118,15 +1133,33 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
             }
             if (best < 0 || std::sqrt(bestD2) > 0.12 * imgW) continue;  // gate outliers
             ++matched;
-            problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<LandmarkShapeExprReprojectionResidual,
-                    2, 3, 3, kShapeCoefficientCount, kExpressionCoefficientCount>(
-                    new LandmarkShapeExprReprojectionResidual(
-                        meanShape.row(best).transpose(), best,
-                        shapeBasis, shapeSigma, exprBasis, exprSigma,
-                        o.imagePoint, intrinsics)),
-                new ceres::HuberLoss(0.02 * imgW), // robust to bad contour matches
-                angleAxis, translation, shapeCoefficients, exprCoefficients);
+            // The jaw silhouette is an IDENTITY signal (face width/length), not
+            // an expression one. When identity is free it drives identity only —
+            // otherwise the optimiser reaches a low jawline via the jaw-OPEN
+            // expression mode, wrongly opening the mouth. When identity is frozen
+            // (video tracking) the contour must drive expression instead.
+            if (optimizeIdentity) {
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<LandmarkShapeReprojectionResidual,
+                        2, 3, 3, kShapeCoefficientCount>(
+                        new LandmarkShapeReprojectionResidual(
+                            meanShape.row(best).transpose(), best,
+                            shapeBasis, shapeSigma, o.imagePoint, intrinsics)),
+                    new ceres::ScaledLoss(new ceres::HuberLoss(0.02 * imgW),
+                                          reprojW, ceres::TAKE_OWNERSHIP),
+                    angleAxis, translation, shapeCoefficients);
+            } else {
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<LandmarkShapeExprReprojectionResidual,
+                        2, 3, 3, kShapeCoefficientCount, kExpressionCoefficientCount>(
+                        new LandmarkShapeExprReprojectionResidual(
+                            meanShape.row(best).transpose(), best,
+                            shapeBasis, shapeSigma, exprBasis, exprSigma,
+                            o.imagePoint, intrinsics)),
+                    new ceres::ScaledLoss(new ceres::HuberLoss(0.02 * imgW),
+                                          reprojW, ceres::TAKE_OWNERSHIP),
+                    angleAxis, translation, shapeCoefficients, exprCoefficients);
+            }
         }
 
         // (c2) DEPTH term (full fit only): nearest model vertex per cloud point,
@@ -1143,17 +1176,35 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
                 }
                 if (best < 0) continue;
                 ++depthMatched;
-                problem.AddResidualBlock(
-                    new ceres::AutoDiffCostFunction<DepthShapeExprResidual,
-                        4, 3, 3, kShapeCoefficientCount, kExpressionCoefficientCount>(
-                        new DepthShapeExprResidual(
-                            meanShape.row(best).transpose(), best,
-                            shapeBasis, shapeSigma, exprBasis, exprSigma,
-                            tp, cloudNormals[ci], depthPointToPlaneWeight)),
-                    new ceres::ScaledLoss(new ceres::HuberLoss(10.0),   // 10 mm
-                                          sqrtDepthWeight * sqrtDepthWeight,
-                                          ceres::TAKE_OWNERSHIP),
-                    angleAxis, translation, shapeCoefficients, exprCoefficients);
+                // Depth is a geometry signal: drive IDENTITY when it is free, so
+                // a neutral scan is explained by identity (not by opening the
+                // mouth). When identity is frozen (tracking) depth drives
+                // expression instead.
+                if (optimizeIdentity) {
+                    problem.AddResidualBlock(
+                        new ceres::AutoDiffCostFunction<DepthPointResidual,
+                            4, 3, 3, kShapeCoefficientCount>(
+                            new DepthPointResidual(
+                                meanShape.row(best).transpose(), best,
+                                shapeBasis, shapeSigma,
+                                tp, cloudNormals[ci], depthPointToPlaneWeight)),
+                        new ceres::ScaledLoss(new ceres::HuberLoss(10.0),
+                                              sqrtDepthWeight * sqrtDepthWeight,
+                                              ceres::TAKE_OWNERSHIP),
+                        angleAxis, translation, shapeCoefficients);
+                } else {
+                    problem.AddResidualBlock(
+                        new ceres::AutoDiffCostFunction<DepthShapeExprResidual,
+                            4, 3, 3, kShapeCoefficientCount, kExpressionCoefficientCount>(
+                            new DepthShapeExprResidual(
+                                meanShape.row(best).transpose(), best,
+                                shapeBasis, shapeSigma, exprBasis, exprSigma,
+                                tp, cloudNormals[ci], depthPointToPlaneWeight)),
+                        new ceres::ScaledLoss(new ceres::HuberLoss(10.0),   // 10 mm
+                                              sqrtDepthWeight * sqrtDepthWeight,
+                                              ceres::TAKE_OWNERSHIP),
+                        angleAxis, translation, shapeCoefficients, exprCoefficients);
+                }
             }
         }
 
