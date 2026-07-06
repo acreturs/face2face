@@ -534,7 +534,84 @@ struct CoeffPriorResidual {
     double sqrtWeight_;
 };
 
+// Depth residual (point-to-point + point-to-plane) with BOTH identity AND
+// expression, so it can join the landmark/contour fit in ONE problem. Like
+// DepthPointResidual but with a 4th (expression) parameter block; the target
+// point/normal live in the SAME camera frame the fit optimises in (for Biwi we
+// pre-transform the depth cloud from the depth camera into the RGB camera).
+struct DepthShapeExprResidual {
+    DepthShapeExprResidual(
+        const Eigen::Vector3f& meanPoint, int vertexIndex,
+        const Eigen::MatrixXf& shapeBasis, const Eigen::VectorXf& shapeSigma,
+        const Eigen::MatrixXf& exprBasis,  const Eigen::VectorXf& exprSigma,
+        const Eigen::Vector3d& targetPoint, const Eigen::Vector3d& targetNormal,
+        double pointToPlaneWeight)
+        : targetX_(targetPoint.x()), targetY_(targetPoint.y()), targetZ_(targetPoint.z()),
+          normalX_(targetNormal.x()), normalY_(targetNormal.y()), normalZ_(targetNormal.z()),
+          sqrtPlaneWeight_(std::sqrt(pointToPlaneWeight))
+    {
+        const Eigen::Matrix3d M = proj::BFM_TO_CAM.cast<double>();
+        const Eigen::Vector3d m = M * meanPoint.cast<double>();
+        meanX_ = m.x(); meanY_ = m.y(); meanZ_ = m.z();
+        for (int k = 0; k < kShapeCoefficientCount; ++k) {
+            const Eigen::Vector3d a = M * Eigen::Vector3d(
+                shapeBasis(3 * vertexIndex + 0, k) * shapeSigma(k),
+                shapeBasis(3 * vertexIndex + 1, k) * shapeSigma(k),
+                shapeBasis(3 * vertexIndex + 2, k) * shapeSigma(k));
+            idX_[k] = a.x(); idY_[k] = a.y(); idZ_[k] = a.z();
+        }
+        for (int j = 0; j < kExpressionCoefficientCount; ++j) {
+            const Eigen::Vector3d a = M * Eigen::Vector3d(
+                exprBasis(3 * vertexIndex + 0, j) * exprSigma(j),
+                exprBasis(3 * vertexIndex + 1, j) * exprSigma(j),
+                exprBasis(3 * vertexIndex + 2, j) * exprSigma(j));
+            exX_[j] = a.x(); exY_[j] = a.y(); exZ_[j] = a.z();
+        }
+    }
+
+    template <typename T>
+    bool operator()(const T* const angleAxis, const T* const translation,
+                    const T* const idCoeff, const T* const exprCoeff,
+                    T* residuals) const {
+        T p[3] = { T(meanX_), T(meanY_), T(meanZ_) };
+        for (int k = 0; k < kShapeCoefficientCount; ++k) {
+            p[0] += T(idX_[k]) * idCoeff[k];
+            p[1] += T(idY_[k]) * idCoeff[k];
+            p[2] += T(idZ_[k]) * idCoeff[k];
+        }
+        for (int j = 0; j < kExpressionCoefficientCount; ++j) {
+            p[0] += T(exX_[j]) * exprCoeff[j];
+            p[1] += T(exY_[j]) * exprCoeff[j];
+            p[2] += T(exZ_[j]) * exprCoeff[j];
+        }
+        T r[3];
+        ceres::AngleAxisRotatePoint(angleAxis, p, r);
+        const T dx = (r[0] + translation[0]) - T(targetX_);
+        const T dy = (r[1] + translation[1]) - T(targetY_);
+        const T dz = (r[2] + translation[2]) - T(targetZ_);
+        residuals[0] = dx;
+        residuals[1] = dy;
+        residuals[2] = dz;
+        residuals[3] = T(sqrtPlaneWeight_) *
+                       (T(normalX_) * dx + T(normalY_) * dy + T(normalZ_) * dz);
+        return true;
+    }
+
+private:
+    double meanX_, meanY_, meanZ_;
+    std::array<double, kShapeCoefficientCount>      idX_, idY_, idZ_;
+    std::array<double, kExpressionCoefficientCount> exX_, exY_, exZ_;
+    double targetX_, targetY_, targetZ_;
+    double normalX_, normalY_, normalZ_;
+    double sqrtPlaneWeight_;
+};
+
 } // namespace
+
+// Estimate per-point cloud normals (defined below) — forward decl so the
+// contour+depth fit can call it.
+static std::vector<Eigen::Vector3d> estimateCloudNormals(
+    const std::vector<Eigen::Vector3d>& cloud, int k);
 
 Eigen::Matrix3f PoseParameters::rotationMatrix() const
 {
@@ -913,7 +990,14 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
     double                                   exprRegWeight,
     double                                   zMin,
     double                                   zMax,
-    int                                      numOuterIterations
+    int                                      numOuterIterations,
+    const std::vector<Eigen::Vector3d>*      targetCloud,
+    double                                   depthPointToPlaneWeight,
+    double                                   depthWeight,
+    int                                      depthVertexStride,
+    const Eigen::VectorXd&                   initialIdentity,
+    const Eigen::VectorXd&                   initialExpr,
+    bool                                     optimizeIdentity
 )
 {
     if (shapeBasis.cols() < kShapeCoefficientCount ||
@@ -921,6 +1005,15 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
         exprBasis.cols() < kExpressionCoefficientCount ||
         exprSigma.size() < kExpressionCoefficientCount)
         throw std::runtime_error("fitPoseAndShapeContour: BFM basis/sigma too small");
+
+    // Depth (full fit) setup: cloud normals for point-to-plane, a model-vertex
+    // subsample for correspondence, and √weight for the depth term.
+    const bool useDepth = targetCloud && !targetCloud->empty();
+    if (depthVertexStride < 1) depthVertexStride = 1;
+    const std::vector<Eigen::Vector3d> cloudNormals =
+        useDepth ? estimateCloudNormals(*targetCloud, 8)
+                 : std::vector<Eigen::Vector3d>{};
+    const double sqrtDepthWeight = std::sqrt(depthWeight);
 
     // Split interior (fixed vertex) vs contour (vertexIndex == -1) observations.
     std::vector<LandmarkObservation> fixed, contour;
@@ -935,13 +1028,20 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
                               initialPose.translation.z() };
     double shapeCoefficients[kShapeCoefficientCount]      = {0.0};
     double exprCoefficients[kExpressionCoefficientCount]  = {0.0};
+    for (int k = 0; k < kShapeCoefficientCount && k < initialIdentity.size(); ++k)
+        shapeCoefficients[k] = initialIdentity(k);         // warm start / personalised id
+    for (int j = 0; j < kExpressionCoefficientCount && j < initialExpr.size(); ++j)
+        exprCoefficients[j] = initialExpr(j);              // warm start expression
 
     const int N = static_cast<int>(meanShape.rows());
     const float imgW = 2.0f * intrinsics(0, 2);   // ≈ image width (cx ≈ W/2)
 
     std::cout << "\nStarting pose+shape+EXPR CONTOUR fit: " << fixed.size()
-              << " interior + " << contour.size() << " contour points, reg="
-              << regularizationWeight << " exprReg=" << exprRegWeight << '\n';
+              << " interior + " << contour.size() << " contour points"
+              << (useDepth ? " + DEPTH (" + std::to_string(targetCloud->size()) +
+                             " pts)" : "")
+              << ", reg=" << regularizationWeight << " exprReg=" << exprRegWeight
+              << '\n';
 
     for (int outer = 0; outer < numOuterIterations; ++outer) {
         // (a) reconstruct current shape (identity + expression), pose; project.
@@ -1029,27 +1129,63 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
                 angleAxis, translation, shapeCoefficients, exprCoefficients);
         }
 
-        // (d) identity + expression priors, and bounds on every block.
-        problem.AddResidualBlock(
-            new ceres::AutoDiffCostFunction<ShapeRegularizationResidual,
-                kShapeCoefficientCount, kShapeCoefficientCount>(
-                new ShapeRegularizationResidual(regularizationWeight)),
-            nullptr, shapeCoefficients);
+        // (c2) DEPTH term (full fit only): nearest model vertex per cloud point,
+        //      re-matched each outer iteration (ICP). Robust + weighted.
+        int depthMatched = 0;
+        if (useDepth) {
+            for (size_t ci = 0; ci < targetCloud->size(); ++ci) {
+                const Eigen::Vector3d& tp = (*targetCloud)[ci];
+                int best = -1; double bestD2 = std::numeric_limits<double>::max();
+                for (int v = 0; v < N; v += depthVertexStride) {
+                    const double d2 =
+                        (Vcam.row(v).transpose().cast<double>() - tp).squaredNorm();
+                    if (d2 < bestD2) { bestD2 = d2; best = v; }
+                }
+                if (best < 0) continue;
+                ++depthMatched;
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<DepthShapeExprResidual,
+                        4, 3, 3, kShapeCoefficientCount, kExpressionCoefficientCount>(
+                        new DepthShapeExprResidual(
+                            meanShape.row(best).transpose(), best,
+                            shapeBasis, shapeSigma, exprBasis, exprSigma,
+                            tp, cloudNormals[ci], depthPointToPlaneWeight)),
+                    new ceres::ScaledLoss(new ceres::HuberLoss(10.0),   // 10 mm
+                                          sqrtDepthWeight * sqrtDepthWeight,
+                                          ceres::TAKE_OWNERSHIP),
+                    angleAxis, translation, shapeCoefficients, exprCoefficients);
+            }
+        }
+
+        // (d) identity (unless frozen for tracking) + expression priors, bounds.
+        if (optimizeIdentity) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<ShapeRegularizationResidual,
+                    kShapeCoefficientCount, kShapeCoefficientCount>(
+                    new ShapeRegularizationResidual(regularizationWeight)),
+                nullptr, shapeCoefficients);
+            for (int k = 0; k < kShapeCoefficientCount; ++k) {
+                problem.SetParameterLowerBound(shapeCoefficients, k, -3.0);
+                problem.SetParameterUpperBound(shapeCoefficients, k,  3.0);
+            }
+        } else if (problem.HasParameterBlock(shapeCoefficients)) {
+            problem.SetParameterBlockConstant(shapeCoefficients);   // tracking: id fixed
+        }
         problem.AddResidualBlock(
             new ceres::AutoDiffCostFunction<CoeffPriorResidual<kExpressionCoefficientCount>,
                 kExpressionCoefficientCount, kExpressionCoefficientCount>(
                 new CoeffPriorResidual<kExpressionCoefficientCount>(exprRegWeight)),
             nullptr, exprCoefficients);
-        problem.SetParameterLowerBound(translation, 2, zMin);
-        problem.SetParameterUpperBound(translation, 2, zMax);
-        for (int a = 0; a < 3; ++a) {
-            problem.SetParameterLowerBound(angleAxis, a, -0.7);
-            problem.SetParameterUpperBound(angleAxis, a,  0.7);
+        if (problem.HasParameterBlock(translation)) {
+            problem.SetParameterLowerBound(translation, 2, zMin);
+            problem.SetParameterUpperBound(translation, 2, zMax);
         }
-        for (int k = 0; k < kShapeCoefficientCount; ++k) {
-            problem.SetParameterLowerBound(shapeCoefficients, k, -3.0);
-            problem.SetParameterUpperBound(shapeCoefficients, k,  3.0);
-        }
+        // Wide angle bounds so head rotation (Biwi video) is representable.
+        if (problem.HasParameterBlock(angleAxis))
+            for (int a = 0; a < 3; ++a) {
+                problem.SetParameterLowerBound(angleAxis, a, -1.5);
+                problem.SetParameterUpperBound(angleAxis, a,  1.5);
+            }
         for (int j = 0; j < kExpressionCoefficientCount; ++j) {
             problem.SetParameterLowerBound(exprCoefficients, j, -3.0);
             problem.SetParameterUpperBound(exprCoefficients, j,  3.0);
@@ -1063,8 +1199,10 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
 
-        std::cout << "  contour outer " << outer << " | matched " << matched
-                  << "/" << contour.size() << " | " << summary.BriefReport() << '\n';
+        std::cout << "  outer " << outer << " | contour " << matched << "/"
+                  << contour.size();
+        if (useDepth) std::cout << " | depth " << depthMatched;
+        std::cout << " | " << summary.BriefReport() << '\n';
     }
 
     FitParameters result;
@@ -1430,6 +1568,7 @@ FitParameters CeresFitter::fitPhotometric(
     bool                              optimizeShape,
     bool                              optimizeLighting,
     bool                              optimizeAlbedo,
+    bool                              optimizePose,
     const DenseIterationCallback&     onIteration
 )
 {
@@ -1668,17 +1807,27 @@ FitParameters CeresFitter::fitPhotometric(
             problem.SetParameterBlockConstant(shapeCoefficients);
         }
 
-        problem.SetParameterLowerBound(translation, 2, 100.0);
-        problem.SetParameterUpperBound(translation, 2, 3000.0);
+        // Pose: freeze for video tracking (pose comes from the depth fit), else
+        // refine it with the photometric term.
+        if (optimizePose) {
+            problem.SetParameterLowerBound(translation, 2, 100.0);
+            problem.SetParameterUpperBound(translation, 2, 3000.0);
+        } else {
+            problem.SetParameterBlockConstant(angleAxis);
+            problem.SetParameterBlockConstant(translation);
+        }
 
-        ceres::Solver::Options options;
-        options.linear_solver_type = ceres::DENSE_QR;
-        options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
-        options.max_num_iterations = 25;
-        options.minimizer_progress_to_stdout = false;
-
+        // Nothing left to solve (pose + shape both frozen) → the linear
+        // lighting/albedo estimate above is the whole update; skip Ceres.
         ceres::Solver::Summary summary;
-        ceres::Solve(options, &problem, &summary);
+        if (optimizePose || optimizeShape) {
+            ceres::Solver::Options options;
+            options.linear_solver_type = ceres::DENSE_QR;
+            options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+            options.max_num_iterations = 25;
+            options.minimizer_progress_to_stdout = false;
+            ceres::Solve(options, &problem, &summary);
+        }
 
         const double rmse = std::sqrt(sumSquared / used);   // render−photo RMSE, [0,1]
         std::cout << "  photo " << it << " | pixels " << used

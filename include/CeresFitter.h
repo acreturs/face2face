@@ -87,6 +87,11 @@ public:
     // Also solves EXPRESSION (delta): the expr basis is added to every landmark
     // residual as a 4th parameter block, so mouth/brow/lip landmarks move the
     // expression. Returned in result.exprCoefficients.
+    //
+    // FULL fit: if `targetCloud` is non-null (its points expressed in THIS fit's
+    // camera frame), a depth ICP term (point-to-point + point-to-plane) is added
+    // each outer iteration, so pose + identity + expression are solved jointly
+    // from landmarks, jaw-contour AND depth. Pass nullptr for the RGB-only fit.
     static FitParameters fitPoseAndShapeContour(
         const Eigen::MatrixX3f&                  meanShape,
         const Eigen::MatrixXf&                   shapeBasis,
@@ -101,7 +106,17 @@ public:
         double                                   exprRegWeight        = 30.0,
         double                                   zMin                 = 200.0,
         double                                   zMax                 = 600.0,
-        int                                      numOuterIterations   = 6
+        int                                      numOuterIterations   = 6,
+        const std::vector<Eigen::Vector3d>*      targetCloud          = nullptr,
+        double                                   depthPointToPlaneWeight = 1.0,
+        double                                   depthWeight             = 1.0,
+        int                                      depthVertexStride       = 8,
+        // ── video tracking ──  seed identity/expression (warm start) and freeze
+        // identity so per-frame tracking only solves pose + expression. Empty
+        // observations are allowed when a depth cloud drives the fit.
+        const Eigen::VectorXd&                   initialIdentity      = Eigen::VectorXd(),
+        const Eigen::VectorXd&                   initialExpr          = Eigen::VectorXd(),
+        bool                                     optimizeIdentity     = true
     );
 
     // Dense fit: outer ICP loop (re-find nearest-vertex correspondences →
@@ -167,6 +182,9 @@ public:
         bool                              optimizeShape     = true,
         bool                              optimizeLighting  = true,
         bool                              optimizeAlbedo    = true,
+        // For video tracking: freeze pose too, so the call only estimates
+        // lighting/albedo at a pose fixed by the (more reliable) depth fit.
+        bool                              optimizePose      = true,
         const DenseIterationCallback&     onIteration       = nullptr
     );
 };

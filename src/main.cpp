@@ -5,11 +5,13 @@
 #include "ProjectionUtils.h"
 #include "Lighting.h"
 #include "CeresFitter.h"
+#include "LandmarkDetector.h"
 
 #include <Eigen/Dense>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/videoio.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -24,23 +26,52 @@
 #include <vector>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Config
+// Config — every path and tunable lives here, grouped by concern.
 // ─────────────────────────────────────────────────────────────────────────────
-namespace {
+namespace cfg {
 
-const std::string kBfmPath      = "data/bfm/model2017-1_bfm_nomouth.h5";
-const std::string kIPhoneDir    = "data/iphone/default";
-std::string       kBiwiDir      = "data/biwi/01";   // selectable via --biwi-seq
-const std::string kOutDir       = "data/out";
+// ── input paths ──
+const std::string kBfmPath   = "data/bfm/model2017-1_bfm_nomouth.h5";
+const std::string kIPhoneDir = "data/iphone/default";
+std::string       kBiwiDir   = "data/biwi/01";   // set via --biwi-seq / --biwi-dir
+// Pretrained LBF landmark model (downloaded once by python/landmarks.py).
+const std::string kLbfModelPath = "models/lbfmodel.yaml";
 
-// Default debug pose: identity rotation, face this many mm in front of the
-// camera. Closer = Bigger in Image, Further = Smaller in Image. We want this
-// to be a reasonable initialisation close to my big head in the Selfie!! (Leon)
-constexpr float kFaceDepthMM = 350.0f;
+// ── output layout ──  each run writes into data/out/<tag>/ (iphone, biwi_rgb,
+// biwi_dense, debug) so datasets never clobber each other.
+const std::string kOutDir = "data/out";
+std::string outDir(const std::string& tag) {
+    const std::string d = kOutDir + "/" + tag;
+    std::filesystem::create_directories(d);
+    return d;
+}
 
-Eigen::Vector3f defaultTranslation() { return {0.0f, 0.0f, kFaceDepthMM}; }
+// ── initial face depth (mm) ──  a plausible pose init; the fit refines it.
+// iPhone selfies are at arm's length; Biwi seeds from the GT head centre.
+constexpr float kIphoneDepthMM = 350.0f;
 
-}  // namespace
+// ── sparse / contour landmark fit ──
+constexpr double kDefaultSparseReg  = 100.0;  // interior-only fit (--sparse-reg)
+constexpr int    kContourOuterIters = 20;
+
+// ── photometric (appearance) fit ──
+constexpr double kAlbedoRegWeight  = 50.0;
+constexpr int    kPhotoIterations  = 10;
+constexpr int    kPhotoPixelStride = 1;
+
+// ── depth term (Biwi "full" fit) ──
+constexpr int    kDepthBackprojStride     = 2;    // subsample the depth map
+constexpr double kDepthCropRadiusMM       = 100.0;
+constexpr double kDepthCropFrontSlabMM    = 90.0;
+constexpr double kDepthPointToPlaneWeight = 1.0;
+constexpr double kDepthWeight             = 1.0;  // depth term scale vs landmarks
+constexpr int    kDepthVertexStride       = 8;    // model subsample for ICP
+
+}  // namespace cfg
+
+// This is a single translation unit; pull the config names into scope so call
+// sites read cleanly (kOutDir, outDir(), tunables …).
+using namespace cfg;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Mesh serialisation
@@ -305,7 +336,7 @@ static void writeFitOutputs(
     }
 
     const std::string wireframePath =
-        kOutDir + "/" + tag + "_overlay_" + suffix + ".png";
+        outDir(tag) + "/overlay_" + suffix + ".png";
 
     cv::imwrite(wireframePath, wireframe);
 
@@ -329,7 +360,7 @@ static void writeFitOutputs(
         ).render(renderInput);
 
     const std::string renderPath =
-        kOutDir + "/render_overlay_" + tag + "_" + suffix + ".png";
+        outDir(tag) + "/render_overlay_" + suffix + ".png";
 
     overlayRenderOnPhoto(
         renderOutput,
@@ -341,245 +372,431 @@ static void writeFitOutputs(
 // Project the BFM mesh onto the first iPhone photo and save a wireframe overlay.
 // No-op (with a message) if the session or its frames are missing.
 
+// Full RGB analysis-by-synthesis fit on ONE image (no depth). Dataset-agnostic:
+// the iPhone and Biwi-RGB entry points both funnel through here with their own
+// image, intrinsics K, landmark file, output tag and initial face depth.
+//   Stage 1  fitPose                 -> pose
+//   Stage 2  fitPoseAndShapeContour  -> pose + identity + expression (+ jaw)
+//   Stage 3  fitPhotometric          -> lighting + albedo + pose (geometry frozen)
+static void fitRgbFrame(
+    const BFMLoader&        bfm,
+    const Eigen::MatrixX3f& meanShape,
+    const Eigen::MatrixX3f& albedo,
+    const cv::Mat&          photo,
+    const Eigen::Matrix3f&  K,
+    const std::string&      landmarkPath,
+    const std::string&      tag,            // output subfolder, e.g. "iphone"
+    double                  initZ,          // initial face depth mm (iPhone ~350, Biwi ~880)
+    double                  sparseReg,
+    bool                    refinePhotometric,
+    // Optional depth cloud (points already in THIS camera frame). When present,
+    // Stage 2 becomes the FULL fit: landmarks + contour + depth solved jointly.
+    const std::vector<Eigen::Vector3d>* depthCloud = nullptr)
+{
+    std::cout << "\n=== RGB fit [" << tag << "] : " << photo.cols << "x" << photo.rows
+              << ", initZ=" << initZ << "mm, landmarks " << landmarkPath << " ===\n";
+
+    const std::vector<LandmarkObservation> observations =
+        loadLandmarkObservations(landmarkPath);
+
+    // Interior-only subset (drop the -1 contour points) — Stage 1 needs fixed
+    // model vertices.
+    std::vector<LandmarkObservation> interiorObs;
+    std::copy_if(observations.begin(), observations.end(),
+                 std::back_inserter(interiorObs),
+                 [](const LandmarkObservation& o) { return o.vertexIndex >= 0; });
+
+    PoseParameters initialPose;
+    initialPose.translation = Eigen::Vector3d(0.0, 0.0, initZ);
+
+    // z-bounds scaled around the initial depth so the same code works at iPhone
+    // (~350 mm) and Biwi (~880 mm) distances.
+    const double zMin = 0.4 * initZ, zMax = 2.5 * initZ;
+
+    // Stage 1: pose only (interior points).
+    const PoseParameters poseOnly = CeresFitter::fitPose(
+        meanShape, interiorObs, K, initialPose, zMin, zMax);
+
+    // Stage 2: pose + identity + expression, with the sliding jaw-contour term
+    // if the landmark file carries -1 contour points.
+    const bool hasContour = std::any_of(
+        observations.begin(), observations.end(),
+        [](const LandmarkObservation& o) { return o.vertexIndex < 0; });
+
+    const FitParameters poseAndShape = hasContour
+        ? CeresFitter::fitPoseAndShapeContour(
+              meanShape, bfm.shape_basis_raw(), bfm.shape_sigma(),
+              bfm.expr_basis_raw(), bfm.expr_sigma(), bfm.faces(),
+              observations, K, poseOnly, sparseReg, /*exprReg=*/sparseReg,
+              zMin, zMax, kContourOuterIters,
+              depthCloud, kDepthPointToPlaneWeight, kDepthWeight, kDepthVertexStride)
+        : CeresFitter::fitPoseAndShape(
+              meanShape, bfm.shape_basis_raw(), bfm.shape_sigma(),
+              observations, K, poseOnly, sparseReg, zMin, zMax);
+    std::cout << tag << " sparse: " << observations.size() << " landmarks ("
+              << (hasContour ? "with contour+expr" : "interior only")
+              << (depthCloud ? " + depth" : "") << "), reg=" << sparseReg << '\n';
+
+    const Eigen::VectorXf alpha = poseAndShape.shapeCoefficients.cast<float>();
+    const Eigen::MatrixX3f fittedShape = poseAndShape.exprCoefficients.size()
+        ? bfm.shape(alpha, poseAndShape.exprCoefficients.cast<float>())
+        : bfm.shape(alpha);
+
+    saveCurrentModel(outDir(tag) + "/fitted_face.obj",
+                     fittedShape, bfm.faces(), albedo);
+    const Eigen::VectorXf disp = (fittedShape - meanShape).rowwise().norm();
+    std::cout << "Mean shape displacement: " << disp.mean()
+              << " mm, max " << disp.maxCoeff() << " mm\n";
+
+    writeFitOutputs("pose_only", photo, bfm, meanShape, albedo, K, poseOnly,
+                    tag, &observations);
+    writeFitOutputs("pose_and_shape", photo, bfm, fittedShape, albedo, K,
+                    poseAndShape.pose, tag, &observations);
+
+    if (!refinePhotometric) return;
+
+    // Stage 3: PHOTOMETRIC — estimate SH lighting + BFM albedo, refine pose;
+    // geometry (identity + expression) frozen from Stage 2.
+    const std::string progressDir = outDir(tag) + "/photo_progress";
+    std::filesystem::create_directories(progressDir);
+    const Renderer photoRenderer(photo.rows, photo.cols, bfm.faces());
+
+    const auto albedoOf = [&](const FitParameters& fp) -> Eigen::MatrixX3f {
+        if (fp.albedoCoefficients.size() == 0) return albedo;
+        Eigen::VectorXf betaFull = Eigen::VectorXf::Zero(bfm.color_sigma().size());
+        const int n = std::min<int>(fp.albedoCoefficients.size(), betaFull.size());
+        betaFull.head(n) = fp.albedoCoefficients.head(n).cast<float>();
+        return bfm.albedo(betaFull);
+    };
+
+    const DenseIterationCallback writeProgress =
+        [&](int iteration, const FitParameters& current, double rmse) {
+            const RenderInput in{
+                .shape  = fittedShape,
+                .albedo = albedoOf(current),
+                .R      = current.pose.rotationMatrix(),
+                .t      = current.pose.translation.cast<float>(),
+                .K      = K,
+                .sh     = current.sh,
+            };
+            cv::Mat prog = blendRenderOnPhoto(photoRenderer.render(in), photo);
+            std::ostringstream label;
+            label << "photo " << std::setw(2) << std::setfill('0') << iteration
+                  << " | colRMSE " << std::fixed << std::setprecision(3) << rmse;
+            cv::putText(prog, label.str(), {8, 28}, cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                        {0, 200, 0}, 2, cv::LINE_AA);
+            std::ostringstream name;
+            name << progressDir << "/photo_" << std::setw(2) << std::setfill('0')
+                 << iteration << ".png";
+            cv::imwrite(name.str(), prog);
+        };
+
+    FitParameters photoInit = poseAndShape;
+    photoInit.shapeCoefficients = Eigen::VectorXd::Zero(kShapeCoefficientCount);
+
+    const FitParameters photoFit = CeresFitter::fitPhotometric(
+        fittedShape, bfm.shape_basis_raw(), bfm.shape_sigma(), bfm.faces(),
+        albedo, bfm.color_basis_raw(), bfm.color_sigma(),
+        photo, K, photoInit,
+        /*shapeRegWeight=*/sparseReg,
+        kAlbedoRegWeight,
+        kPhotoIterations,
+        kPhotoPixelStride,
+        /*photometricWeight=*/1.0,
+        /*optimizeShape=*/false,   // geometry (id+expr) fixed from Stage 2
+        /*optimizeLighting=*/true,
+        /*optimizeAlbedo=*/true,
+        /*optimizePose=*/true,
+        writeProgress);
+
+    const Eigen::MatrixX3f photoAlbedo = albedoOf(photoFit);
+    saveCurrentModel(outDir(tag) + "/fitted_face_photometric.obj",
+                     fittedShape, bfm.faces(), photoAlbedo);
+
+    const RenderInput finalIn{
+        .shape  = fittedShape,
+        .albedo = photoAlbedo,
+        .R      = photoFit.pose.rotationMatrix(),
+        .t      = photoFit.pose.translation.cast<float>(),
+        .K      = K,
+        .sh     = photoFit.sh,
+    };
+    overlayRenderOnPhoto(photoRenderer.render(finalIn), photo,
+        outDir(tag) + "/render_photometric_appearance.png");
+    writeFitOutputs("photometric", photo, bfm, fittedShape, photoAlbedo, K,
+                    photoFit.pose, tag, &observations);
+}
+
+// iPhone entry point: load frame `frameIndex` + its landmarks, then fitRgbFrame.
 static void overlayMeshOnPhoto(
     const BFMLoader& bfm,
     const Eigen::MatrixX3f& meanShape,
     const Eigen::MatrixX3f& albedo,
-    // Shape regulariser λ of the sparse fit (--sparse-reg). Default 100 suits
-    // the 9-landmark set (0.9 mm displacement, plausible); the 25-point set on a
-    // high-res photo needs a much higher λ or it depth-overfits — see the study
-    // in report_figures/leon_landmark_reg_study/.
     double sparseReg = 100.0,
-    // When true, refine the sparse result with the dense PHOTOMETRIC term
-    // (RGB-only, no depth) and write an extra "photometric" overlay + mesh.
     bool refinePhotometric = false,
-    // Which iPhone frame to solve (--iphone-frame). Frame N uses RGB/00000N_RGB.png
-    // and landmarks_00000N.txt.
-    int frameIndex = 0
-)
+    int frameIndex = 0)
 {
     try {
-        // Load frames 0..frameIndex; we then pick frameIndex.
         IPhoneLoader iphone(kIPhoneDir, frameIndex + 1);
-
         const auto frames = iphone.getFrames();
-
         if (static_cast<int>(frames.size()) <= frameIndex) {
             std::cout << "iPhone: frame " << frameIndex << " not found in "
                       << kIPhoneDir << " (have " << frames.size() << ")\n";
             return;
         }
-
-        const cv::Mat& photo = frames[frameIndex].rgb;
-
         std::ostringstream stem;
         stem << std::setw(6) << std::setfill('0') << frameIndex;
-        const std::string landmarkPath =
-            kIPhoneDir + "/landmarks_" + stem.str() + ".txt";
-        std::cout << "iPhone: solving frame " << frameIndex
-                  << " (landmarks " << landmarkPath << ")\n";
-
-        const std::vector<LandmarkObservation> observations =
-            loadLandmarkObservations(landmarkPath);
-
-        // Interior-only subset (drop the -1 contour points) — Stage 1 pose needs
-        // fixed model vertices.
-        std::vector<LandmarkObservation> interiorObs;
-        std::copy_if(observations.begin(), observations.end(),
-                     std::back_inserter(interiorObs),
-                     [](const LandmarkObservation& o) { return o.vertexIndex >= 0; });
-
-        PoseParameters initialPose;
-        initialPose.translation =
-            defaultTranslation().cast<double>();
-
-        // Stage 1: optimize only rotation and translation (interior points only).
-        const PoseParameters poseOnly =
-            CeresFitter::fitPose(
-                meanShape,
-                interiorObs,
-                iphone.K(),
-                initialPose
-            );
-
-        // Stage 2: refine pose and optimize shape coefficients.
-        // If the landmark file includes CONTOUR points (vertexIndex == -1, the
-        // jawline emitted by `gen_landmarks.py --contour`), use the contour fit:
-        // its sliding-silhouette term constrains face WIDTH, so a lower reg is
-        // used so the identity can actually widen. Otherwise fall back to the
-        // interior-only fit (strong reg — 9 interior landmarks say nothing about
-        // depth, so a weak reg would distort the 3D geometry).
-        const bool hasContour = std::any_of(
-            observations.begin(), observations.end(),
-            [](const LandmarkObservation& o) { return o.vertexIndex < 0; });
-
-        // The contour fit also solves EXPRESSION (delta) from the landmarks.
-        const FitParameters poseAndShape = hasContour
-            ? CeresFitter::fitPoseAndShapeContour(
-                  meanShape, bfm.shape_basis_raw(), bfm.shape_sigma(),
-                  bfm.expr_basis_raw(), bfm.expr_sigma(), bfm.faces(),
-                  observations, iphone.K(), poseOnly, sparseReg)
-            : CeresFitter::fitPoseAndShape(
-                  meanShape, bfm.shape_basis_raw(), bfm.shape_sigma(),
-                  observations, iphone.K(), poseOnly, sparseReg);
-        std::cout << "iPhone sparse: " << observations.size() << " landmarks ("
-                  << (hasContour ? "with contour+expr" : "interior only")
-                  << "), reg=" << sparseReg << '\n';
-
-        const Eigen::VectorXf alpha =
-            poseAndShape.shapeCoefficients.cast<float>();
-
-        // Full fitted geometry = identity + expression (neutral if no expr coeffs).
-        const Eigen::MatrixX3f fittedShape =
-            poseAndShape.exprCoefficients.size()
-                ? bfm.shape(alpha, poseAndShape.exprCoefficients.cast<float>())
-                : bfm.shape(alpha);
-
-        // Save the personalized 3D mesh.
-        saveCurrentModel(
-            kOutDir + "/fitted_face.obj",
-            fittedShape,
-            bfm.faces(),
-            albedo
-        );
-
-        // Print how much the optimized shape differs from the mean shape.
-        const Eigen::VectorXf vertexDisplacement =
-            (fittedShape - meanShape).rowwise().norm();
-
-        std::cout
-            << "Mean shape displacement: "
-            << vertexDisplacement.mean()
-            << " mm\n";
-
-        std::cout
-            << "Maximum shape displacement: "
-            << vertexDisplacement.maxCoeff()
-            << " mm\n";
-
-        // Output 1: mean shape with pose-only optimization.
-        writeFitOutputs(
-            "pose_only",
-            photo,
-            bfm,
-            meanShape,
-            albedo,
-            iphone.K(),
-            poseOnly,
-            "iphone",
-            &observations
-        );
-
-        // Output 2: fitted shape with pose-and-shape optimization.
-        writeFitOutputs(
-            "pose_and_shape",
-            photo,
-            bfm,
-            fittedShape,
-            albedo,
-            iphone.K(),
-            poseAndShape.pose,
-            "iphone",
-            &observations
-        );
-
-        // Output 3 (optional): dense PHOTOMETRIC refinement — RGB only, no depth.
-        // Alternates estimating SH lighting + BFM albedo (both linear) with a
-        // per-pixel geometry refinement, so the render matches the selfie's
-        // colour AND lighting. Progress overlays → data/out/iphone_photo_progress/.
-        if (refinePhotometric) {
-            const std::string progressDir = kOutDir + "/iphone_photo_progress";
-            std::filesystem::create_directories(progressDir);
-            const Renderer photoRenderer(photo.rows, photo.cols, bfm.faces());
-
-            // Rebuild the per-vertex albedo from a fit's estimated β coeffs
-            // (empty ⇒ fall back to the mean albedo).
-            const auto albedoOf = [&](const FitParameters& fp) -> Eigen::MatrixX3f {
-                if (fp.albedoCoefficients.size() == 0) return albedo;
-                Eigen::VectorXf betaFull =
-                    Eigen::VectorXf::Zero(bfm.color_sigma().size());
-                const int n = std::min<int>(fp.albedoCoefficients.size(),
-                                            betaFull.size());
-                betaFull.head(n) = fp.albedoCoefficients.head(n).cast<float>();
-                return bfm.albedo(betaFull);
-            };
-
-            const DenseIterationCallback writeProgress =
-                [&](int iteration, const FitParameters& current, double rmse) {
-                    const RenderInput in{
-                        .shape  = fittedShape,              // frozen geometry (id+expr)
-                        .albedo = albedoOf(current),        // estimated albedo
-                        .R      = current.pose.rotationMatrix(),
-                        .t      = current.pose.translation.cast<float>(),
-                        .K      = iphone.K(),
-                        .sh     = current.sh,               // estimated lighting
-                    };
-                    cv::Mat prog = blendRenderOnPhoto(photoRenderer.render(in), photo);
-                    std::ostringstream label;
-                    label << "photo " << std::setw(2) << std::setfill('0')
-                          << iteration << " | colRMSE " << std::fixed
-                          << std::setprecision(3) << rmse;
-                    cv::putText(prog, label.str(), {8, 28},
-                                cv::FONT_HERSHEY_SIMPLEX, 0.7, {0, 200, 0}, 2,
-                                cv::LINE_AA);
-                    std::ostringstream name;
-                    name << progressDir << "/photo_" << std::setw(2)
-                         << std::setfill('0') << iteration << ".png";
-                    cv::imwrite(name.str(), prog);
-                };
-
-            // Bake the full fitted geometry (identity + expression) into the base
-            // mesh and zero the identity coeffs, so the frozen Stage-3 geometry
-            // keeps BOTH the widened jaw and the expression.
-            FitParameters photoInit = poseAndShape;
-            photoInit.shapeCoefficients =
-                Eigen::VectorXd::Zero(kShapeCoefficientCount);
-
-            const FitParameters photoFit = CeresFitter::fitPhotometric(
-                fittedShape, bfm.shape_basis_raw(), bfm.shape_sigma(), bfm.faces(),
-                albedo, bfm.color_basis_raw(), bfm.color_sigma(),
-                photo, iphone.K(), photoInit,
-                /*shapeRegWeight=*/sparseReg,
-                /*albedoRegWeight=*/50.0,
-                /*numIterations=*/10,
-                /*pixelStride=*/1,
-                /*photometricWeight=*/1.0,
-                // Freeze SHAPE here: identity/width already came from the contour
-                // landmark fit. The photometric term has no silhouette signal, so
-                // re-optimising shape only lets its mean-pulling prior erode the
-                // jaw width. Photometric refines pose + lighting + albedo only.
-                /*optimizeShape=*/false,
-                /*optimizeLighting=*/true,
-                /*optimizeAlbedo=*/true,
-                writeProgress);
-
-            const Eigen::MatrixX3f photoShape = fittedShape;  // geometry frozen (id+expr)
-            const Eigen::MatrixX3f photoAlbedo = albedoOf(photoFit);
-            saveCurrentModel(kOutDir + "/fitted_face_photometric.obj",
-                             photoShape, bfm.faces(), photoAlbedo);
-
-            // Final overlay rendered with the ESTIMATED lighting + albedo.
-            const RenderInput finalIn{
-                .shape  = photoShape,
-                .albedo = photoAlbedo,
-                .R      = photoFit.pose.rotationMatrix(),
-                .t      = photoFit.pose.translation.cast<float>(),
-                .K      = iphone.K(),
-                .sh     = photoFit.sh,
-            };
-            overlayRenderOnPhoto(
-                photoRenderer.render(finalIn), photo,
-                kOutDir + "/render_overlay_iphone_photometric_appearance.png");
-
-            writeFitOutputs("photometric", photo, bfm, photoShape, photoAlbedo,
-                            iphone.K(), photoFit.pose, "iphone", &observations);
-        }
+        fitRgbFrame(bfm, meanShape, albedo, frames[frameIndex].rgb, iphone.K(),
+                    kIPhoneDir + "/landmarks_" + stem.str() + ".txt", "iphone",
+                    kIphoneDepthMM, sparseReg, refinePhotometric);
+    } catch (const std::exception& e) {
+        std::cerr << "iPhone fit skipped: " << e.what() << '\n';
     }
-    catch (const std::exception& exception) {
-        std::cerr
-            << "iPhone projection skipped: "
-            << exception.what()
-            << '\n';
+}
+
+// Biwi RGB entry point: the same analysis-by-synthesis pipeline on a Biwi RGB
+// frame, using the rgb.cal intrinsics and the GT head depth as the init.
+//   useDepth = false → RGB-only fit (landmarks + contour + photometric).
+//   useDepth = true  → FULL fit: the Kinect depth cloud, transformed into the
+//                      RGB camera via the extrinsics, joins Stage 2 as an ICP
+//                      term, so geometry is anchored by metric depth.
+static void fitBiwiRgb(
+    const BFMLoader& bfm,
+    const Eigen::MatrixX3f& meanShape,
+    const Eigen::MatrixX3f& albedo,
+    double sparseReg,
+    bool refinePhotometric,
+    bool useDepth)
+{
+    try {
+        BiwiLoader biwi(kBiwiDir, 1);           // first available frame
+        const auto frames = biwi.getFrames();
+        if (frames.empty()) {
+            std::cout << "Biwi: no frames in " << kBiwiDir << '\n';
+            return;
+        }
+        const BiwiFrame& f = frames[0];
+        const BiwiCalibration cal = biwi.getCalibration();
+        std::ostringstream stem;
+        stem << std::setw(5) << std::setfill('0') << f.frameNumber;
+        const std::string tag = useDepth ? "biwi_full" : "biwi_rgb";
+
+        // Head centre in the RGB camera frame → init depth + cloud crop centre.
+        const Eigen::Vector3d headRgb = cal.R_rgb * f.headCenter + cal.t_rgb;
+
+        // Build the depth cloud in the RGB camera frame (only when requested).
+        std::vector<Eigen::Vector3d> headCloud;
+        if (useDepth) {
+            const std::vector<Eigen::Vector3d> cloudDepth = backprojectDepth(
+                f.depth, cal.K_depth, kDepthBackprojStride);
+            const std::vector<Eigen::Vector3d> headDepth = cropHead(
+                cloudDepth, f.headCenter, kDepthCropRadiusMM, kDepthCropFrontSlabMM);
+            headCloud.reserve(headDepth.size());
+            for (const Eigen::Vector3d& p : headDepth)
+                headCloud.push_back(cal.R_rgb * p + cal.t_rgb);  // depth → rgb frame
+            std::cout << "Biwi depth: " << headCloud.size()
+                      << " head points into the RGB fit\n";
+        }
+
+        fitRgbFrame(bfm, meanShape, albedo, f.rgb, cal.K_rgb,
+                    kBiwiDir + "/landmarks_" + stem.str() + ".txt", tag,
+                    headRgb.z(), sparseReg, refinePhotometric,
+                    useDepth ? &headCloud : nullptr);
+    } catch (const std::exception& e) {
+        std::cerr << "Biwi RGB fit skipped: " << e.what() << '\n';
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Offline VIDEO tracking (Biwi frame sequence)
+// ─────────────────────────────────────────────────────────────────────────────
+// Personalise identity + albedo on frame 0 (the expensive full fit), then TRACK
+// only pose + expression (+ lighting) on the rest, warm-started from the previous
+// frame with identity/albedo frozen. This is the split real-time reconstruction
+// needs. Adaptable:
+//   useDepth = true  → track via the depth cloud (robust to head rotation; only
+//                      frame 0 needs landmarks).
+//   useDepth = false → RGB-only: track via per-frame landmark files.
+static void fitBiwiVideo(
+    const BFMLoader& bfm,
+    const Eigen::MatrixX3f& meanShape,
+    const Eigen::MatrixX3f& albedo,
+    int numFrames,
+    double sparseReg,
+    bool useDepth)
+{
+    try {
+        BiwiLoader biwi(kBiwiDir, numFrames);
+        const std::vector<BiwiFrame> frames = biwi.getFrames();
+        if (frames.empty()) { std::cout << "Biwi: no frames in " << kBiwiDir << '\n'; return; }
+        const BiwiCalibration cal = biwi.getCalibration();
+
+        const std::string tag      = useDepth ? "biwi_video_full" : "biwi_video_rgb";
+        const std::string dir      = outDir(tag);
+        const std::string frameDir = outDir(tag + "/frames");
+        const cv::Size sz(frames[0].rgb.cols, frames[0].rgb.rows);
+        const Renderer renderer(sz.height, sz.width, bfm.faces());
+        cv::VideoWriter writer(dir + "/tracking.mp4",
+            cv::VideoWriter::fourcc('m', 'p', '4', 'v'), 15.0, sz);
+
+        const auto albedoOf = [&](const Eigen::VectorXd& beta) -> Eigen::MatrixX3f {
+            if (beta.size() == 0) return albedo;
+            Eigen::VectorXf bf = Eigen::VectorXf::Zero(bfm.color_sigma().size());
+            bf.head(std::min<int>(beta.size(), bf.size())) =
+                beta.head(std::min<int>(beta.size(), bf.size())).cast<float>();
+            return bfm.albedo(bf);
+        };
+        const auto headCloudRgb = [&](const BiwiFrame& f) {
+            std::vector<Eigen::Vector3d> head = cropHead(
+                backprojectDepth(f.depth, cal.K_depth, kDepthBackprojStride),
+                f.headCenter, kDepthCropRadiusMM, kDepthCropFrontSlabMM);
+            for (Eigen::Vector3d& p : head) p = cal.R_rgb * p + cal.t_rgb;  // → rgb frame
+            return head;
+        };
+        // In-process landmark detection — no per-frame Python round-trip.
+        LandmarkDetector detector(kLbfModelPath);
+        if (!detector.ok()) {
+            std::cerr << "video: landmark detector unavailable "
+                         "(is models/lbfmodel.yaml present?)\n";
+            return;
+        }
+
+        // Personalised (constant) parameters, filled on frame 0.
+        Eigen::VectorXd identity, betaVec;
+        light::SHCoeffs prevSh = light::defaultWhite();
+        // Per-frame history for constant-velocity motion PREDICTION: warm-start
+        // each frame from where the head is *heading* (prev + (prev − prev2)),
+        // not where it *was* — otherwise the tracker starts a frame behind and
+        // lags during motion.
+        PoseParameters  prevPose,  prev2Pose;
+        Eigen::VectorXd prevExpr,  prev2Expr;
+        bool            havePrev2 = false;
+
+        for (size_t i = 0; i < frames.size(); ++i) {
+            const BiwiFrame& f = frames[i];
+            const Eigen::Vector3d headRgb = cal.R_rgb * f.headCenter + cal.t_rgb;
+            const double zMin = 0.4 * headRgb.z(), zMax = 2.5 * headRgb.z();
+            std::vector<Eigen::Vector3d> cloud;
+            if (useDepth) cloud = headCloudRgb(f);
+            const std::vector<Eigen::Vector3d>* cloudPtr = useDepth ? &cloud : nullptr;
+
+            FitParameters geo;
+            if (i == 0) {
+                // ── PERSONALISE: full fit (identity + albedo + everything) ──
+                const std::vector<LandmarkObservation> obs = detector.detect(f.rgb);
+                if (obs.empty()) {
+                    std::cerr << "video: no face detected on the first frame — "
+                                 "cannot personalise\n";
+                    return;
+                }
+                std::vector<LandmarkObservation> interior;
+                std::copy_if(obs.begin(), obs.end(), std::back_inserter(interior),
+                             [](const LandmarkObservation& o) { return o.vertexIndex >= 0; });
+                PoseParameters init; init.translation = Eigen::Vector3d(0, 0, headRgb.z());
+                const PoseParameters poseOnly = CeresFitter::fitPose(
+                    meanShape, interior, cal.K_rgb, init, zMin, zMax);
+                geo = CeresFitter::fitPoseAndShapeContour(
+                    meanShape, bfm.shape_basis_raw(), bfm.shape_sigma(),
+                    bfm.expr_basis_raw(), bfm.expr_sigma(), bfm.faces(),
+                    obs, cal.K_rgb, poseOnly, sparseReg, sparseReg, zMin, zMax,
+                    kContourOuterIters, cloudPtr, kDepthPointToPlaneWeight,
+                    kDepthWeight, kDepthVertexStride);
+                identity = geo.shapeCoefficients;
+
+                const Eigen::MatrixX3f fitted = bfm.shape(
+                    identity.cast<float>(), geo.exprCoefficients.cast<float>());
+                FitParameters photoInit;
+                photoInit.pose = geo.pose;
+                photoInit.shapeCoefficients = Eigen::VectorXd::Zero(kShapeCoefficientCount);
+                const FitParameters photo = CeresFitter::fitPhotometric(
+                    fitted, bfm.shape_basis_raw(), bfm.shape_sigma(), bfm.faces(),
+                    albedo, bfm.color_basis_raw(), bfm.color_sigma(),
+                    f.rgb, cal.K_rgb, photoInit, sparseReg, kAlbedoRegWeight,
+                    kPhotoIterations, kPhotoPixelStride, 1.0,
+                    /*optimizeShape=*/false, /*optimizeLighting=*/true,
+                    /*optimizeAlbedo=*/true, /*optimizePose=*/true);
+                betaVec  = photo.albedoCoefficients;
+                prevPose = geo.pose;       // depth pose = the tracking reference
+                prevSh   = photo.sh;
+                prevExpr = geo.exprCoefficients;
+                std::cout << "[personalise] frame " << f.frameNumber
+                          << " — identity + albedo fixed for the rest\n";
+            } else {
+                // ── TRACK: pose + expression only, identity/albedo frozen ──
+                // RGB-only tracks from per-frame landmarks (detected in C++);
+                // depth tracks from the cloud (no landmarks needed).
+                std::vector<LandmarkObservation> obs;
+                if (!useDepth) {
+                    obs = detector.detect(f.rgb);
+                    if (obs.empty()) {
+                        std::cout << "  skip frame " << f.frameNumber
+                                  << " (no face detected)\n";
+                        continue;
+                    }
+                }
+                // Constant-velocity prediction of pose + expression → warm-start
+                // where the head is heading, not where it was (kills motion lag).
+                PoseParameters  initPose = prevPose;
+                Eigen::VectorXd initExpr = prevExpr;
+                if (havePrev2) {
+                    initPose.angleAxis   = 2.0 * prevPose.angleAxis   - prev2Pose.angleAxis;
+                    initPose.translation = 2.0 * prevPose.translation - prev2Pose.translation;
+                    initExpr = (2.0 * prevExpr - prev2Expr).cwiseMax(-3.0).cwiseMin(3.0);
+                }
+
+                geo = CeresFitter::fitPoseAndShapeContour(
+                    meanShape, bfm.shape_basis_raw(), bfm.shape_sigma(),
+                    bfm.expr_basis_raw(), bfm.expr_sigma(), bfm.faces(),
+                    obs, cal.K_rgb, initPose, sparseReg, sparseReg, zMin, zMax,
+                    /*numOuterIterations=*/3, cloudPtr, kDepthPointToPlaneWeight,
+                    kDepthWeight, kDepthVertexStride,
+                    identity, initExpr, /*optimizeIdentity=*/false);
+
+                const Eigen::MatrixX3f fitted = bfm.shape(
+                    identity.cast<float>(), geo.exprCoefficients.cast<float>());
+                FitParameters photoInit;
+                photoInit.pose = geo.pose;
+                photoInit.shapeCoefficients  = Eigen::VectorXd::Zero(kShapeCoefficientCount);
+                photoInit.albedoCoefficients = betaVec;
+                photoInit.sh = prevSh;
+                // Lighting only — pose stays FIXED at the depth-fit result, which
+                // is the authoritative tracking pose. Refining pose photometrically
+                // here (unreliable on low-res Biwi) is what drifted the tracker.
+                const FitParameters photo = CeresFitter::fitPhotometric(
+                    fitted, bfm.shape_basis_raw(), bfm.shape_sigma(), bfm.faces(),
+                    albedo, bfm.color_basis_raw(), bfm.color_sigma(),
+                    f.rgb, cal.K_rgb, photoInit, sparseReg, kAlbedoRegWeight,
+                    /*numIterations=*/2, kPhotoPixelStride, 1.0,
+                    /*optimizeShape=*/false, /*optimizeLighting=*/true,
+                    /*optimizeAlbedo=*/false, /*optimizePose=*/false);
+                prev2Pose = prevPose;  prev2Expr = prevExpr;   // shift history
+                prevPose  = geo.pose;  prevExpr  = geo.exprCoefficients;
+                prevSh    = photo.sh;
+                havePrev2 = true;
+            }
+
+            // Render the current fit over the frame and append to the video.
+            const Eigen::MatrixX3f fitted = bfm.shape(
+                identity.cast<float>(), prevExpr.cast<float>());
+            const RenderInput in{
+                .shape = fitted, .albedo = albedoOf(betaVec),
+                .R = prevPose.rotationMatrix(), .t = prevPose.translation.cast<float>(),
+                .K = cal.K_rgb, .sh = prevSh };
+            cv::Mat overlay = blendRenderOnPhoto(renderer.render(in), f.rgb);
+            cv::putText(overlay, (i == 0 ? "personalise" : "track"), {8, 20},
+                        cv::FONT_HERSHEY_SIMPLEX, 0.6, {0, 220, 0}, 2, cv::LINE_AA);
+            std::ostringstream name;
+            name << frameDir << "/frame_" << std::setw(5) << std::setfill('0')
+                 << f.frameNumber << ".png";
+            cv::imwrite(name.str(), overlay);
+            if (writer.isOpened()) writer.write(overlay);
+            std::cout << "video " << (i + 1) << "/" << frames.size()
+                      << " (biwi frame " << f.frameNumber << ")\n";
+        }
+        if (writer.isOpened()) writer.release();
+        std::cout << "Wrote tracking video → " << dir << "/tracking.mp4  (+ frames/)\n";
+    } catch (const std::exception& e) {
+        std::cerr << "Biwi video skipped: " << e.what() << '\n';
     }
 }
 
@@ -595,7 +812,7 @@ static void renderMeanFace(const BFMLoader&         bfm,
         .shape  = shape,
         .albedo = albedo,
         .R      = Eigen::Matrix3f::Identity(),
-        .t      = defaultTranslation(),
+        .t      = Eigen::Vector3f(0.0f, 0.0f, kIphoneDepthMM),
         .K      = proj::defaultIntrinsics(RW, RH),
         .sh     = light::defaultWhite(),
     };
@@ -605,8 +822,9 @@ static void renderMeanFace(const BFMLoader&         bfm,
     const int covered = cv::countNonZero(r.mask);
     std::cout << "render: " << covered << " / " << (RW * RH) << " pixels covered\n";
 
-    writeDepthVis  (r, kOutDir + "/render_depth.png");
-    writeColourImage(r, kOutDir + "/render_image.png");
+    const std::string dbg = outDir("debug");
+    writeDepthVis  (r, dbg + "/render_depth.png");
+    writeColourImage(r, dbg + "/render_image.png");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -656,7 +874,7 @@ static std::optional<FitParameters> fitSparseOnBiwi(
         const Eigen::MatrixX3f fittedShape =
             bfm.shape(poseAndShape.shapeCoefficients.cast<float>());
 
-        saveCurrentModel(kOutDir + "/fitted_face_biwi_sparse.obj",
+        saveCurrentModel(outDir("biwi_sparse") + "/fitted_face.obj",
                          fittedShape, bfm.faces(), albedo);
 
         writeFitOutputs("sparse", frame.rgb, bfm, fittedShape, albedo,
@@ -677,7 +895,7 @@ static std::optional<FitParameters> fitSparseOnBiwi(
                 .sh     = light::defaultWhite(),
             };
             writeColourImage(Renderer(RH, RW, bfm.faces()).render(portrait),
-                             kOutDir + "/biwi_sparse_face_render.png");
+                             outDir("biwi_sparse") + "/face_render.png");
         }
         return poseAndShape;
     }
@@ -755,7 +973,7 @@ static void fitDenseOnBiwi(const BFMLoader&        bfm,
                            (proj::BFM_TO_CAM.cast<double>() * c0);
 
         const cv::Mat depthViz = depthToBgr(frame.depth);
-        const std::string progressDir = kOutDir + "/biwi_icp_progress";
+        const std::string progressDir = outDir("biwi_dense") + "/icp_progress";
         std::filesystem::create_directories(progressDir);
         const Renderer depthRenderer(depthViz.rows, depthViz.cols, bfm.faces());
 
@@ -805,15 +1023,15 @@ static void fitDenseOnBiwi(const BFMLoader&        bfm,
         const Eigen::MatrixX3f fitted =
             bfm.shape(dense.shapeCoefficients.cast<float>());
 
-        saveCurrentModel(kOutDir + "/fitted_face_biwi_dense.obj",
+        saveCurrentModel(outDir("biwi_dense") + "/fitted_face.obj",
                          fitted, bfm.faces(), albedo);
 
         const Eigen::Matrix3f R = dense.pose.rotationMatrix();
         const Eigen::Vector3f t = dense.pose.translation.cast<float>();
         const Eigen::MatrixX3f posedCam = proj::toCameraFrame(fitted, R, t);
-        saveCurrentModel(kOutDir + "/fitted_face_biwi_dense_camframe.obj",
+        saveCurrentModel(outDir("biwi_dense") + "/fitted_face_camframe.obj",
                          posedCam, bfm.faces(), albedo);
-        savePointCloud(kOutDir + "/biwi_head_cloud.obj", head);
+        savePointCloud(outDir("biwi_dense") + "/head_cloud.obj", head);
 
         // ─── projective texture: sample the real photo colours onto the mesh ─
         // Geometry alone is not recognisable — the mean albedo always looks like
@@ -850,7 +1068,7 @@ static void fitDenseOnBiwi(const BFMLoader&        bfm,
             std::cout << "Projective texture: " << sampled << " / "
                       << posedCam.rows() << " vertices sampled from the photo\n";
         }
-        saveCurrentModel(kOutDir + "/fitted_face_biwi_textured.obj",
+        saveCurrentModel(outDir("biwi_dense") + "/fitted_face_textured.obj",
                          fitted, bfm.faces(), photoAlbedo);
 
         // Overlay 1: depth camera.
@@ -863,7 +1081,7 @@ static void fitDenseOnBiwi(const BFMLoader&        bfm,
             .sh     = light::defaultWhite(),
         };
         overlayRenderOnPhoto(depthRenderer.render(depthInput), depthViz,
-                             kOutDir + "/biwi_depth_overlay.png");
+                             outDir("biwi_dense") + "/depth_overlay.png");
 
         // Overlay 2 — the Biwi payoff: the same fitted pose transformed into
         // the RGB camera via the extrinsics and blended over the real photo.
@@ -882,7 +1100,7 @@ static void fitDenseOnBiwi(const BFMLoader&        bfm,
             .sh     = light::defaultWhite(),
         };
         overlayRenderOnPhoto(rgbRenderer.render(rgbInput), frame.rgb,
-                             kOutDir + "/biwi_rgb_overlay_dense.png");
+                             outDir("biwi_dense") + "/rgb_overlay.png");
 
         // The same copy with the photo texture — the most convincing view:
         // when geometry AND colour match, the (green) boundary is nearly
@@ -890,7 +1108,7 @@ static void fitDenseOnBiwi(const BFMLoader&        bfm,
         rgbInput.albedo = photoAlbedo;
         const RenderOutput texturedRender = rgbRenderer.render(rgbInput);
         overlayRenderOnPhoto(texturedRender, frame.rgb,
-                             kOutDir + "/biwi_rgb_overlay_textured.png");
+                             outDir("biwi_dense") + "/rgb_overlay_textured.png");
 
         // 100% variant: NO blend, NO contour — inside the render mask the
         // render fully replaces the photo, so everything there is purely the
@@ -901,9 +1119,9 @@ static void fitDenseOnBiwi(const BFMLoader&        bfm,
             renderBgr.convertTo(renderBgr, CV_8UC3, 255.0f);
             cv::Mat hard = frame.rgb.clone();
             renderBgr.copyTo(hard, texturedRender.mask);
-            cv::imwrite(kOutDir + "/biwi_rgb_overlay_textured_100.png", hard);
+            cv::imwrite(outDir("biwi_dense") + "/rgb_overlay_textured_100.png", hard);
             std::cout << "render overlay (100%) → "
-                      << kOutDir + "/biwi_rgb_overlay_textured_100.png" << '\n';
+                      << outDir("biwi_dense") + "/rgb_overlay_textured_100.png" << '\n';
         }
 
         // Frontal portrait of the fitted identity: once with the mean albedo
@@ -921,10 +1139,10 @@ static void fitDenseOnBiwi(const BFMLoader&        bfm,
             };
             const Renderer portraitRenderer(RH, RW, bfm.faces());
             writeColourImage(portraitRenderer.render(portrait),
-                             kOutDir + "/biwi_face_render.png");
+                             outDir("biwi_dense") + "/face_render.png");
             portrait.albedo = photoAlbedo;
             writeColourImage(portraitRenderer.render(portrait),
-                             kOutDir + "/biwi_face_render_textured.png");
+                             outDir("biwi_dense") + "/face_render_textured.png");
         }
 
         const Eigen::VectorXf disp = (fitted - meanShape).rowwise().norm();
@@ -945,11 +1163,14 @@ int main(int argc, char** argv)
     // --biwi-seq <NN>: Biwi sequence (01..24, default 01). Generate landmarks
     // once: python3 python/gen_landmarks.py --set dense
     //   data/biwi/NN/frame_XXXXX_rgb.png data/biwi/NN/landmarks_XXXXX.txt
-    std::string mode = "sparse";
-    std::string dataset = "biwi";
-    double sparseReg = 100.0;
-    int icpIters = 30;          // --icp-iters: outer ICP rounds of the dense fit
-    int iphoneFrame = 0;        // --iphone-frame: which iPhone RGB frame to solve
+    // ── CLI ──
+    std::string mode        = "sparse";  // sparse | dense | full | photometric
+    std::string dataset     = "biwi";    // biwi | iphone
+    double      sparseReg   = kDefaultSparseReg;   // --sparse-reg
+    int         icpIters    = 30;        // --icp-iters: dense-fit outer rounds
+    int         iphoneFrame = 0;         // --iphone-frame: which iPhone frame
+    int         numFrames   = 30;        // --frames: video-mode frame count
+    bool        useDepth    = false;     // --depth: add the depth term
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--mode" && i + 1 < argc) mode = argv[++i];
@@ -960,8 +1181,11 @@ int main(int argc, char** argv)
             if (seq.size() == 1) seq = "0" + seq;
             kBiwiDir = "data/biwi/" + seq;
         }
+        else if (arg == "--biwi-dir" && i + 1 < argc) kBiwiDir = argv[++i];  // e.g. data/BK-1/01
         else if (arg == "--icp-iters" && i + 1 < argc) icpIters = std::stoi(argv[++i]);
         else if (arg == "--iphone-frame" && i + 1 < argc) iphoneFrame = std::stoi(argv[++i]);
+        else if (arg == "--frames" && i + 1 < argc) numFrames = std::stoi(argv[++i]);
+        else if (arg == "--depth") useDepth = true;
     }
 
     std::filesystem::create_directories(kOutDir);
@@ -974,12 +1198,17 @@ int main(int argc, char** argv)
     const Eigen::MatrixX3f albedo    = bfm.albedo();   // mean albedo (β = 0)
     std::cout << "BFM: " << meanShape.rows() << " vertices, "
               << bfm.faces().rows() << " triangles\n";
-    std::cout << "Mode: " << mode << "  Dataset: " << dataset << '\n';
+    std::cout << "Mode: " << mode << "  Dataset: " << dataset
+              << (useDepth ? "  (+depth)" : "") << '\n';
 
-    saveCurrentModel(kOutDir + "/current_face.obj", meanShape, bfm.faces(), albedo);
+    saveCurrentModel(outDir("debug") + "/current_face.obj", meanShape,
+                     bfm.faces(), albedo);
 
-    if (mode == "dense") {
-        fitDenseOnBiwi(bfm, meanShape, albedo,           // Biwi depth → fitted_face_biwi_dense.obj
+    if (mode == "video") {
+        // Offline video: personalise on frame 0, then track the sequence.
+        fitBiwiVideo(bfm, meanShape, albedo, numFrames, sparseReg, useDepth);
+    } else if (mode == "dense") {
+        fitDenseOnBiwi(bfm, meanShape, albedo,           // Biwi depth → data/out/biwi_dense/
                        nullptr, icpIters);
     } else if (mode == "full") {
         // Two-stage pipeline: first the cheap, robust landmark fit (pins the
@@ -995,10 +1224,14 @@ int main(int argc, char** argv)
         fitDenseOnBiwi(bfm, meanShape, albedo,
                        sparse ? &*sparse : nullptr, icpIters);
     } else if (mode == "photometric") {
-        // RGB-only analysis-by-synthesis: sparse landmark init → photometric
-        // refinement. No depth needed, so it runs on the iPhone selfie.
-        overlayMeshOnPhoto(bfm, meanShape, albedo, sparseReg,
-                           /*refinePhotometric=*/true, iphoneFrame);
+        // Analysis-by-synthesis: landmark+contour+expr init → photometric.
+        // On Biwi, --depth adds the metric depth term (the FULL fit).
+        if (dataset == "biwi")
+            fitBiwiRgb(bfm, meanShape, albedo, sparseReg,
+                       /*refinePhotometric=*/true, useDepth);
+        else
+            overlayMeshOnPhoto(bfm, meanShape, albedo, sparseReg,
+                               /*refinePhotometric=*/true, iphoneFrame);
     } else if (dataset == "biwi") {
         fitSparseOnBiwi(bfm, meanShape, albedo);         // Biwi RGB landmarks → fitted_face_biwi_sparse.obj
     } else {
