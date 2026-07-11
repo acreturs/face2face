@@ -3,8 +3,8 @@
 # Compiles the loaders + main into one binary and runs it.
 #
 #   make                                # build  -> build/face_recon
-#   make run                            # build + run with the defaults below
-#   make run NUM_IMAGES=20 RGBD=false   # override the runtime options
+#   make run                            # build + run (defaults below)
+#   make run MODE=rgbd BIWI_DIR=data/BK-1/01   # override the runtime options
 #   make clean                          # remove build/
 #
 # Dependencies (all in the dev container): Eigen, OpenCV, HDF5, HighFive.
@@ -12,8 +12,10 @@
 # =============================================================================
 
 # ---- runtime options (forwarded to the program as CLI args) -----------------
-NUM_IMAGES ?= 1
-RGBD       ?= true
+# Modes: rgb | rgbd | live-cpu | live-gpu | dense | full | sparse  (Biwi only)
+MODE      ?= rgb
+BIWI_DIR  ?= data/BK-1/01
+FRAMES    ?= 30
 
 # ---- toolchain --------------------------------------------------------------
 CXX  ?= g++
@@ -46,7 +48,7 @@ CXXFLAGS = $(STD) $(OPT) $(WARN) -Iinclude $(HIGHFIVE_INC) $(PKG_CFLAGS) $(HDF5_
 LDLIBS   = $(PKG_LIBS) $(HDF5_LIBS) -lceres -lglog -lpthread
 
 # ---- sources ----------------------------------------------------------------
-SRCS = src/main.cpp src/BFMLoader.cpp src/PandoraLoader.cpp src/iPhoneLoader.cpp src/render/Renderer.cpp src/render/ProjectionUtils.cpp src/render/Lighting.cpp src/CeresFitter.cpp
+SRCS = src/main.cpp src/BFMLoader.cpp src/BiwiLoader.cpp src/render/Renderer.cpp src/render/ProjectionUtils.cpp src/render/Lighting.cpp src/CeresFitter.cpp src/LandmarkDetector.cpp src/FaceTracker.cpp
 HDRS = $(wildcard include/*.h)
 BIN  = build/face_recon
 
@@ -61,7 +63,7 @@ $(BIN): $(SRCS) $(HDRS) | $(HIGHFIVE_DIR)
 	$(CXX) $(CXXFLAGS) $(SRCS) -o $@ $(LDLIBS)
 
 run: $(BIN)
-	./$(BIN)
+	./$(BIN) --mode $(MODE) --biwi-dir $(BIWI_DIR) --frames $(FRAMES)
 
 # fetch the header-only HighFive once (needs git + network; ~one-time)
 $(HIGHFIVE_DIR):

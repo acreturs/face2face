@@ -6,7 +6,7 @@ build/
 # Vendored header-only deps fetched by the Makefile
 third_party/
 
-# Datasets & models -- LICENSED, must never be committed (BFM + Pandora forbid redistribution)
+# Datasets & models -- LICENSED, must never be committed (BFM + Biwi forbid redistribution)
 data/
 models/
 
@@ -20,8 +20,20 @@ __pycache__/
 *.swp
 .DS_Store
 
-# For My personal doc (Alex needs some extra explanation)
+# For My personal docs (Alex needs some extra explanation) — never pushed
 DOKUMENTATION.md
+DOKUMENTATION_full_backup.md
+
+# Generated images, meshes & report figures — local only, never pushed
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tif
+*.tiff
+*.obj
+*.ply
 
 # AI assistant / agent tooling
 .claude/
@@ -37,3 +49,6 @@ ceres_projection_test
 ceres_projection_test.cpp
 ceres_test
 ceres_test.cpp
+
+# Author guidelines / paper template (not part of the codebase)
+LaTeXAuthor_Guidelines_for_Proceedings.pdf

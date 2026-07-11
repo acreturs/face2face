@@ -14,13 +14,13 @@ There are **two ways** to run this project. You do **not** need `docker-compose`
 
 ## 0. Get the data (everyone does this — it is NOT in git)
 
-The BFM and Pandora are licensed, so `data/` is gitignored and shared by **no one**.
+The BFM and Biwi are licensed, so `data/` is gitignored and shared by **no one**.
 After cloning, each teammate obtains the data themselves and drops it in:
 
 ```
 data/
 ├── bfm/model2017-1_bfm_nomouth.h5      # request: https://faces.dmi.unibas.ch/bfm/bfm2017/restricted/model2017-1_bfm_nomouth.h5 (is my personal link might not work)
-└── pandora/base_1_ID01/                # request: https://www.dropbox.com/home/pandora/01/base_1_ID01 (Leo uploaded a subset -> he has to add you)
+└── biwi/                               # fully scripted: python3 python/get_biwi.py --all  (see README)
     ├── RGB/  DEPTH/  data.json  data.txt
 ```
 
@@ -70,7 +70,7 @@ docker run --rm -it -v "$PWD":/workspace -w /workspace facerecon bash
 
 - **In git (~112 KB):** source, headers, `Makefile`, `.devcontainer/`,
   `python/` (incl. `config.yaml`), docs.
-- **Not in git:** `data/` (licensed BFM + Pandora, ~GBs), `build/`,
+- **Not in git:** `data/` (licensed BFM + Biwi, ~GBs), `build/`,
   `__pycache__/`, the Docker image itself. The libraries are installed *inside*
   the image from the `Dockerfile`; only the recipe is committed, never the libs.
 
