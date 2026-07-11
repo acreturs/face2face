@@ -15,34 +15,51 @@ first, so nothing to download on a normal container run.
 
 ## 1. Every mode at a glance
 
-| `--mode` | `--dataset` | What it does | Landmarks | Needs depth? |
-|---|---|---|---|---|
-| `sparse` (default) | `iphone` | Pose + identity from 2D landmarks only | **auto (YuNet)** | no |
-| `sparse` | `biwi` | Same, on a Biwi RGB frame | file | no |
-| `dense` | `biwi` | Depth-only ICP (geometry, no photo term) | none | yes |
-| `full` | `biwi` | Stage 1 sparse landmark fit → Stage 2 dense ICP (no photometric) | file | yes |
-| `photometric` | `iphone` | Sparse+contour+expression → photometric (lighting+albedo). RGB only. | **auto (YuNet)** | no |
-| `photometric` | `biwi` | Same, on a Biwi RGB frame. Add `--depth` for the **full depth+photo+sparse fit** (see §3) | **auto (YuNet)** | optional |
-| `video` | `biwi` | Personalise on frame 0, then track a sequence (pose+expression only) | **auto (YuNet)** | optional (`--depth`) |
+The only dataset is **Biwi** (Kinect RGB-D). Everything is selected with
+`--mode`; there is no `--dataset` flag. The two primary modes reconstruct a
+**video sequence**; the geometry modes operate on a single frame.
 
-**auto (YuNet)** = landmarks are detected in-process by the C++ `LandmarkDetector`
-(YuNet CNN face box + pose-robust 5 points, LBF jaw contour) — no Python step,
-no landmark file. **file** = still reads a pre-generated `landmarks_XXXXX.txt`
+| `--mode` | What it does | Depth | Landmarks |
+|---|---|---|---|
+| **`rgb`** | Video: personalise frame 0, then track pose+expression. Landmarks + jaw contour + photometric (lighting/albedo). | no | auto (YuNet) |
+| **`rgbd`** | Same, **plus the metric Kinect depth ICP term** (the full fit). | yes | auto (YuNet) |
+| **`live-cpu`** | Realtime from the Mac camera, CPU tracker (§4b). **HOST only.** | no | auto (YuNet) |
+| **`live-gpu`** | Realtime on the GPU — **stub**, under development by the GPU team. | — | — |
+| `dense` | Single frame: depth-only ICP (geometry, no photometric). | yes | none |
+| `full` | Single frame: sparse landmark fit → dense ICP. | yes | file (Stage 1) |
+
+**auto (YuNet)** = landmarks are detected in-process by the C++
+`LandmarkDetector` (YuNet CNN face box + pose-robust 5 points + LBF jaw contour)
+— no Python step, no landmark file. Switch backend with `--detector` (§2).
+`full`'s Stage-1 sparse fit still reads a pre-generated `landmarks_XXXXX.txt`
 (see §2).
-
-`--dataset iphone` only ever runs RGB-only (no depth exists for the iPhone
-selfie); `--dataset biwi` is where the depth term is available.
 
 ---
 
 ## 2. Landmarks
 
-Most modes now detect landmarks **in-process** (C++ `LandmarkDetector`: YuNet
-face box + pose-robust 5 points + LBF jaw contour) — **no landmark file and no
-Python step**. This covers: iPhone (`sparse`/`photometric`), Biwi
-`photometric` (incl. `--depth`), and `video`.
+Three landmark backends, selected with **`--detector yunet|lbf|mediapipe`**
+(default `yunet`):
 
-Only two modes still read a pre-generated `landmarks_XXXXX.txt` file:
+| `--detector` | Source | Points | Notes |
+|---|---|---|---|
+| `yunet` (default) | in-process C++ | 5 pose-robust interior (YuNet CNN) + 8 LBF jaw contour | best pose robustness, no pre-pass |
+| `lbf` | in-process C++ | 9 interior + 8 jaw, all from Haar+LBF | the legacy detector; frontal-biased |
+| `mediapipe` | **offline pre-pass files** | 8 interior (incl. upper/lower lip + chin) + 8 jaw contour | densest; MediaPipe is Bazel-built so it runs as a Python pre-pass, not in the binary |
+
+For `mediapipe`, run the pre-pass once per sequence/image (writes
+`landmarks_mp_XXXXX.txt` next to the frames; mediapipe is preinstalled in the
+devcontainer image):
+
+```bash
+python3 python/gen_landmarks_mediapipe.py --biwi-dir data/BK-1/01 [--max N]
+python3 python/gen_landmarks_mediapipe.py --iphone-dir data/iphone/default
+```
+
+`yunet`/`lbf` need **no landmark file and no Python step** for: iPhone
+(`sparse`/`photometric`), Biwi `photometric` (incl. `--depth`), and `video`.
+
+Only two modes still read the old pre-generated `landmarks_XXXXX.txt` file:
 `--mode sparse --dataset biwi` and `--mode full --dataset biwi` (its Stage-1
 sparse fit). For those, generate the file once with the in-repo Python tool
 (one line per point: `bfm_vertex_index u v`; `-1` = jaw-contour point):
@@ -62,73 +79,98 @@ ls data/BK-1/01/*_rgb.png | sed -E 's/.*frame_([0-9]+)_rgb.*/\1/' | sort -n
 
 ---
 
-## 3. Full Biwi fit (depth + photo + sparse) for a given person and frame
+## 3. The full RGB-D reconstruction (`rgbd`)
 
-This is the complete analysis-by-synthesis pipeline in one run: **sparse
-landmarks → jaw-contour + expression + depth ICP (jointly) → photometric
-(lighting + albedo)**. Landmarks are detected in-process (YuNet) — **no landmark
-file needed**. Person = the Biwi subject folder; frame = a specific
-`frame_XXXXX` in it, selected by its 0-based index via `--biwi-frame`.
-
-```bash
-# 1. Pick a person (subject folder) and frame number, e.g. subject 01, frame 00201
-PERSON=data/BK-1/01
-FRAME=00201
-
-# 2. Find that frame's INDEX in the sorted frame list (0-based). --biwi-frame
-#    selects by index, not by raw frame number. grep -n gives the 1-based line
-#    number, so the index is (that number − 1).
-ls $PERSON/*_rgb.png | sed -E 's/.*frame_([0-9]+)_rgb.*/\1/' | sort -n | grep -n "^${FRAME}$"
-# → e.g. "199:00201"  means line 199, so index = 198
-
-# 3. Run the full fit (--depth is what adds the depth ICP term)
-./build/face_recon --mode photometric --dataset biwi \
-    --biwi-dir $PERSON --biwi-frame 198 --depth --sparse-reg 30
-```
-
-If you just want the **first available frame** of a person (simplest case,
-`--biwi-frame` defaults to `0`):
+The complete analysis-by-synthesis pipeline on a Biwi sequence, per frame:
+**sparse landmarks → jaw-contour + expression + depth ICP (jointly) →
+photometric (lighting + albedo)**, with identity + albedo personalised on
+frame 0 and frozen for tracking. Landmarks are detected in-process (YuNet) —
+**no landmark file needed**.
 
 ```bash
-./build/face_recon --mode photometric --dataset biwi \
-    --biwi-dir data/BK-1/01 --depth --sparse-reg 30
+# subject 01, first 200 frames, with the depth term
+./build/face_recon --mode rgbd --biwi-dir data/BK-1/01 --frames 200 --sparse-reg 30
 ```
 
-**Outputs** land in `data/out/biwi_full/` (see §5), including
-`mask_panels_photometric.png` — the overlay + reconstruction-only views side
-by side, which is the quickest way to check the fit.
+**Outputs** land in `data/out/biwi_video_full/`: `tracking.mp4` plus per-frame
+3-panel PNGs (overlay | reconstruction @ pose | reconstruction frontal) in
+`frames/`.
 
-Drop `--depth` to run the same pipeline **RGB-only** (no depth term) —
-outputs go to `data/out/biwi_rgb/` instead.
+Use `--mode rgb` for the same pipeline **without** the depth term (RGB-only);
+outputs go to `data/out/biwi_video_rgb/`.
 
 ---
 
 ## 4. Other common runs
 
 ```bash
-# iPhone: sparse pose+identity only
-./build/face_recon --mode sparse --dataset iphone
+# RGB-only video (no depth)
+./build/face_recon --mode rgb --biwi-dir data/BK-1/01 --frames 200 --sparse-reg 30
 
-# iPhone: full RGB analysis-by-synthesis (sparse+contour+expr → photometric)
-./build/face_recon --mode photometric --dataset iphone --sparse-reg 30 --iphone-frame 0
+# RGB-D video with the MediaPipe detector (run the pre-pass first — see §2)
+./build/face_recon --mode rgbd --biwi-dir data/BK-1/01 --frames 200 \
+    --sparse-reg 30 --detector mediapipe
 
-# Biwi: sparse landmarks only  (needs a landmarks_XXXXX.txt file — see §2)
-./build/face_recon --mode sparse --dataset biwi --biwi-dir data/BK-1/01
-
-# Biwi: depth-only ICP (no landmarks, no photo term)
+# Depth-only ICP on a single frame (geometry, no photometric)
 ./build/face_recon --mode dense --biwi-dir data/BK-1/01 --icp-iters 30
 
-# Biwi: sparse landmark init → dense ICP (no photometric; needs a file — see §2)
+# Single-frame sparse landmark init → dense ICP (Stage 1 needs a file — see §2)
 ./build/face_recon --mode full --biwi-dir data/BK-1/01 --icp-iters 30
 
-# Biwi video: depth tracking (robust to rotation; landmarks auto-detected)
-./build/face_recon --mode video --dataset biwi --biwi-dir data/BK-1/01 \
-    --depth --frames 200 --sparse-reg 30
+# Any mode with a different detector (see §2) or per-stage timings:
+./build/face_recon --mode photometric --dataset biwi --biwi-dir data/BK-1/01 \
+    --depth --sparse-reg 30 --detector mediapipe --timers
 
-# Biwi video: RGB-only tracking (in-C++ YuNet+LBF detection every frame, no depth)
-./build/face_recon --mode video --dataset biwi --biwi-dir data/BK-1/01 \
-    --frames 200 --sparse-reg 30
+# Focal-estimation test on the iPhone photo (known fx=1930): replace K with a
 ```
+
+---
+
+## 4b. Realtime camera mode (`--mode live-cpu`) — HOST ONLY
+
+Live tracking from the MacBook camera: personalises on the first detected face
+(identity + albedo + lighting), then tracks pose + expression per frame with a
+live overlay. **Must run on the host** (Docker has no camera). From the repo
+root in a normal terminal:
+
+```bash
+# build for the host (Homebrew paths), then run
+CPATH=/opt/homebrew/include LIBRARY_PATH=/opt/homebrew/lib make
+./build/face_recon --mode live-cpu --sparse-reg 30
+
+# with the pyramid photometric pose refinement (better silhouette, ~9 fps)
+./build/face_recon --mode live-cpu --sparse-reg 30 --photo-refine
+
+# pick a specific camera (0 is sometimes the iPhone Continuity Camera)
+./build/face_recon --mode live-cpu --sparse-reg 30 --camera 1
+
+# headless smoke test without a camera (Biwi frames as a fake camera)
+./build/face_recon --mode live-cpu --live-source data/BK-1/01/frame_00003_rgb.png \
+    --live-frames 12 --live-nodisplay --sparse-reg 30 --timers
+```
+
+(`--mode live-gpu` is a stub for the GPU team — see PLAN_REALTIME.md.)
+
+- Keys: `q` quit · `p` re-personalise · `s` snapshot → `data/out/live/`.
+- HUD shows fps and the current focal. Intrinsics start from a 60°-HFOV guess;
+  `--optimize-focal` additionally solves the focal during personalisation
+  (experimental — single-frame estimation is biased long, see PLAN_REALTIME.md).
+- `--photo-refine` is auto-rejected on frames where it would worsen the
+  landmark reprojection (safeguard).
+
+**Black screen / camera troubleshooting.** The app now warms each camera up
+(~2.5 s), skips devices that only deliver black frames (a plugged-in iPhone
+Continuity Camera at index 0 is the usual culprit), retries with a fresh open
+(a stream opened *before* the permission grant stays black until re-opened),
+and falls back over indices 0–2 automatically. If it still reports no usable
+frames:
+1. System Settings → Privacy & Security → **Camera** → enable your terminal
+   app, then **re-run** (the grant only applies to new sessions).
+2. Try `--camera 1` (or 2) explicitly.
+3. Make sure no other app (Zoom/FaceTime) is holding the camera.
+
+Measured on an M2 (640 px): detect ~9 ms, track ~15 ms, render ~14 ms →
+~25 fps steady-state; ~9 fps with `--photo-refine`.
 
 ---
 
@@ -136,47 +178,41 @@ outputs go to `data/out/biwi_rgb/` instead.
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--mode <sparse\|dense\|full\|photometric\|video>` | Which pipeline to run | `sparse` |
-| `--dataset <iphone\|biwi>` | Which input | `biwi` |
-| `--sparse-reg <λ>` | Shape/expression regulariser weight | `100.0` |
+| `--mode <rgb\|rgbd\|live-cpu\|live-gpu\|dense\|full>` | Which pipeline to run | `rgb` |
+| `--sparse-reg <λ>` | Identity/expression regulariser weight | `100.0` |
 | `--biwi-seq <NN>` | Shortcut for `data/biwi/NN` | — |
-| `--biwi-dir <path>` | Explicit Biwi subject folder (e.g. `data/BK-1/01`) | `data/biwi/01` |
-| `--biwi-frame <k>` | Frame **index** (0-based, sorted) within `--biwi-dir` for single-image Biwi modes | `0` |
-| `--iphone-frame <k>` | iPhone frame index | `0` |
+| `--biwi-dir <path>` | Biwi subject folder (e.g. `data/BK-1/01`) | `data/biwi/01` |
+| `--frames <n>` | Number of frames for `rgb`/`rgbd` | `30` |
 | `--icp-iters <n>` | Outer ICP rounds for `dense`/`full` | `30` |
-| `--frames <n>` | Number of frames for `video` mode | `30` |
-| `--depth` | Add the depth ICP term (Biwi `photometric`/`video` modes) | off |
+| `--detector <yunet\|lbf\|mediapipe>` | Landmark backend (§2); `mediapipe` needs the pre-pass | `yunet` |
+| `--camera <idx>` / `--live-source <path>` | Live input: device index, or a video file / image sequence | `0` |
+| `--live-width <px>` / `--live-frames <n>` / `--live-nodisplay` | Live processing width; headless test run | `640` / `0` / off |
+| `--photo-refine` | Live: pyramid photometric pose refinement (safeguarded) | off |
+| `--optimize-focal` | Solve fx=fy during personalisation (experimental, see §4b) | off |
+| `--timers` | Print per-stage timings | off |
 
 ---
 
 ## 6. Output layout
 
-Everything writes into `data/out/<tag>/` so datasets/modes never clobber each
-other:
+Everything writes into `data/out/<tag>/` so modes never clobber each other:
 
 ```
 data/out/
-  iphone/            # --dataset iphone (sparse/photometric)
-  biwi_sparse/        # --mode sparse --dataset biwi
+  biwi_video_rgb/      # --mode rgb
+  biwi_video_full/     # --mode rgbd
   biwi_dense/          # --mode dense
-  biwi_rgb/            # --mode photometric --dataset biwi   (no --depth)
-  biwi_full/           # --mode photometric --dataset biwi   --depth
-  biwi_video_rgb/      # --mode video                        (no --depth)
-  biwi_video_full/     # --mode video                        --depth
+  biwi_sparse/         # full's Stage-1 sparse fit
+  live/                # --mode live-cpu snapshots / headless frames
   debug/               # mean-face sanity render, current_face.obj
 ```
 
-Inside each single-image tag folder:
+`rgb`/`rgbd` write one 3-panel composite **per frame** into
+`<tag>/frames/frame_XXXXX.png`, plus the whole sequence as `<tag>/tracking.mp4`.
+Each panel is: **overlay** (render blended on the frame) | **reconstruction @
+pose** (mask alone on black, at the tracked pose) | **reconstruction frontal**
+(mask alone, straight-on).
 
-- `fitted_face*.obj` — the reconstructed mesh at each stage.
-- `overlay_<stage>.png` — wireframe + landmark reprojection.
-- `render_overlay_<stage>.png` / `render_photometric_appearance.png` — full
-  render blended over the photo.
-- **`mask_panels_<stage>.png`** — 3-panel strip: **overlay** (render blended
-  on the photo) | **reconstruction @ pose** (mask alone, on black, at the
-  fitted scale/pose) | **reconstruction frontal** (mask alone, straight-on).
-  Present for every stage of every single-image mode (iPhone, Biwi sparse,
-  Biwi RGB/full) and as `mask_panels.png` for `biwi_dense`.
-
-`video` mode writes one 3-panel composite **per frame** into
-`<tag>/frames/frame_XXXXX.png`, and the whole sequence as `<tag>/tracking.mp4`.
+The single-frame geometry modes (`dense`/`full`) write `fitted_face*.obj`,
+wireframe/render overlays, and a `mask_panels*.png` strip into `biwi_dense/` /
+`biwi_sparse/`.

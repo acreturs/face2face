@@ -152,8 +152,15 @@ Eigen::MatrixX3f BFMLoader::shape(const Eigen::VectorXf& alpha) const
     return Eigen::Map<RowMat3f>(v.data(), v.size() / 3, 3); //left col ist ersten k spalten, die restlichen modes fallen weg
 }
 
-// identity + additive, identity-independent expression: V = mean_s + B_s·(α⊙σ_id)
-//                                                       + mean_e + B_e·(δ⊙σ_exp)
+// identity + additive expression: V = mean_s + B_s·(α⊙σ_id) + B_e·(δ⊙σ_exp)
+//
+// NOTE: expr_mean is deliberately OMITTED. The Ceres fitter builds its model
+// points as mean_s + B_s·α + B_e·δ (no expr_mean), and mean_shape()/shape(α)
+// omit it too — so δ=0 must equal the closed-mouth neutral (shape_mean). The
+// BFM's expr_mean is the *average* expression over its database (~1.4 mm mean,
+// ~4 mm at the lower lip = a slightly parted mouth); adding it here opened the
+// rendered mouth by a displacement the optimiser never saw, which no
+// expression-prior tuning could close. Omitting it keeps render == fit.
 Eigen::MatrixX3f BFMLoader::shape(const Eigen::VectorXf& alpha,
                                   const Eigen::VectorXf& delta) const
 {
@@ -161,7 +168,6 @@ Eigen::MatrixX3f BFMLoader::shape(const Eigen::VectorXf& alpha,
     const int kd = delta.size();
     Eigen::VectorXf v = shape_mean
         + shape_basis.leftCols(ka) * (alpha.array() * shape_std.head(ka).array()).matrix()
-        + expr_mean
         + expr_basis .leftCols(kd) * (delta.array() * expr_std .head(kd).array()).matrix();
     return Eigen::Map<RowMat3f>(v.data(), v.size() / 3, 3);
 }

@@ -116,7 +116,15 @@ public:
         // observations are allowed when a depth cloud drives the fit.
         const Eigen::VectorXd&                   initialIdentity      = Eigen::VectorXd(),
         const Eigen::VectorXd&                   initialExpr          = Eigen::VectorXd(),
-        bool                                     optimizeIdentity     = true
+        bool                                     optimizeIdentity     = true,
+        // ── camera focal estimation (realtime plan, Phase 3) ──
+        // When optimizeFocal, a single focal parameter (fx = fy; principal
+        // point fixed) joins the landmark/contour residuals; *focalInOut seeds
+        // it (else intrinsics(0,0)) and receives the estimate. The identity
+        // prior anchors the metric face size, which is what disambiguates
+        // focal from distance. Only sensible during personalisation.
+        bool                                     optimizeFocal        = false,
+        double*                                  focalInOut           = nullptr
     );
 
     // Dense fit: outer ICP loop (re-find nearest-vertex correspondences →
@@ -185,6 +193,9 @@ public:
         // For video tracking: freeze pose too, so the call only estimates
         // lighting/albedo at a pose fixed by the (more reliable) depth fit.
         bool                              optimizePose      = true,
-        const DenseIterationCallback&     onIteration       = nullptr
+        const DenseIterationCallback&     onIteration       = nullptr,
+        // Working-resolution cap (image + intrinsics are downscaled together).
+        // The realtime path calls this per pyramid level (e.g. 100 then 200).
+        int                               maxImageWidth     = 400
     );
 };
