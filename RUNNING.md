@@ -24,7 +24,7 @@ The only dataset is **Biwi** (Kinect RGB-D). Everything is selected with
 | **`rgb`** | Video: personalise frame 0, then track pose+expression. Landmarks + jaw contour + photometric (lighting/albedo). | no | auto (YuNet) |
 | **`rgbd`** | Same, **plus the metric Kinect depth ICP term** (the full fit). | yes | auto (YuNet) |
 | **`live-cpu`** | Realtime from the Mac camera, CPU tracker (§4b). **HOST only.** | no | auto (YuNet) |
-| **`live-gpu`** | Realtime on the GPU — **stub**, under development by the GPU team. | — | — |
+| **`live-gpu`** | Same realtime loop as `live-cpu`, but the overlay is rendered by the **CUDA** rasteriser (tracking/photometric still CPU). Needs `make USE_CUDA=1`. See [GPU_RENDERER.md](GPU_RENDERER.md). | no | auto (YuNet) |
 | `dense` | Single frame: depth-only ICP (geometry, no photometric). | yes | none |
 | `full` | Single frame: sparse landmark fit → dense ICP. | yes | file (Stage 1) |
 
@@ -149,7 +149,9 @@ CPATH=/opt/homebrew/include LIBRARY_PATH=/opt/homebrew/lib make
     --live-frames 12 --live-nodisplay --sparse-reg 30 --timers
 ```
 
-(`--mode live-gpu` is a stub for the GPU team — see PLAN_REALTIME.md.)
+(`--mode live-gpu` renders the overlay with the CUDA rasteriser — build with
+`make USE_CUDA=1` and verify with `--mode verify-gpu` first; see
+[GPU_RENDERER.md](GPU_RENDERER.md).)
 
 - Keys: `q` quit · `p` re-personalise · `s` snapshot → `data/out/live/`.
 - HUD shows fps and the current focal. Intrinsics start from a 60°-HFOV guess;

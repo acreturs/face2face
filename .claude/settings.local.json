@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git check-ignore *)"
+      "Bash(git check-ignore *)",
+      "Bash(python3 -m pip install --quiet --break-system-packages pypdf)",
+      "Bash(python3 -c ' *)"
     ]
   }
 }

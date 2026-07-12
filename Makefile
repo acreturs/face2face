@@ -52,15 +52,38 @@ SRCS = src/main.cpp src/BFMLoader.cpp src/BiwiLoader.cpp src/render/Renderer.cpp
 HDRS = $(wildcard include/*.h)
 BIN  = build/face_recon
 
+# ---- optional CUDA renderer (opt-in: `make USE_CUDA=1`) ---------------------
+# Adds the GPU rasteriser (src/render/cuda_raster.cu + CudaRenderer.cpp), enables
+# `--mode live-gpu` and `--mode verify-gpu`, and defines USE_CUDA for the C++.
+# The default build (USE_CUDA unset) is completely unchanged — no CUDA toolkit
+# required. Build+run this variant on a machine with an NVIDIA GPU + CUDA.
+CUDA_OBJ =
+ifeq ($(USE_CUDA),1)
+  CUDA_HOME ?= /usr/local/cuda
+  NVCC      ?= $(CUDA_HOME)/bin/nvcc
+  CUDA_ARCH ?= sm_60                 # override for your GPU, e.g. sm_86 (Ampere)
+  CUDA_OBJ   = build/cuda_raster.o build/cuda_photometric.o
+  CXXFLAGS  += -DUSE_CUDA
+  SRCS      += src/render/CudaRenderer.cpp
+  LDLIBS    += -L$(CUDA_HOME)/lib64 -lcudart
+endif
+
 # ---- rules ------------------------------------------------------------------
 .PHONY: all run clean
 
 all: $(BIN)
 
 # order-only prereq on HighFive: clone it once if it isn't there yet
-$(BIN): $(SRCS) $(HDRS) | $(HIGHFIVE_DIR)
+$(BIN): $(SRCS) $(HDRS) $(CUDA_OBJ) | $(HIGHFIVE_DIR)
 	@mkdir -p build
-	$(CXX) $(CXXFLAGS) $(SRCS) -o $@ $(LDLIBS)
+	$(CXX) $(CXXFLAGS) $(SRCS) $(CUDA_OBJ) -o $@ $(LDLIBS)
+
+# CUDA objects (only built when USE_CUDA=1). Pure CUDA — no Eigen/OpenCV
+# includes — so nvcc needs no project/pkg-config flags. -fmad=false keeps the
+# arithmetic close to the CPU's (no fused multiply-add contraction).
+build/%.o: src/render/%.cu
+	@mkdir -p build
+	$(NVCC) -std=c++17 -O2 -arch=$(CUDA_ARCH) --fmad=false -c $< -o $@
 
 run: $(BIN)
 	./$(BIN) --mode $(MODE) --biwi-dir $(BIWI_DIR) --frames $(FRAMES)

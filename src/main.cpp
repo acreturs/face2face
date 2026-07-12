@@ -7,6 +7,9 @@
 #include "LandmarkDetector.h"
 #include "FaceTracker.h"
 #include "ScopedTimer.h"
+#ifdef USE_CUDA
+#include "CudaRenderer.h"   // GPU rasteriser (built with `make USE_CUDA=1`)
+#endif
 
 #include <Eigen/Dense>
 #include <opencv2/core.hpp>
@@ -659,9 +662,16 @@ struct LiveOptions {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ENTRY POINT: live-cpu — realtime reconstruction from the Mac camera (CPU)
+// Realtime reconstruction loop, generic over the DISPLAY renderer type.
 // ─────────────────────────────────────────────────────────────────────────────
-static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions& lo)
+// RendererT is the renderer used for the on-screen overlay; both Renderer (CPU)
+// and CudaRenderer (GPU) satisfy the same construction + render() contract, so
+// the camera/HUD/personalise/track loop below is shared verbatim between
+// live-cpu and live-gpu. NOTE: the tracker's *internal* photometric renders
+// still run on the CPU renderer — only the display render is swapped here (see
+// GPU_RENDERER.md for the roadmap to a fully GPU photometric solve).
+template <class RendererT>
+static void runLiveImpl(const BFMLoader& bfm, double sparseReg, const LiveOptions& lo)
 {
     cv::VideoCapture cap;
     cv::Mat raw;
@@ -763,7 +773,7 @@ static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions
     tc.optimizeFocal          = lo.optimizeFocal;
     FaceTracker tracker(bfm, K0, tc);
 
-    const Renderer renderer(H, W, bfm.faces());
+    const RendererT renderer(H, W, bfm.faces());
     const std::string liveDir = outDir("live");
     double fpsEma = 0.0;
     long processed = 0, written = 0;
@@ -840,18 +850,126 @@ static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ENTRY POINT: live-gpu — realtime reconstruction on the GPU (colleagues' WIP)
+// ENTRY POINTS: live-cpu / live-gpu — thin wrappers over runLiveImpl<>.
 // ─────────────────────────────────────────────────────────────────────────────
-// Stub. The intended design (see PLAN_REALTIME.md §4): a GPU rasteriser + an
-// analytic-Jacobian photometric solve, driven by the SAME FaceTracker
-// personalise/track split as runLiveCpu(). Wire the GPU renderer + solver in
-// here and reuse the camera/HUD loop from runLiveCpu().
+static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions& lo)
+{
+    runLiveImpl<Renderer>(bfm, sparseReg, lo);
+}
+
+#ifdef USE_CUDA
+// Same realtime loop as live-cpu, but the display overlay is rendered by the
+// CUDA rasteriser. Tracking/photometric still run on the CPU (next milestone).
+static void runLiveGpu(const BFMLoader& bfm, double sparseReg, const LiveOptions& lo)
+{
+    std::cout << "live-gpu: CUDA display renderer active "
+                 "(tracking + photometric still on CPU)\n";
+    runLiveImpl<CudaRenderer>(bfm, sparseReg, lo);
+}
+#else
 static void runLiveGpu(const BFMLoader& bfm, double sparseReg, const LiveOptions& lo)
 {
     (void)bfm; (void)sparseReg; (void)lo;
-    std::cerr << "live-gpu: not implemented yet — under development by the GPU "
-                 "team. Use --mode live-cpu for the CPU tracker.\n";
+    std::cerr << "live-gpu: this binary was built without CUDA support.\n"
+                 "  Rebuild on an NVIDIA machine with:  make USE_CUDA=1\n"
+                 "  (optionally CUDA_ARCH=sm_XX for your GPU)\n"
+                 "  Use --mode live-cpu for the CPU tracker.\n";
 }
+#endif
+
+#ifdef USE_CUDA
+// ─────────────────────────────────────────────────────────────────────────────
+// ENTRY POINT: verify-gpu — CPU vs CUDA renderer parity + speed, on the mean
+// face (deterministic; needs only the BFM, no Biwi). This is the correctness
+// gate for the GPU rasteriser: it must reproduce the CPU G-buffer, not just a
+// visually similar image.
+// ─────────────────────────────────────────────────────────────────────────────
+static void runGpuCheck(const BFMLoader&        bfm,
+                        const Eigen::MatrixX3f& shape,
+                        const Eigen::MatrixX3f& albedo)
+{
+    constexpr int RH = 480, RW = 640;
+    const RenderInput in{
+        .shape  = shape,
+        .albedo = albedo,
+        .R      = Eigen::Matrix3f::Identity(),
+        .t      = Eigen::Vector3f(0.0f, 0.0f, kFrontalRenderDepthMM),
+        .K      = proj::defaultIntrinsics(RW, RH),
+        .sh     = light::defaultWhite(),
+    };
+
+    const Renderer     cpu(RH, RW, bfm.faces());
+    const CudaRenderer gpu(RH, RW, bfm.faces());
+    const RenderOutput rc = cpu.render(in);
+    const RenderOutput rg = gpu.render(in);
+
+    // ── parity: compare the visible result AND the differentiable G-buffer ──
+    double  imgMax = 0.0, imgSum = 0.0;
+    double  baryMax = 0.0, depthMax = 0.0;
+    long    maskMismatch = 0, triMismatch = 0, covered = 0, both = 0;
+    for (int y = 0; y < RH; ++y) {
+        for (int x = 0; x < RW; ++x) {
+            const cv::Vec3f a = rc.image.at<cv::Vec3f>(y, x);
+            const cv::Vec3f b = rg.image.at<cv::Vec3f>(y, x);
+            for (int c = 0; c < 3; ++c) {
+                const double d = std::abs(a[c] - b[c]);
+                imgMax = std::max(imgMax, d);
+                imgSum += d;
+            }
+            const bool mc = rc.mask.at<uchar>(y, x) != 0;
+            const bool mg = rg.mask.at<uchar>(y, x) != 0;
+            if (mc) ++covered;
+            if (mc != mg) ++maskMismatch;
+
+            const int tc = rc.triIdx.at<int>(y, x);
+            const int tg = rg.triIdx.at<int>(y, x);
+            if (mc && mg) {
+                ++both;
+                if (tc != tg) ++triMismatch;
+                if (tc == tg) {                       // bary only meaningful if same tri
+                    const cv::Vec3f ba = rc.bary.at<cv::Vec3f>(y, x);
+                    const cv::Vec3f bb = rg.bary.at<cv::Vec3f>(y, x);
+                    for (int c = 0; c < 3; ++c)
+                        baryMax = std::max(baryMax, (double)std::abs(ba[c] - bb[c]));
+                    depthMax = std::max(depthMax,
+                        (double)std::abs(rc.depth.at<float>(y, x) - rg.depth.at<float>(y, x)));
+                }
+            }
+        }
+    }
+
+    std::cout << "\n== verify-gpu: CPU vs CUDA on the mean face (" << RW << "x" << RH << ") ==\n"
+              << "  CPU covered pixels     : " << covered << "\n"
+              << "  mask mismatches        : " << maskMismatch
+              << " (" << (100.0 * maskMismatch / (RW * RH)) << "% of frame)\n"
+              << "  triIdx mismatches      : " << triMismatch
+              << " (" << (both ? 100.0 * triMismatch / both : 0.0) << "% of shared coverage)\n"
+              << "  image  max|Δ|          : " << imgMax << "\n"
+              << "  image  mean|Δ|         : " << (imgSum / (RW * RH * 3)) << "\n"
+              << "  bary   max|Δ| (same tri): " << baryMax << "\n"
+              << "  depth  max|Δ| mm        : " << depthMax << "\n"
+              << "  (small edge/ULP diffs are expected — CPU is the reference)\n";
+
+    // ── speed: warm up, then time N renders each ────────────────────────────
+    constexpr int WARMUP = 3, N = 50;
+    for (int i = 0; i < WARMUP; ++i) { cpu.render(in); gpu.render(in); }
+    const auto tc0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < N; ++i) cpu.render(in);
+    const auto tc1 = std::chrono::steady_clock::now();
+    for (int i = 0; i < N; ++i) gpu.render(in);
+    const auto tg1 = std::chrono::steady_clock::now();
+    const double cpuMs = std::chrono::duration<double, std::milli>(tc1 - tc0).count() / N;
+    const double gpuMs = std::chrono::duration<double, std::milli>(tg1 - tc1).count() / N;
+    std::cout << "\n  render time  CPU " << std::fixed << std::setprecision(2) << cpuMs
+              << " ms   GPU " << gpuMs << " ms   speedup "
+              << std::setprecision(1) << (gpuMs > 0 ? cpuMs / gpuMs : 0.0) << "x\n"
+              << "  (GPU includes the CPU vertex stage + host<->device copies)\n\n";
+
+    const std::string dbg = outDir("debug");
+    writeColourImage(rc, dbg + "/gpu_check_cpu.png");
+    writeColourImage(rg, dbg + "/gpu_check_gpu.png");
+}
+#endif
 
 // Render the mean face into a synthetic camera and dump depth + colour PNGs.
 // Verifies the full forward pipeline (project → cull → rasterize → shade).
@@ -1232,8 +1350,10 @@ static void printUsage()
       "  rgb        landmarks + jaw contour + photometric      (no depth term)\n"
       "  rgbd       + the metric Kinect depth ICP term\n"
       "Realtime (Mac camera, HOST only — Docker has no camera):\n"
-      "  live-cpu   the CPU tracker (this build)\n"
-      "  live-gpu   GPU tracker — stub, under development\n"
+      "  live-cpu   the CPU tracker\n"
+      "  live-gpu   CPU tracker + CUDA display renderer (needs make USE_CUDA=1)\n"
+      "GPU renderer checks (needs make USE_CUDA=1):\n"
+      "  verify-gpu CPU vs CUDA renderer parity + speed on the mean face\n"
       "Single-frame geometry (kept for reports):\n"
       "  dense      depth-only ICP\n"
       "  full       sparse landmark fit → dense ICP\n\n"
@@ -1247,6 +1367,8 @@ static void printUsage()
       "  --live-frames <n> --live-nodisplay   headless live test\n"
       "  --photo-refine     pyramid photometric pose refinement (live)\n"
       "  --optimize-focal   solve fx=fy during personalise (experimental)\n"
+      "  --photo-gpu        run the photometric geometry solve on the GPU "
+      "(needs make USE_CUDA=1)\n"
       "  --timers           print per-stage timings\n";
 }
 
@@ -1279,6 +1401,15 @@ int main(int argc, char** argv)
         else if (arg == "--live-nodisplay") live.display = false;
         else if (arg == "--photo-refine") live.photoRefine = true;
         else if (arg == "--optimize-focal") live.optimizeFocal = true;
+        else if (arg == "--photo-gpu") {
+#ifdef USE_CUDA
+            CeresFitter::usePhotometricGpu = true;
+            std::cout << "photometric geometry solve: GPU (CUDA finite-diff LM)\n";
+#else
+            std::cerr << "--photo-gpu ignored: built without CUDA "
+                         "(rebuild: make USE_CUDA=1)\n";
+#endif
+        }
         else if (arg == "--timers") ScopedTimer::enabled = true;
         else { std::cerr << "unknown argument: " << arg << "\n\n"; printUsage(); return 1; }
     }
@@ -1305,6 +1436,14 @@ int main(int argc, char** argv)
         runLiveCpu(bfm, sparseReg, live);
     } else if (mode == "live-gpu") {
         runLiveGpu(bfm, sparseReg, live);
+    } else if (mode == "verify-gpu") {
+#ifdef USE_CUDA
+        runGpuCheck(bfm, meanShape, albedo);
+        return 0;                                    // no mean-face debug render needed
+#else
+        std::cerr << "verify-gpu: built without CUDA. Rebuild with: make USE_CUDA=1\n";
+        return 1;
+#endif
     } else if (mode == "dense") {
         fitDenseOnBiwi(bfm, meanShape, albedo, /*sparseInit=*/nullptr, icpIters);
     } else if (mode == "full") {

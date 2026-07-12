@@ -52,6 +52,13 @@ std::vector<LandmarkObservation> loadLandmarkObservations(
 
 class CeresFitter {
 public:
+    // When true (set via --photo-gpu), fitPhotometric's per-pixel GEOMETRY solve
+    // runs on the GPU (CUDA finite-difference Levenberg–Marquardt) instead of
+    // Ceres. Only has an effect in a `make USE_CUDA=1` build and only when the
+    // fit actually solves geometry (optimizePose || optimizeShape). The CPU/Ceres
+    // path is unchanged and remains the reference. See GPU_RENDERER.md.
+    static bool usePhotometricGpu;
+
     // Stage 1: pose only. zMin/zMax bound the face depth (mm).
     static PoseParameters fitPose(
         const Eigen::MatrixX3f& shape,
