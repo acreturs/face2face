@@ -59,6 +59,12 @@ public:
     // path is unchanged and remains the reference. See GPU_RENDERER.md.
     static bool usePhotometricGpu;
 
+    // When usePhotometricGpu is on, selects the GPU Jacobian: false → finite
+    // differences (default, --photo-gpu); true → analytic image-gradient ×
+    // projection × pose/shape chain (--photo-gpu-analytic), with the pose
+    // rotation solved as a local perturbation on SO(3).
+    static bool photoGpuAnalytic;
+
     // Stage 1: pose only. zMin/zMax bound the face depth (mm).
     static PoseParameters fitPose(
         const Eigen::MatrixX3f& shape,

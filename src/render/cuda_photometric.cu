@@ -108,6 +108,32 @@ __device__ __forceinline__ void sampleBilinear(const float* img, int H, int W,
     }
 }
 
+// Bilinear sample + analytic image gradient (dI/du, dI/dv) with border clamp.
+// Used by the analytic-Jacobian path. Gradient is the exact derivative of the
+// bilinear interpolant (piecewise-constant across texels); at a clamped border
+// the corresponding gradient component is 0.
+__device__ __forceinline__ void sampleBilinearGrad(const float* img, int H, int W,
+                                                    double u, double v,
+                                                    double* out, double* dIdu, double* dIdv)
+{
+    if (u < 0.0) u = 0.0; if (u > W - 1.0) u = W - 1.0;
+    if (v < 0.0) v = 0.0; if (v > H - 1.0) v = H - 1.0;
+    const int x0 = (int)floor(u), y0 = (int)floor(v);
+    const int x1 = min(x0 + 1, W - 1), y1 = min(y0 + 1, H - 1);
+    const double ax = u - x0, ay = v - y0;
+    for (int c = 0; c < 3; ++c) {
+        const double c00 = img[(y0 * W + x0) * 3 + c];
+        const double c10 = img[(y0 * W + x1) * 3 + c];
+        const double c01 = img[(y1 * W + x0) * 3 + c];
+        const double c11 = img[(y1 * W + x1) * 3 + c];
+        const double top = c00 * (1.0 - ax) + c10 * ax;
+        const double bot = c01 * (1.0 - ax) + c11 * ax;
+        out[c]  = top * (1.0 - ay) + bot * ay;
+        dIdu[c] = (1.0 - ay) * (c10 - c00) + ay * (c11 - c01);
+        dIdv[c] = (1.0 - ax) * (c01 - c00) + ax * (c11 - c10);
+    }
+}
+
 // One pixel's residual (RGB) at parameters (aa, t, shape).
 __device__ __forceinline__ void pixelResidual(
     const double* aa, const double* t, const double* shape, int K,
@@ -144,7 +170,11 @@ __device__ __forceinline__ double stepFor(int a, int poseParams)
 }
 
 // Kernel: accumulate JᵀJ, Jᵀr and Huber cost over all pixels.
-__global__ void normalEqKernel(const CudaPhotoState s, int optimizePose,
+// analytic==0 → finite-difference Jacobian (perturb the global angle-axis).
+// analytic==1 → analytic Jacobian (image-gradient × projection × pose/shape
+//               chain); pose rotation is a LOCAL perturbation δ (∂cam/∂δ =
+//               −[R·S]_×), which the host composes as R(δ)·R_cur.
+__global__ void normalEqKernel(const CudaPhotoState s, int optimizePose, int analytic,
                                double sqrtW, double huberDelta,
                                double* JtJ, double* Jtr, double* cost)
 {
@@ -175,34 +205,92 @@ __global__ void normalEqKernel(const CudaPhotoState s, int optimizePose,
     const double rho = (s2 <= d2) ? s2 : (2.0 * huberDelta * sqrt(s2) - d2);
     atomicAdd(cost, rho);
 
-    // Weighted residual + finite-difference Jacobian columns.
     double J[3 * MAXNP];
-    for (int a = 0; a < nP; ++a) {
-        double aap[3] = { aa[0], aa[1], aa[2] };
-        double tp[3]  = { t[0], t[1], t[2] };
-        double shp[MAXK];
-        for (int k = 0; k < s.K; ++k) shp[k] = shape[k];
+    if (analytic) {
+        // Recompute geometry at the current params (linearisation point).
+        double S[3] = { base[0], base[1], base[2] };
+        for (int k = 0; k < Keff; ++k) {
+            S[0] += basisPix[3 * k + 0] * shape[k];
+            S[1] += basisPix[3 * k + 1] * shape[k];
+            S[2] += basisPix[3 * k + 2] * shape[k];
+        }
+        double rot[3];
+        aaRotate(aa, S, rot);
+        const double X = rot[0] + t[0], Y = rot[1] + t[1], Z = rot[2] + t[2];
+        const double u = s.fx * X / Z + s.cx, v = s.fy * Y / Z + s.cy;
 
-        const double h = stepFor(a, poseParams);
-        double* slot;
-        if (a < poseParams) slot = (a < 3) ? &aap[a] : &tp[a - 3];
-        else                slot = &shp[a - poseParams];
+        double val[3], dIdu[3], dIdv[3];
+        sampleBilinearGrad(s.d_image, s.H, s.W, u, v, val, dIdu, dIdv);
 
-        const double save = *slot;
-        *slot = save + h;
-        double rp[3];
-        pixelResidual(aap, tp, shp, Keff, base, basisPix, tgt, sqrtW,
-                      s.d_image, s.H, s.W, s.fx, s.fy, s.cx, s.cy, rp);
-        *slot = save - h;
-        double rm[3];
-        pixelResidual(aap, tp, shp, Keff, base, basisPix, tgt, sqrtW,
-                      s.d_image, s.H, s.W, s.fx, s.fy, s.cx, s.cy, rm);
-        *slot = save;
+        // ∂u/∂cam = (fx/Z, 0, −fx·X/Z²);  ∂v/∂cam = (0, fy/Z, −fy·Y/Z²)
+        const double duX = s.fx / Z, duZ = -s.fx * X / (Z * Z);
+        const double dvY = s.fy / Z, dvZ = -s.fy * Y / (Z * Z);
+        const double wsq = -w * sqrtW;   // Huber weight × residual scale × (−1)
 
-        const double inv2h = 1.0 / (2.0 * h);
-        J[3 * a + 0] = w * (rp[0] - rm[0]) * inv2h;
-        J[3 * a + 1] = w * (rp[1] - rm[1]) * inv2h;
-        J[3 * a + 2] = w * (rp[2] - rm[2]) * inv2h;
+        int a = 0;
+        if (optimizePose) {
+            // rotation δ (local): columns of ∂cam/∂δ = −[rot]_×
+            const double dc[3][3] = {
+                {  0.0,     -rot[2],  rot[1] },
+                {  rot[2],   0.0,    -rot[0] },
+                { -rot[1],   rot[0],  0.0    } };
+            for (int j = 0; j < 3; ++j) {
+                const double du_dp = duX * dc[j][0] + duZ * dc[j][2];
+                const double dv_dp = dvY * dc[j][1] + dvZ * dc[j][2];
+                for (int c = 0; c < 3; ++c)
+                    J[3 * a + c] = wsq * (dIdu[c] * du_dp + dIdv[c] * dv_dp);
+                ++a;
+            }
+            // translation: ∂cam/∂t_j = e_j
+            for (int j = 0; j < 3; ++j) {
+                const double du_dp = (j == 0 ? duX : 0.0) + (j == 2 ? duZ : 0.0);
+                const double dv_dp = (j == 1 ? dvY : 0.0) + (j == 2 ? dvZ : 0.0);
+                for (int c = 0; c < 3; ++c)
+                    J[3 * a + c] = wsq * (dIdu[c] * du_dp + dIdv[c] * dv_dp);
+                ++a;
+            }
+        }
+        if (s.optimizeShape) {
+            for (int k = 0; k < s.K; ++k) {
+                double bk[3] = { basisPix[3 * k + 0], basisPix[3 * k + 1], basisPix[3 * k + 2] };
+                double rb[3];
+                aaRotate(aa, bk, rb);                     // ∂cam/∂shape_k = R_cur·basis_k
+                const double du_dp = duX * rb[0] + duZ * rb[2];
+                const double dv_dp = dvY * rb[1] + dvZ * rb[2];
+                for (int c = 0; c < 3; ++c)
+                    J[3 * a + c] = wsq * (dIdu[c] * du_dp + dIdv[c] * dv_dp);
+                ++a;
+            }
+        }
+    } else {
+        // Finite-difference Jacobian (central differences on the global params).
+        for (int a = 0; a < nP; ++a) {
+            double aap[3] = { aa[0], aa[1], aa[2] };
+            double tp[3]  = { t[0], t[1], t[2] };
+            double shp[MAXK];
+            for (int k = 0; k < s.K; ++k) shp[k] = shape[k];
+
+            const double h = stepFor(a, poseParams);
+            double* slot;
+            if (a < poseParams) slot = (a < 3) ? &aap[a] : &tp[a - 3];
+            else                slot = &shp[a - poseParams];
+
+            const double save = *slot;
+            *slot = save + h;
+            double rp[3];
+            pixelResidual(aap, tp, shp, Keff, base, basisPix, tgt, sqrtW,
+                          s.d_image, s.H, s.W, s.fx, s.fy, s.cx, s.cy, rp);
+            *slot = save - h;
+            double rm[3];
+            pixelResidual(aap, tp, shp, Keff, base, basisPix, tgt, sqrtW,
+                          s.d_image, s.H, s.W, s.fx, s.fy, s.cx, s.cy, rm);
+            *slot = save;
+
+            const double inv2h = 1.0 / (2.0 * h);
+            J[3 * a + 0] = w * (rp[0] - rm[0]) * inv2h;
+            J[3 * a + 1] = w * (rp[1] - rm[1]) * inv2h;
+            J[3 * a + 2] = w * (rp[2] - rm[2]) * inv2h;
+        }
     }
 
     const double rw[3] = { w * r0[0], w * r0[1], w * r0[2] };
@@ -279,7 +367,7 @@ void* cudaPhotoPrepare(const float* image, int H, int W,
 
 // Uploads (aa,t,shape) → params, runs normalEqKernel, downloads JtJ/Jtr/cost.
 void cudaPhotoNormalEq(void* handle, const double* aa, const double* t, const double* shape,
-                       int optimizePose, int optimizeShape,
+                       int optimizePose, int optimizeShape, int analytic,
                        double sqrtWeight, double huberDelta,
                        double* JtJ, double* Jtr, double* cost)
 {
@@ -298,7 +386,7 @@ void cudaPhotoNormalEq(void* handle, const double* aa, const double* t, const do
     CUDA_CHECK(cudaMemset(s->d_cost, 0, sizeof(double)));
 
     const int TPB = 128;
-    normalEqKernel<<<(s->P + TPB - 1) / TPB, TPB>>>(*s, optimizePose, sqrtWeight,
+    normalEqKernel<<<(s->P + TPB - 1) / TPB, TPB>>>(*s, optimizePose, analytic, sqrtWeight,
                                                     huberDelta, s->d_JtJ, s->d_Jtr, s->d_cost);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemcpy(JtJ, s->d_JtJ, sizeof(double) * nP * nP, cudaMemcpyDeviceToHost));

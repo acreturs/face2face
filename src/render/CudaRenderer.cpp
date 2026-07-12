@@ -71,8 +71,8 @@ RenderOutput CudaRenderer::render(const RenderInput& in) const
     // ── vertex stage on the CPU (identical to Renderer::render Steps 2 & 5) ──
     const Eigen::MatrixX3f V_cam  = proj::toCameraFrame(in.shape, in.R, in.t);
     const proj::Pixels     uv     = proj::project(V_cam, in.K);
-    const Eigen::MatrixX3f N      = Renderer::computeNormals(in.shape, triangles_);
-    const Eigen::MatrixX3f N_cam  = proj::normalsToCameraFrame(N, in.R);
+    const Eigen::MatrixX3f Nrm    = Renderer::computeNormals(in.shape, triangles_);
+    const Eigen::MatrixX3f N_cam  = proj::normalsToCameraFrame(Nrm, in.R);
     const Eigen::MatrixX3f shaded = light::shadeVertices(in.albedo, N_cam, in.sh);
 
     // ── flatten to row-major host arrays for the kernel ─────────────────────

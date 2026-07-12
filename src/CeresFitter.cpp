@@ -24,6 +24,7 @@
 
 // GPU photometric inner solve — off unless --photo-gpu (and a USE_CUDA build).
 bool CeresFitter::usePhotometricGpu = false;
+bool CeresFitter::photoGpuAnalytic  = false;
 
 #ifdef USE_CUDA
 // Launchers implemented in src/render/cuda_photometric.cu (built by nvcc).
@@ -33,7 +34,7 @@ void*  cudaPhotoPrepare(const float* image, int H, int W,
                         int P, const double* basePoint, const double* bBasis,
                         const double* target, int K, int optimizeShape);
 void   cudaPhotoNormalEq(void* h, const double* aa, const double* t, const double* shape,
-                         int optimizePose, int optimizeShape,
+                         int optimizePose, int optimizeShape, int analytic,
                          double sqrtWeight, double huberDelta,
                          double* JtJ, double* Jtr, double* cost);
 double cudaPhotoCost(void* h, const double* aa, const double* t, const double* shape,
@@ -1670,7 +1671,7 @@ static void solvePhotometricGpu(
     double sqrtWeight, double huberDelta, double shapeRegWeight,
     double tzMin, double tzMax, double shapeLo, double shapeHi,
     double* angleAxis, double* translation, double* shapeCoefficients,
-    int maxIters)
+    bool analytic, int maxIters)
 {
     const int poseParams = optimizePose ? 6 : 0;
     const int nP = poseParams + (optimizeShape ? Kshape : 0);
@@ -1694,8 +1695,26 @@ static void solvePhotometricGpu(
         for (int k = 0; k < Kshape; ++k) shT[k] = shape[k];
         int a = 0;
         if (optimizePose) {
-            for (int i = 0; i < 3; ++i) aaT[i] = aa[i] + d(a++);
-            for (int i = 0; i < 3; ++i) tT[i]  = t[i]  + d(a++);
+            const Eigen::Vector3d drot(d(a), d(a + 1), d(a + 2)); a += 3;
+            const Eigen::Vector3d dt  (d(a), d(a + 1), d(a + 2)); a += 3;
+            if (analytic) {
+                // δrot is a LOCAL SO(3) update: R_new = R(δrot)·R_cur.
+                const Eigen::Vector3d aaCur(aa[0], aa[1], aa[2]);
+                const double angCur = aaCur.norm();
+                const Eigen::Matrix3d Rcur = angCur > 1e-12
+                    ? Eigen::Matrix3d(Eigen::AngleAxisd(angCur, aaCur / angCur))
+                    : Eigen::Matrix3d::Identity();
+                const double angD = drot.norm();
+                const Eigen::Matrix3d Rd = angD > 1e-12
+                    ? Eigen::Matrix3d(Eigen::AngleAxisd(angD, drot / angD))
+                    : Eigen::Matrix3d::Identity();
+                const Eigen::AngleAxisd aaNew(Rd * Rcur);
+                const Eigen::Vector3d v = aaNew.angle() * aaNew.axis();
+                aaT[0] = v(0); aaT[1] = v(1); aaT[2] = v(2);
+            } else {                                   // FD: global angle-axis update
+                aaT[0] = aa[0] + drot(0); aaT[1] = aa[1] + drot(1); aaT[2] = aa[2] + drot(2);
+            }
+            tT[0] = t[0] + dt(0); tT[1] = t[1] + dt(1); tT[2] = t[2] + dt(2);
             if (tT[2] < tzMin) tT[2] = tzMin;
             if (tT[2] > tzMax) tT[2] = tzMax;
         }
@@ -1721,7 +1740,7 @@ static void solvePhotometricGpu(
     std::vector<double> JtJ(nP * nP, 0.0), Jtr(nP, 0.0);
     double cost0 = 0.0;
     cudaPhotoNormalEq(h, aa, t, shape.data(), optimizePose ? 1 : 0, optimizeShape ? 1 : 0,
-                      sqrtWeight, huberDelta, JtJ.data(), Jtr.data(), &cost0);
+                      analytic ? 1 : 0, sqrtWeight, huberDelta, JtJ.data(), Jtr.data(), &cost0);
     addShapePrior(JtJ, Jtr, cost0, shape);
 
     double lambda = 1e-3;
@@ -1759,7 +1778,7 @@ static void solvePhotometricGpu(
                 std::fill(Jtr.begin(), Jtr.end(), 0.0);
                 double c2 = 0.0;
                 cudaPhotoNormalEq(h, aa, t, shape.data(), optimizePose ? 1 : 0,
-                                  optimizeShape ? 1 : 0, sqrtWeight, huberDelta,
+                                  optimizeShape ? 1 : 0, analytic ? 1 : 0, sqrtWeight, huberDelta,
                                   JtJ.data(), Jtr.data(), &c2);
                 addShapePrior(JtJ, Jtr, c2, shape);
             } else {
@@ -2070,8 +2089,11 @@ FitParameters CeresFitter::fitPhotometric(
                     optimizePose, optimizeShape, sqrtWeight, /*huberDelta=*/0.1,
                     shapeRegWeight, /*tzMin=*/100.0, /*tzMax=*/3000.0,
                     /*shapeLo=*/-3.0, /*shapeHi=*/3.0,
-                    angleAxis, translation, shapeCoefficients, /*maxIters=*/25);
-                solverReport = "GPU-LM (finite-diff)  pixels " + std::to_string(P);
+                    angleAxis, translation, shapeCoefficients,
+                    CeresFitter::photoGpuAnalytic, /*maxIters=*/25);
+                solverReport = std::string("GPU-LM (")
+                             + (CeresFitter::photoGpuAnalytic ? "analytic" : "finite-diff")
+                             + ")  pixels " + std::to_string(P);
             } else
 #endif
             {

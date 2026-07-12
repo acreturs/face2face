@@ -1368,7 +1368,8 @@ static void printUsage()
       "  --photo-refine     pyramid photometric pose refinement (live)\n"
       "  --optimize-focal   solve fx=fy during personalise (experimental)\n"
       "  --photo-gpu        run the photometric geometry solve on the GPU "
-      "(needs make USE_CUDA=1)\n"
+      "(finite-diff; needs make USE_CUDA=1)\n"
+      "  --photo-gpu-analytic  GPU photometric solve with analytic Jacobian\n"
       "  --timers           print per-stage timings\n";
 }
 
@@ -1407,6 +1408,16 @@ int main(int argc, char** argv)
             std::cout << "photometric geometry solve: GPU (CUDA finite-diff LM)\n";
 #else
             std::cerr << "--photo-gpu ignored: built without CUDA "
+                         "(rebuild: make USE_CUDA=1)\n";
+#endif
+        }
+        else if (arg == "--photo-gpu-analytic") {
+#ifdef USE_CUDA
+            CeresFitter::usePhotometricGpu = true;
+            CeresFitter::photoGpuAnalytic  = true;
+            std::cout << "photometric geometry solve: GPU (CUDA analytic-Jacobian LM)\n";
+#else
+            std::cerr << "--photo-gpu-analytic ignored: built without CUDA "
                          "(rebuild: make USE_CUDA=1)\n";
 #endif
         }

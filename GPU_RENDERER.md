@@ -130,14 +130,31 @@ GPU too (see below).
 
 This is the big one — it moves the per-pixel photometric **geometry solve** (the
 ~95% hot spot, see above) off Ceres/CPU and onto the GPU. It is **opt-in** and
-composes with any mode that runs a photometric geometry step:
+composes with any mode that runs a photometric geometry step. Two Jacobian
+backends, both selectable (the CPU/Ceres path stays the reference):
+
+- `--photo-gpu` — **finite-difference** Jacobian (central differences). Robust,
+  a couple of FD step constants to tune (`H_AA`/`H_T`/`H_SHAPE` in the `.cu`).
+- `--photo-gpu-analytic` — **analytic** Jacobian (image-gradient × projection ×
+  pose/shape chain; pose rotation solved as a local SO(3) perturbation). Fewer
+  residual evals per step, no FD tuning.
 
 ```bash
-# offline RGB video, GPU photometric geometry solve
-./build/face_recon --mode rgb  --biwi-dir data/BK-1/01 --frames 30 --photo-gpu --timers
-# live overlay + GPU photometric refinement
-./build/face_recon --mode live-gpu --sparse-reg 30 --photo-refine --photo-gpu
+# offline RGB video, GPU photometric (finite-diff)
+./build/face_recon --mode rgb --biwi-dir data/BK-1/01 --frames 30 --photo-gpu --timers
+# same, analytic Jacobian
+./build/face_recon --mode rgb --biwi-dir data/BK-1/01 --frames 30 --photo-gpu-analytic --timers
+# live overlay + GPU pose photometric refinement (real-time path; needs a camera)
+./build/face_recon --mode live-gpu --sparse-reg 30 --photo-refine --photo-gpu-analytic
+# headless live smoke test (Biwi frames as a fake camera — no camera needed)
+./build/face_recon --mode live-gpu --live-source data/BK-1/01/frame_00003_rgb.png \
+    --live-frames 12 --live-nodisplay --photo-refine --photo-gpu-analytic --timers
 ```
+
+**Photo-refine** (`--photo-refine`, the live pyramid pose refinement) runs its
+solve through the same `fitPhotometric`, so it automatically uses whichever GPU
+backend you selected — it's a pure pose solve (6 params), the cleanest case for
+the analytic Jacobian.
 
 **How it works** (`src/render/cuda_photometric.cu` + `solvePhotometricGpu` in
 `src/CeresFitter.cpp`): the correspondence set is fixed per outer iteration, so
@@ -154,13 +171,19 @@ run closely. The CPU path is the reference.
 
 **Deliberate approximations** (documented so the parity gap is expected, not a
 bug):
-- **Finite-difference Jacobian** (central differences) instead of Ceres autodiff.
-  Step sizes are `H_AA`/`H_T`/`H_SHAPE` at the top of `cuda_photometric.cu` —
-  tune if convergence stalls or oscillates.
+- **Jacobian:** finite-difference (`--photo-gpu`) or analytic (`--photo-gpu-analytic`)
+  instead of Ceres autodiff. FD step sizes are `H_AA`/`H_T`/`H_SHAPE` at the top of
+  `cuda_photometric.cu` — tune if convergence stalls or oscillates. The analytic
+  path has no such tuning.
 - **Bilinear** image sampling instead of Ceres' **bicubic** — sub-pixel colour
-  differences, negligible for tracking.
+  differences, negligible for tracking. (The analytic gradient is the exact
+  derivative of this bilinear interpolant.)
 - A hand-rolled LM (λ up/down on accept/reject) rather than Ceres' trust region —
   converges to a very similar minimum, not bit-identical.
+- Three-way comparison to sanity-check the analytic path: run the same sequence
+  with `--photo-gpu` (FD) and `--photo-gpu-analytic` and compare the `photo N`
+  RMSE trajectories — they should agree closely, and both should track the CPU
+  Ceres run.
 
 **Perf note:** the normal-equation accumulation uses global `atomicAdd` (one per
 matrix entry per pixel). Correct but not optimal; a shared-memory block reduction
@@ -185,9 +208,9 @@ sits exactly on an edge and rounding flips the inside test.
 2. ✅ **GPU photometric residual + Jacobian** (`--photo-gpu`) — the per-pixel
    residual + finite-difference Jacobian + normal equations now run on the GPU;
    the small linear solve/LM is on the host. This is where the ~95% lived.
-3. ◻ **Analytic Jacobian** to replace the finite differences (image-gradient ×
-   projection Jacobian × pose/expr chain; PLAN_REALTIME §4). Fewer residual
-   evals per LM step and no FD-step tuning.
+3. ✅ **Analytic Jacobian** (`--photo-gpu-analytic`) — image-gradient × projection
+   Jacobian × pose/shape chain, pose rotation as a local SO(3) perturbation. Kept
+   alongside the finite-difference path (`--photo-gpu`), which stays the default.
 4. ◻ **Keep the G-buffer on the device.** `CudaRenderer` copies the G-buffer back
    to host cv::Mats; `cuda_photometric` re-uploads the derived correspondences.
    Fuse them so `triIdx`/`bary`/base-point/target stay resident between render and
