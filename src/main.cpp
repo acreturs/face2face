@@ -108,7 +108,7 @@ constexpr double kExprRegWeight = 200.0;
 // 120 the mouth never opened past a few mm, at 30 it stopped halfway. Jitter
 // damping is instead done by the TEMPORAL prior (FaceTracker::Config
 // exprTemporalReg, ‖δ − δ_prev‖²), which costs nothing for a held expression.
-constexpr double kTrackExprRegWeight = 18.0;
+constexpr double kTrackExprRegWeight = 5.0;
 
 // ── photometric (appearance) fit ──
 // 3, not 50: the albedo LS AtA-diagonal is ~47 (measured on this BFM), so λ=50
@@ -124,7 +124,7 @@ constexpr int    kPhotoPixelStride = 1;
 // ── video temporal smoothing ──  EMA on the per-frame pose + expression to
 // damp jitter: new = α·fit + (1−α)·previous. 1 = no smoothing, lower = smoother
 // (but laggier). Paired with velocity prediction so it stays responsive.
-constexpr double kSmoothAlpha = 0.6;
+constexpr double kSmoothAlpha = 0.95;   // NOTE: LOW = heavy smoothing (laggy); raise toward 0.9 for responsive
 
 // ── depth term (Biwi "full" fit) ──
 constexpr int    kDepthBackprojStride     = 2;    // subsample the depth map
@@ -275,6 +275,67 @@ static void writeColourImage(const RenderOutput& r, const std::string& path)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Shared render / IO helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Draw a small green status label in the top-left corner (panel captions, HUD).
+static void drawLabel(cv::Mat& img, const std::string& text, double scale = 0.6)
+{
+    cv::putText(img, text, {8, 22}, cv::FONT_HERSHEY_SIMPLEX, scale,
+                {0, 220, 0}, 2, cv::LINE_AA);
+}
+
+// Render a face into an 8-bit BGR image (the reconstruction alone on black) —
+// the panel format shared by every mask/reconstruction view. Renderer float RGB
+// [0,1] → 8-bit BGR.
+static cv::Mat renderFaceBgr(const Renderer& renderer, const RenderInput& in)
+{
+    cv::Mat bgr;
+    cv::cvtColor(renderer.render(in).image, bgr, cv::COLOR_RGB2BGR);
+    bgr.convertTo(bgr, CV_8UC3, 255.0);
+    return bgr;
+}
+
+// A path is an image SEQUENCE (needs cv::CAP_IMAGES, else FFmpeg opens it as a
+// one-frame video) if it names a still image or contains a printf pattern.
+static bool isImageSequence(const std::string& path)
+{
+    return path.find(".png") != std::string::npos ||
+           path.find(".jpg") != std::string::npos ||
+           path.find('%')    != std::string::npos;
+}
+
+// Downscale to a target processing width (never upscales); keeps aspect ratio.
+static cv::Mat resizeToWidth(const cv::Mat& in, int width)
+{
+    const double scale = std::min(1.0, static_cast<double>(width) / in.cols);
+    if (scale >= 1.0) return in;
+    cv::Mat out;
+    cv::resize(in, out, {}, scale, scale, cv::INTER_AREA);
+    return out;
+}
+
+// FaceTracker config for the offline video paths (rgb/rgbd) and the transfer
+// target personalise — full-quality personalise (per-pixel shape refine on) with
+// the metric depth term wired up. Tunables live in namespace cfg.
+static FaceTracker::Config offlineConfig(double sparseReg)
+{
+    FaceTracker::Config tc;
+    tc.sparseReg               = sparseReg;
+    tc.exprRegPersonalise      = kExprRegWeight;
+    tc.exprRegTrack            = kTrackExprRegWeight;
+    tc.albedoRegWeight         = kAlbedoRegWeight;
+    tc.smoothAlpha             = kSmoothAlpha;
+    tc.contourItersPersonalise = kContourOuterIters;
+    tc.photoIterations         = kPhotoIterations;
+    tc.photoPixelStride        = kPhotoPixelStride;
+    tc.depthPointToPlaneWeight = kDepthPointToPlaneWeight;
+    tc.depthWeight             = kDepthWeight;
+    tc.depthVertexStride       = kDepthVertexStride;
+    return tc;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Pipeline stages
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -350,33 +411,25 @@ static cv::Mat renderMaskPanels(
 {
     const Renderer renderer(photo.rows, photo.cols, faces);
     const auto reconBgr = [&](const PoseParameters& p, const Eigen::Matrix3f& K) {
-        const RenderInput in{ .shape = shape, .albedo = albedo,
+        return renderFaceBgr(renderer, { .shape = shape, .albedo = albedo,
             .R = p.rotationMatrix(), .t = p.translation.cast<float>(),
-            .K = K, .sh = sh };
-        cv::Mat bgr;
-        cv::cvtColor(renderer.render(in).image, bgr, cv::COLOR_RGB2BGR);
-        bgr.convertTo(bgr, CV_8UC3, 255.0);
-        return bgr;
-    };
-    const auto label = [](cv::Mat& img, const std::string& s) {
-        cv::putText(img, s, {8, 22}, cv::FONT_HERSHEY_SIMPLEX, 0.6,
-                    {0, 220, 0}, 2, cv::LINE_AA);
+            .K = K, .sh = sh });
     };
 
     const RenderInput overlayIn{ .shape = shape, .albedo = albedo,
         .R = pose.rotationMatrix(), .t = pose.translation.cast<float>(),
         .K = intrinsics, .sh = sh };
     cv::Mat overlay = blendRenderOnPhoto(renderer.render(overlayIn), photo);
-    label(overlay, "overlay");
+    drawLabel(overlay, "overlay");
 
     cv::Mat reconPose = reconBgr(pose, intrinsics);
-    label(reconPose, "reconstruction @ pose");
+    drawLabel(reconPose, "reconstruction @ pose");
 
     PoseParameters frontal;                                // identity rotation, centred
     frontal.translation = Eigen::Vector3d(0, 0, kFrontalRenderDepthMM);
     cv::Mat reconFront =
         reconBgr(frontal, proj::defaultIntrinsics(photo.cols, photo.rows));
-    label(reconFront, "reconstruction frontal");
+    drawLabel(reconFront, "reconstruction frontal");
 
     cv::Mat composite;
     cv::hconcat(std::vector<cv::Mat>{overlay, reconPose, reconFront}, composite);
@@ -574,17 +627,9 @@ static void runVideoReconstruction(
                                   const PoseParameters& pose,
                                   const light::SHCoeffs& sh,
                                   const Eigen::Matrix3f& K) {
-            const RenderInput in{ .shape = shape, .albedo = albedoOf(beta),
+            return renderFaceBgr(renderer, { .shape = shape, .albedo = albedoOf(beta),
                 .R = pose.rotationMatrix(), .t = pose.translation.cast<float>(),
-                .K = K, .sh = sh };
-            cv::Mat bgr;
-            cv::cvtColor(renderer.render(in).image, bgr, cv::COLOR_RGB2BGR);
-            bgr.convertTo(bgr, CV_8UC3, 255.0);
-            return bgr;
-        };
-        const auto label = [](cv::Mat& img, const std::string& s) {
-            cv::putText(img, s, {8, 22}, cv::FONT_HERSHEY_SIMPLEX, 0.6,
-                        {0, 220, 0}, 2, cv::LINE_AA);
+                .K = K, .sh = sh });
         };
         const auto headCloudRgb = [&](const BiwiFrame& f) {
             std::vector<Eigen::Vector3d> head = cropHead(
@@ -617,19 +662,7 @@ static void runVideoReconstruction(
 
         // The personalise-then-track state machine lives in FaceTracker (shared
         // with --mode live); this loop only feeds frames and renders panels.
-        FaceTracker::Config tc;
-        tc.sparseReg              = sparseReg;
-        tc.exprRegPersonalise     = kExprRegWeight;
-        tc.exprRegTrack           = kTrackExprRegWeight;
-        tc.albedoRegWeight        = kAlbedoRegWeight;
-        tc.smoothAlpha            = kSmoothAlpha;
-        tc.contourItersPersonalise = kContourOuterIters;
-        tc.photoIterations        = kPhotoIterations;
-        tc.photoPixelStride       = kPhotoPixelStride;
-        tc.depthPointToPlaneWeight = kDepthPointToPlaneWeight;
-        tc.depthWeight            = kDepthWeight;
-        tc.depthVertexStride      = kDepthVertexStride;
-        FaceTracker tracker(bfm, cal.K_rgb, tc);
+        FaceTracker tracker(bfm, cal.K_rgb, offlineConfig(sparseReg));
 
         // Identity-quality metric: interior-landmark reprojection RMS of the
         // frozen identity at each TRACKED frame. A better identity generalises
@@ -717,15 +750,15 @@ static void runVideoReconstruction(
                 .R = curPose.rotationMatrix(), .t = curPose.translation.cast<float>(),
                 .K = cal.K_rgb, .sh = curSh };
             cv::Mat overlay = blendRenderOnPhoto(renderer.render(in), f.rgb);
-            label(overlay, i == 0 ? "personalise" : "track");
+            drawLabel(overlay, i == 0 ? "personalise" : "track");
 
             cv::Mat reconPose = reconBgr(fitted, betaVec, curPose, curSh, cal.K_rgb);
-            label(reconPose, "reconstruction @ pose");
+            drawLabel(reconPose, "reconstruction @ pose");
 
             PoseParameters frontal;                     // identity rotation, centred
             frontal.translation = Eigen::Vector3d(0, 0, kFrontalRenderDepthMM);
             cv::Mat reconFront = reconBgr(fitted, betaVec, frontal, curSh, frontalK);
-            label(reconFront, "reconstruction frontal");
+            drawLabel(reconFront, "reconstruction frontal");
 
             cv::Mat composite;
             cv::hconcat(std::vector<cv::Mat>{overlay, reconPose, reconFront}, composite);
@@ -903,14 +936,90 @@ struct LiveOptions {
     // --optimize-focal; robust recovery needs multi-keyframe bundling (plan §3).
     bool        optimizeFocal = false;
     double      initZ         = 500.0;  // webcam ≈ arm's length (mm)
-    // --photo-texture: at personalise time, project the camera frame onto the
-    // fitted mesh (per-vertex photo colours, like the offline textured
-    // overlays) and render with THAT instead of the BFM albedo — in the main
-    // overlay AND the mask debug window. Makes drift instantly visible: the
-    // texture is sampled once, so any later misalignment shows as the painted
-    // features sliding off the real ones.
-    bool        photoTexture  = false;
+    // --transfer-target <biwi-dir>: expression-transfer mode. The named subject
+    // is personalised once as the TARGET avatar; the live camera drives it with
+    // YOUR expressions (neutral-relative δ). Empty ⇒ normal live tracking.
+    std::string transferTarget;
 };
+
+// Open the driving input — a --live-source image/video, or a live camera — and
+// return the first usable frame in `firstFrame`. Shared by live-cpu and the
+// transfer driver. For a live device this warms the stream up and falls back
+// over device indices, handling the macOS/AVFoundation quirks:
+//  - a stream opened before the camera-permission dialog is answered delivers
+//    BLACK frames until re-opened;
+//  - device 0 is often an inactive iPhone Continuity Camera (black forever);
+//  - forcing FRAME_WIDTH/HEIGHT can blank the stream, so we take native size.
+// `who` tags the diagnostics ("live" / "transfer"). Returns false on failure.
+static bool openLiveCapture(cv::VideoCapture& cap, const LiveOptions& lo,
+                            cv::Mat& firstFrame, const char* who)
+{
+    if (!lo.source.empty()) {
+        cap.open(lo.source,
+                 isImageSequence(lo.source) ? cv::CAP_IMAGES : cv::CAP_ANY);
+        if (!cap.isOpened() || !cap.read(firstFrame) || firstFrame.empty()) {
+            std::cerr << who << ": could not read " << lo.source << '\n';
+            return false;
+        }
+        return true;
+    }
+    const auto openWorkingCamera = [&](int idx) -> bool {
+        cap.release();
+        if (!cap.open(idx)) return false;
+        cv::Mat probe;
+        for (int attempt = 0; attempt < 50; ++attempt) {   // ~2.5 s warm-up
+            if (cap.read(probe) && !probe.empty()) {
+                const cv::Scalar m = cv::mean(probe);
+                if (m[0] + m[1] + m[2] > 6.0) { firstFrame = probe; return true; }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        std::cout << who << ": camera " << idx
+                  << " opened but only delivers black frames — skipping\n";
+        return false;
+    };
+    bool opened = openWorkingCamera(lo.camera);
+    // Continuity Camera is often index 0 while the built-in FaceTime camera is 1.
+    for (int idx = 0; !opened && idx <= 2; ++idx)
+        if (idx != lo.camera) opened = openWorkingCamera(idx);
+    // Final fresh retry: a stream opened before the permission grant stays black.
+    if (!opened) opened = openWorkingCamera(lo.camera);
+    if (!opened) {
+        std::cerr << who << ": no camera delivered usable frames.\n"
+                     "  - run on the HOST (Docker has no camera)\n"
+                     "  - System Settings → Privacy & Security → Camera → "
+                     "enable your terminal, then RE-RUN\n"
+                     "  - or pick a device explicitly: --camera 1\n";
+        return false;
+    }
+    std::cout << who << ": camera delivering " << firstFrame.cols << "x"
+              << firstFrame.rows << " (" << cap.getBackendName() << ")\n";
+    return true;
+}
+
+// FaceTracker config for the realtime paths (speed over polish), shared by
+// live-cpu and the transfer driver. Lighting/albedo and the per-pixel shape
+// refinement run only at personalise; tracking is warm-started landmarks.
+static FaceTracker::Config liveConfig(double sparseReg, const LiveOptions& lo)
+{
+    FaceTracker::Config tc;
+    tc.sparseReg               = sparseReg;
+    tc.exprRegPersonalise      = kExprRegWeight;
+    tc.exprRegTrack            = kTrackExprRegWeight;
+    tc.albedoRegWeight         = kAlbedoRegWeight;
+    tc.smoothAlpha             = kSmoothAlpha;
+    tc.contourItersPersonalise = kContourOuterIters;
+    tc.photoIterations         = 20;      // one-off → keep startup snappy
+    tc.photoPixelStride        = 2;
+    tc.personaliseOptimizeShape = false;  // per-pixel shape refine too slow live
+    tc.contourItersTrack       = 3;       // warm-started → converges fast
+    tc.trackPhotoIterations    = 1;
+    tc.trackPhotoOptimizePose  = false;   // lighting = pure linear estimate
+    tc.lightingEvery           = 10;
+    tc.photoRefine             = lo.photoRefine;
+    tc.optimizeFocal           = lo.optimizeFocal;
+    return tc;
+}
 
 // Personalisation quality gate: the identity (and, with --optimize-focal, the
 // focal) is fitted ONCE and kept for the whole session, so refusing a turned
@@ -931,47 +1040,6 @@ static bool frontalEnough(const std::vector<LandmarkObservation>& obs)
     if (eyeDist < 25.0) return false;                        // face too small/far
     const Eigen::Vector2d mid = 0.5 * (eyeL + eyeR);
     return std::abs(nose.x() - mid.x()) < 0.35 * eyeDist;    // |yaw| ≲ 25–30°
-}
-
-// Projective texture for live (--photo-texture): sample the photo's colour at
-// every camera-facing vertex's projection (1×1 getRectSubPix = bilinear);
-// averted / off-image vertices keep the fallback albedo. Same recipe as the
-// offline `rgb_overlay_textured`, minus the RGB↔depth extrinsics (live has a
-// single camera). Captured ONCE at personalise time — lighting is baked into
-// the samples, so render it with flat white SH, not the estimated lighting.
-static Eigen::MatrixX3f projectiveTexture(const cv::Mat&          bgr,
-                                          const Eigen::MatrixX3f& shape,
-                                          const Eigen::MatrixX3i& faces,
-                                          const Eigen::MatrixX3f& fallback,
-                                          const PoseParameters&   pose,
-                                          const Eigen::Matrix3f&  K)
-{
-    Eigen::MatrixX3f tex = fallback;
-    const Eigen::Matrix3f  R   = pose.rotationMatrix();
-    const Eigen::Vector3f  t   = pose.translation.cast<float>();
-    const Eigen::MatrixX3f cam = proj::toCameraFrame(shape, R, t);
-    const Eigen::MatrixX3f nrm =
-        proj::normalsToCameraFrame(Renderer::computeNormals(shape, faces), R);
-
-    int sampled = 0;
-    for (int i = 0; i < cam.rows(); ++i) {
-        if (cam(i, 2) <= 1.0f) continue;
-        // visible ≈ normal faces the camera (the face is frontally convex).
-        const Eigen::Vector3f dir = cam.row(i).normalized();
-        if (nrm.row(i).dot(dir) > -0.25f) continue;
-        const float u = K(0, 0) * cam(i, 0) / cam(i, 2) + K(0, 2);
-        const float v = K(1, 1) * cam(i, 1) / cam(i, 2) + K(1, 2);
-        if (u < 1.0f || v < 1.0f || u >= bgr.cols - 2.0f || v >= bgr.rows - 2.0f)
-            continue;
-        cv::Mat patch;
-        cv::getRectSubPix(bgr, {1, 1}, {u, v}, patch);
-        const cv::Vec3b c = patch.at<cv::Vec3b>(0, 0);
-        tex.row(i) = Eigen::RowVector3f(c[2] / 255.0f, c[1] / 255.0f, c[0] / 255.0f);
-        ++sampled;
-    }
-    std::cout << "live: photo texture captured (" << sampled << " / "
-              << cam.rows() << " vertices)\n";
-    return tex;
 }
 
 // Keypoint debug view: the camera frame with the detected observations
@@ -1013,69 +1081,9 @@ static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions
 {
     cv::VideoCapture cap;
     cv::Mat raw;
+    if (!openLiveCapture(cap, lo, raw, "live")) return;
 
-    if (!lo.source.empty()) {
-        // An image path/pattern (e.g. frame_00003_rgb.png) is an image SEQUENCE
-        // — force CAP_IMAGES, else FFmpeg opens it as a one-frame video.
-        const bool imageSeq = lo.source.find(".png") != std::string::npos ||
-                              lo.source.find(".jpg") != std::string::npos ||
-                              lo.source.find('%')   != std::string::npos;
-        cap.open(lo.source, imageSeq ? cv::CAP_IMAGES : cv::CAP_ANY);
-        if (!cap.isOpened() || !cap.read(raw) || raw.empty()) {
-            std::cerr << "live: could not read " << lo.source << '\n';
-            return;
-        }
-    } else {
-        // macOS/AVFoundation gotchas this handles:
-        //  - frames stay BLACK if the stream opened before the permission
-        //    dialog was answered → re-opening after warm-up fixes it;
-        //  - device 0 can be an inactive iPhone Continuity Camera (delivers
-        //    black forever) → fall through to the next indices;
-        //  - forcing CAP_PROP_FRAME_WIDTH/HEIGHT can also blank the stream, so
-        //    we take the camera's native size (prep() downscales anyway).
-        const auto openWorkingCamera = [&](int idx) -> bool {
-            cap.release();
-            if (!cap.open(idx)) return false;
-            cv::Mat probe;
-            for (int attempt = 0; attempt < 50; ++attempt) {   // ~2.5 s warm-up
-                if (cap.read(probe) && !probe.empty()) {
-                    const cv::Scalar m = cv::mean(probe);
-                    if (m[0] + m[1] + m[2] > 6.0) { raw = probe; return true; }
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            }
-            std::cout << "live: camera " << idx
-                      << " opened but only delivers black frames — skipping\n";
-            return false;
-        };
-
-        bool opened = openWorkingCamera(lo.camera);
-        // Auto-fallback over the next device indices (Continuity Camera is
-        // often index 0 while the built-in FaceTime camera is 1).
-        for (int idx = 0; !opened && idx <= 2; ++idx)
-            if (idx != lo.camera) opened = openWorkingCamera(idx);
-        // Final retry of the requested device with a FRESH open — a stream that
-        // was opened before the permission grant stays black until re-opened.
-        if (!opened) opened = openWorkingCamera(lo.camera);
-        if (!opened) {
-            std::cerr << "live: no camera delivered usable frames.\n"
-                         "  - run on the HOST (Docker has no camera)\n"
-                         "  - System Settings → Privacy & Security → Camera → "
-                         "enable your terminal, then RE-RUN\n"
-                         "  - or pick a device explicitly: --camera 1\n";
-            return;
-        }
-        std::cout << "live: camera delivering " << raw.cols << "x" << raw.rows
-                  << " (" << cap.getBackendName() << ")\n";
-    }
-    const double scale = std::min(1.0, static_cast<double>(lo.width) / raw.cols);
-    const auto prep = [&](const cv::Mat& in) {
-        cv::Mat out;
-        if (scale < 1.0) cv::resize(in, out, {}, scale, scale, cv::INTER_AREA);
-        else             out = in;
-        return out;
-    };
-    cv::Mat frame = prep(raw);
+    cv::Mat frame = resizeToWidth(raw, lo.width);
     const int W = frame.cols, H = frame.rows;
 
     // Unknown webcam intrinsics: start from a 60°-HFOV guess; personalisation
@@ -1104,42 +1112,17 @@ static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions
         return;
     }
 
-    FaceTracker::Config tc;                    // live-tuned (speed over polish)
-    tc.sparseReg              = sparseReg;
-    tc.exprRegPersonalise     = kExprRegWeight;
-    tc.exprRegTrack           = kTrackExprRegWeight;
-    tc.albedoRegWeight        = kAlbedoRegWeight;
-    tc.smoothAlpha            = kSmoothAlpha;
-    tc.contourItersPersonalise = kContourOuterIters;
-    tc.photoIterations        = 20;            // one-off → keep startup snappy
-    tc.photoPixelStride       = 2;
-    // Lighting + albedo only at personalise: the per-pixel SHAPE refinement
-    // carries a kShapeCoefficientCount-wide autodiff jet per covered pixel
-    // (plus a 53k × K basis precompute) — with a large identity count that is
-    // seconds of startup for a refinement that measures out at ‖Δα‖ ≈ 0.01.
-    // The offline modes keep it.
-    tc.personaliseOptimizeShape = false;
-    tc.contourItersTrack      = 3;             // warm-started → converges fast
-    tc.trackPhotoIterations   = 1;
-    tc.trackPhotoOptimizePose = false;         // lighting = pure linear estimate
-    tc.lightingEvery          = 10;
-    tc.photoRefine            = lo.photoRefine;
-    tc.optimizeFocal          = lo.optimizeFocal;
-    FaceTracker tracker(bfm, K0, tc);
+    FaceTracker tracker(bfm, K0, liveConfig(sparseReg, lo));
 
     const Renderer renderer(H, W, bfm.faces());
     const std::string liveDir = outDir("live");
     double fpsEma = 0.0;
     long processed = 0, written = 0;
 
-    // --photo-texture state: captured once per personalisation.
-    Eigen::MatrixX3f photoTex;
-    bool             havePhotoTex = false;
-
     for (;;) {
         if (!cap.read(raw) || raw.empty()) break;
         const auto t0 = std::chrono::steady_clock::now();
-        frame = prep(raw);
+        frame = resizeToWidth(raw, lo.width);
 
         std::vector<LandmarkObservation> obs;
         {
@@ -1155,12 +1138,6 @@ static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions
             if (!obs.empty() && frontalEnough(obs)) {
                 ScopedTimer t("live/personalise");
                 tracked = tracker.personalise(frame, obs, lo.initZ);
-                if (tracked && lo.photoTexture) {
-                    photoTex = projectiveTexture(
-                        frame, tracker.currentShape(), bfm.faces(),
-                        tracker.currentAlbedo(), tracker.pose(), tracker.K());
-                    havePhotoTex = true;
-                }
             }
         } else {
             ScopedTimer t("live/track");
@@ -1168,19 +1145,17 @@ static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions
         }
 
         // Rendered-model views (shared by the overlay and the mask window).
-        // Photo texture has the capture frame's lighting baked in → flat SH.
         cv::Mat vis, maskVis, kpVis;
         if (tracker.personalised()) {
             ScopedTimer t("live/render");
-            const bool textured = havePhotoTex;
             const Eigen::MatrixX3f shape = tracker.currentShape();
             const RenderInput in{
                 .shape  = shape,
-                .albedo = textured ? photoTex : tracker.currentAlbedo(),
+                .albedo = tracker.currentAlbedo(),
                 .R      = tracker.pose().rotationMatrix(),
                 .t      = tracker.pose().translation.cast<float>(),
                 .K      = tracker.K(),
-                .sh     = textured ? light::defaultWhite() : tracker.sh() };
+                .sh     = tracker.sh() };
             const RenderOutput r = renderer.render(in);
             vis = blendRenderOnPhoto(r, frame);
 
@@ -1201,7 +1176,6 @@ static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions
                    << p.angleAxis.z() * 180.0 / M_PI;
                 l3 << "|id| " << std::setprecision(2) << tracker.identity().norm()
                    << "  |expr| " << (ex.size() ? ex.norm() : 0.0)
-                   << "  albedo: " << (textured ? "photo-texture" : "BFM beta")
                    << "  f " << static_cast<int>(tracker.K()(0, 0)) << "px";
                 int y = 22;
                 for (const std::ostringstream* s : {&l1, &l2, &l3}) {
@@ -1253,7 +1227,6 @@ static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions
             if (key == 'q' || key == 27) break;
             if (key == 'p') {                   // re-personalise from scratch
                 tracker.reset(K0);
-                havePhotoTex = false;           // recaptured next personalise
                 std::cout << "live: re-personalising…\n";
             }
             if (key == 's') {
@@ -1267,6 +1240,180 @@ static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions
     std::cout << "live: processed " << processed << " frames @ "
               << std::fixed << std::setprecision(1) << fpsEma << " fps";
     if (written > 0) std::cout << ", wrote " << written << " → " << liveDir;
+    std::cout << '\n';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENTRY POINT: transfer — live EXPRESSION TRANSFER (Face2Face §7, our variant)
+// ─────────────────────────────────────────────────────────────────────────────
+// The named Biwi subject is personalised ONCE as the target avatar; your live
+// camera then drives its expressions. Because the BFM expression basis is a
+// single GLOBAL additive basis (shape = mean + B_id·α + B_exp·δ), transfer is a
+// coefficient copy — no per-person deformation transfer (the paper needs that
+// only for identity-specific blendshapes). We use NEUTRAL-RELATIVE transfer:
+//   δ_target = δ_target_neutral + (δ_you − δ_you_neutral)
+// so each face keeps its own resting shape and only the CHANGE is transferred.
+// Expression-only: the target stays frontal; only the face articulates.
+static void runTransferLive(const BFMLoader& bfm, double sparseReg,
+                            const LiveOptions& lo)
+{
+    // ── 1. Personalise the TARGET avatar (Biwi frame 0, + depth) ─────────────
+    Eigen::VectorXd  tgtAlpha, tgtNeutral;
+    Eigen::MatrixX3f tgtAlbedo;
+    light::SHCoeffs  tgtSh;
+    cv::Mat          tgtImg;           // the target's own photo (frame 0)
+    Eigen::Matrix3f  tgtImgK;          // its intrinsics
+    PoseParameters   tgtPose;          // its personalised head pose
+    try {
+        BiwiLoader biwi(lo.transferTarget, 1);
+        const std::vector<BiwiFrame> tf = biwi.getFrames();
+        if (tf.empty()) { std::cerr << "transfer: no frames in " << lo.transferTarget << '\n'; return; }
+        const BiwiCalibration cal = biwi.getCalibration();
+        const BiwiFrame& f = tf[0];
+        std::vector<LandmarkObservation> obs;
+        std::ostringstream mp;
+        mp << lo.transferTarget << "/landmarks_mp_" << std::setw(5)
+           << std::setfill('0') << f.frameNumber << ".txt";
+        try { obs = loadLandmarkObservations(mp.str()); } catch (const std::exception&) {}
+        if (obs.empty()) {
+            LandmarkDetector d(kLbfModelPath, kYuNetPath); obs = d.detect(f.rgb);
+        }
+        if (obs.empty()) { std::cerr << "transfer: no landmarks for target\n"; return; }
+        std::vector<Eigen::Vector3d> head = cropHead(
+            backprojectDepth(f.depth, cal.K_depth, kDepthBackprojStride),
+            f.headCenter, kDepthCropRadiusMM, kDepthCropFrontSlabMM);
+        for (Eigen::Vector3d& p : head) p = cal.R_rgb * p + cal.t_rgb;
+        const Eigen::Vector3d headRgb = cal.R_rgb * f.headCenter + cal.t_rgb;
+        FaceTracker tt(bfm, cal.K_rgb, offlineConfig(sparseReg));
+        if (!tt.personalise(f.rgb, obs, headRgb.z(), &head)) {
+            std::cerr << "transfer: target personalise failed\n"; return; }
+        tgtAlpha = tt.identity(); tgtAlbedo = tt.currentAlbedo();
+        tgtSh = tt.sh();          tgtNeutral = tt.expr();
+        tgtImg = f.rgb.clone();   tgtImgK = cal.K_rgb;   tgtPose = tt.pose();
+        std::cout << "transfer: target '" << lo.transferTarget
+                  << "' personalised (|id|=" << tgtAlpha.norm() << ")\n";
+    } catch (const std::exception& e) {
+        std::cerr << "transfer: target load failed: " << e.what() << '\n'; return;
+    }
+
+    // ── 2. Camera / source for the DRIVING actor (you) ───────────────────────
+    cv::VideoCapture cap; cv::Mat raw;
+    if (!openLiveCapture(cap, lo, raw, "transfer")) return;
+    cv::Mat frame = resizeToWidth(raw, lo.width);
+    const int W = frame.cols, H = frame.rows;
+    const Eigen::Matrix3f K0 = proj::defaultIntrinsics(W, H);
+
+    MpLandmarkStream mpStream;
+    if (kDetector == "mediapipe" || !kDetectorExplicit) mpStream.start();
+    LandmarkDetector detector(kLbfModelPath, kDetector == "lbf" ? "" : kYuNetPath);
+    if (!detector.ok() && !mpStream.running()) {
+        std::cerr << "transfer: no landmark detector\n"; return; }
+
+    FaceTracker driver(bfm, K0, liveConfig(sparseReg, lo));
+
+    const int TH = H, TW = H;                       // square target panel
+    const Eigen::Matrix3f tgtK = proj::defaultIntrinsics(TW, TH);
+    const Renderer tgtRenderer(TH, TW, bfm.faces());
+    // Renderer for the driven avatar over the target's OWN photo (its pose).
+    const Renderer tgtOverlayRenderer(tgtImg.rows, tgtImg.cols, bfm.faces());
+    PoseParameters frontal; frontal.translation = Eigen::Vector3d(0, 0, kFrontalRenderDepthMM);
+
+    Eigen::VectorXd userNeutral; bool haveUserNeutral = false;
+    const std::string outDirT = outDir("transfer");
+    std::cout << "transfer: driving with your expressions. keys: q quit | "
+                 "p re-personalise | n set neutral | s snapshot\n";
+    long processed = 0, written = 0; double fpsEma = 0.0;
+
+    for (;;) {
+        if (!cap.read(raw) || raw.empty()) break;
+        const auto t0 = std::chrono::steady_clock::now();
+        frame = resizeToWidth(raw, lo.width);
+        std::vector<LandmarkObservation> obs =
+            mpStream.running() ? mpStream.detect(frame) : detector.detect(frame);
+
+        if (!driver.personalised()) {
+            if (!obs.empty() && frontalEnough(obs) &&
+                driver.personalise(frame, obs, lo.initZ)) {
+                userNeutral = driver.expr(); haveUserNeutral = true;   // rest pose
+                std::cout << "transfer: driver personalised — hold neutral, or press 'n'\n";
+            }
+        } else {
+            driver.track(frame, obs, lo.initZ);
+        }
+
+        // Render the target avatar with the NEUTRAL-RELATIVE transferred δ, in
+        // two views: (a) frontal on black, (b) over the target's OWN photo at
+        // its personalised pose (the target person making your expression).
+        cv::Mat tgtVis = cv::Mat::zeros(TH, TW, CV_8UC3);
+        cv::Mat tgtOverlay = tgtImg.clone();
+        if (driver.personalised()) {
+            Eigen::VectorXd d = tgtNeutral;
+            const Eigen::VectorXd ue = driver.expr();
+            if (haveUserNeutral && ue.size() == userNeutral.size() &&
+                tgtNeutral.size() == ue.size())
+                d = tgtNeutral + (ue - userNeutral);
+            d = d.cwiseMax(-3.5).cwiseMin(3.5);
+            const Eigen::MatrixX3f ts =
+                bfm.shape(tgtAlpha.cast<float>(), d.cast<float>());
+            const RenderInput frontIn{ .shape = ts, .albedo = tgtAlbedo,
+                .R = frontal.rotationMatrix(), .t = frontal.translation.cast<float>(),
+                .K = tgtK, .sh = tgtSh };
+            cv::cvtColor(tgtRenderer.render(frontIn).image, tgtVis, cv::COLOR_RGB2BGR);
+            tgtVis.convertTo(tgtVis, CV_8UC3, 255.0);
+
+            const RenderInput overIn{ .shape = ts, .albedo = tgtAlbedo,
+                .R = tgtPose.rotationMatrix(), .t = tgtPose.translation.cast<float>(),
+                .K = tgtImgK, .sh = tgtSh };
+            tgtOverlay = blendRenderOnPhoto(tgtOverlayRenderer.render(overIn), tgtImg);
+        }
+
+        // Composite: your camera (left) | target avatar (right).
+        cv::Mat driverVis = frame.clone();
+        for (const LandmarkObservation& o : obs)
+            cv::circle(driverVis, {int(o.imagePoint.x()), int(o.imagePoint.y())}, 2,
+                       o.vertexIndex < 0 ? cv::Scalar(255,255,0) : cv::Scalar(0,220,0),
+                       -1, cv::LINE_AA);
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        fpsEma = fpsEma <= 0.0 ? 1000.0/ms : 0.9*fpsEma + 0.1*(1000.0/ms);
+        std::ostringstream hud;
+        hud << (driver.personalised() ? "driving" : "hold a frontal face...")
+            << "  " << std::fixed << std::setprecision(1) << fpsEma << " fps";
+        cv::putText(driverVis, hud.str(), {8, 24}, cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                    {0, 220, 0}, 2, cv::LINE_AA);
+        cv::putText(tgtVis, "target avatar", {8, 24},
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, {0, 220, 0}, 1, cv::LINE_AA);
+        // Match the overlay panel to the row height for hconcat.
+        if (tgtOverlay.rows != H) {
+            const double r = static_cast<double>(H) / tgtOverlay.rows;
+            cv::resize(tgtOverlay, tgtOverlay, {}, r, r, cv::INTER_AREA);
+        }
+        cv::putText(tgtOverlay, "target over photo", {8, 24},
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, {0, 220, 0}, 1, cv::LINE_AA);
+        cv::Mat composite;
+        cv::hconcat(std::vector<cv::Mat>{driverVis, tgtVis, tgtOverlay}, composite);
+
+        ++processed;
+        if (lo.maxFrames > 0) {
+            std::ostringstream n; n << outDirT << "/transfer_" << std::setw(4)
+                << std::setfill('0') << written++ << ".png";
+            cv::imwrite(n.str(), composite);
+        }
+        if (lo.display) {
+            cv::imshow("face2face transfer", composite);
+            const int key = cv::waitKey(1) & 0xFF;
+            if (key == 'q' || key == 27) break;
+            if (key == 'p') { driver.reset(K0); haveUserNeutral = false; }
+            if (key == 'n' && driver.personalised()) {   // recapture neutral
+                userNeutral = driver.expr(); haveUserNeutral = true;
+                std::cout << "transfer: neutral recaptured\n";
+            }
+            if (key == 's') cv::imwrite(outDirT + "/snapshot.png", composite);
+        }
+        if (lo.maxFrames > 0 && processed >= lo.maxFrames) break;
+    }
+    std::cout << "transfer: processed " << processed << " frames";
+    if (written) std::cout << ", wrote " << written << " → " << outDirT;
     std::cout << '\n';
 }
 
@@ -1517,44 +1664,6 @@ static void fitDenseOnBiwi(const BFMLoader&        bfm,
                          posedCam, bfm.faces(), albedo);
         savePointCloud(outDir("biwi_dense") + "/head_cloud.obj", head);
 
-        // ─── projective texture: sample the real photo colours onto the mesh ─
-        // Geometry alone is not recognisable — the mean albedo always looks like
-        // "some face". With the extrinsics we project every camera-facing vertex
-        // into the RGB photo and sample its colour there; averted/occluded
-        // vertices keep the mean albedo.
-        Eigen::MatrixX3f photoAlbedo = albedo;
-        {
-            const Eigen::MatrixX3f camNormals =
-                Renderer::computeNormals(posedCam, bfm.faces());
-            int sampled = 0;
-            for (int i = 0; i < posedCam.rows(); ++i) {
-                const Eigen::Vector3d pDepth = posedCam.row(i).cast<double>();
-                const Eigen::Vector3d pRgb = cal.R_rgb * pDepth + cal.t_rgb;
-                if (pRgb.z() <= 1.0) continue;
-                // visible ≈ normal faces the camera (the face is frontally
-                // convex, so no real occlusion test is needed here).
-                const Eigen::Vector3d n = camNormals.row(i).cast<double>();
-                if (n.dot(pDepth.normalized()) > -0.25) continue;
-                const float u = static_cast<float>(
-                    cal.K_rgb(0, 0) * pRgb.x() / pRgb.z() + cal.K_rgb(0, 2));
-                const float v = static_cast<float>(
-                    cal.K_rgb(1, 1) * pRgb.y() / pRgb.z() + cal.K_rgb(1, 2));
-                if (u < 1.0f || v < 1.0f || u >= frame.rgb.cols - 2.0f ||
-                    v >= frame.rgb.rows - 2.0f)
-                    continue;
-                cv::Mat patch;                          // 1x1 patch = bilinear
-                cv::getRectSubPix(frame.rgb, {1, 1}, {u, v}, patch);
-                const cv::Vec3b bgr = patch.at<cv::Vec3b>(0, 0);
-                photoAlbedo.row(i) = Eigen::RowVector3f(
-                    bgr[2] / 255.0f, bgr[1] / 255.0f, bgr[0] / 255.0f);
-                ++sampled;
-            }
-            std::cout << "Projective texture: " << sampled << " / "
-                      << posedCam.rows() << " vertices sampled from the photo\n";
-        }
-        saveCurrentModel(outDir("biwi_dense") + "/fitted_face_textured.obj",
-                         fitted, bfm.faces(), photoAlbedo);
-
         // Overlay 1: depth camera.
         RenderInput depthInput{
             .shape  = fitted,
@@ -1586,48 +1695,25 @@ static void fitDenseOnBiwi(const BFMLoader&        bfm,
         overlayRenderOnPhoto(rgbRenderer.render(rgbInput), frame.rgb,
                              outDir("biwi_dense") + "/rgb_overlay.png");
 
-        // The same copy with the photo texture — the most convincing view:
-        // when geometry AND colour match, the (green) boundary is nearly
-        // invisible, i.e. the reconstruction is right.
-        rgbInput.albedo = photoAlbedo;
-        const RenderOutput texturedRender = rgbRenderer.render(rgbInput);
-        overlayRenderOnPhoto(texturedRender, frame.rgb,
-                             outDir("biwi_dense") + "/rgb_overlay_textured.png");
-
-        // 100% variant: NO blend, NO contour — inside the render mask the
-        // render fully replaces the photo, so everything there is purely the
-        // reconstructed mesh with its texture.
-        {
-            cv::Mat renderBgr;
-            cv::cvtColor(texturedRender.image, renderBgr, cv::COLOR_RGB2BGR);
-            renderBgr.convertTo(renderBgr, CV_8UC3, 255.0f);
-            cv::Mat hard = frame.rgb.clone();
-            renderBgr.copyTo(hard, texturedRender.mask);
-            cv::imwrite(outDir("biwi_dense") + "/rgb_overlay_textured_100.png", hard);
-            std::cout << "render overlay (100%) → "
-                      << outDir("biwi_dense") + "/rgb_overlay_textured_100.png" << '\n';
-        }
-
         // 3-panel mask visualisation (overlay | recon @ pose | recon frontal),
-        // in the RGB camera, with the photo-projected texture.
+        // in the RGB camera.
         {
             const Eigen::AngleAxisd rgbAA(Rrgb.cast<double>());
             PoseParameters rgbPose;
             rgbPose.angleAxis   = rgbAA.angle() * rgbAA.axis();
             rgbPose.translation = trgb.cast<double>();
             const cv::Mat maskPanels = renderMaskPanels(
-                frame.rgb, fitted, photoAlbedo, cal.K_rgb, rgbPose, bfm.faces());
+                frame.rgb, fitted, albedo, cal.K_rgb, rgbPose, bfm.faces());
             const std::string maskPath = outDir("biwi_dense") + "/mask_panels.png";
             cv::imwrite(maskPath, maskPanels);
             std::cout << "Wrote mask panels: " << maskPath << '\n';
         }
 
-        // Frontal portrait of the fitted identity: once with the mean albedo
-        // (shows pure GEOMETRY) and once with the projected photo texture
-        // (shows the PERSON — colour comes from the real image).
+        // Frontal portrait of the fitted identity with the mean albedo (pure
+        // GEOMETRY — the individual face shape straight-on).
         {
             constexpr int RH = 480, RW = 640;
-            RenderInput portrait{
+            const RenderInput portrait{
                 .shape  = fitted,
                 .albedo = albedo,
                 .R      = Eigen::Matrix3f::Identity(),
@@ -1635,12 +1721,8 @@ static void fitDenseOnBiwi(const BFMLoader&        bfm,
                 .K      = proj::defaultIntrinsics(RW, RH),
                 .sh     = light::defaultWhite(),
             };
-            const Renderer portraitRenderer(RH, RW, bfm.faces());
-            writeColourImage(portraitRenderer.render(portrait),
+            writeColourImage(Renderer(RH, RW, bfm.faces()).render(portrait),
                              outDir("biwi_dense") + "/face_render.png");
-            portrait.albedo = photoAlbedo;
-            writeColourImage(portraitRenderer.render(portrait),
-                             outDir("biwi_dense") + "/face_render_textured.png");
         }
 
         const Eigen::VectorXf disp = (fitted - meanShape).rowwise().norm();
@@ -1664,6 +1746,7 @@ static void printUsage()
       "  rgbd       + the metric Kinect depth ICP term\n"
       "Realtime (Mac camera, HOST only — Docker has no camera):\n"
       "  live-cpu   the CPU tracker (this build)\n"
+      "  transfer   live expression transfer onto a target avatar\n"
       "  live-gpu   GPU tracker — stub, under development\n"
       "Single-frame geometry (kept for reports):\n"
       "  dense      depth-only ICP\n"
@@ -1679,9 +1762,8 @@ static void printUsage()
       "  --camera <i> | --live-source <path> | --live-width <px>\n"
       "  --live-frames <n> --live-nodisplay   headless live test\n"
       "  --photo-refine     pyramid photometric pose refinement (live)\n"
-      "  --photo-texture    live: project the personalise frame onto the mesh\n"
-      "                     and render with that texture (overlay + mask window)\n"
       "  --optimize-focal   solve fx=fy during personalise (experimental)\n"
+      "  --transfer-target <biwi-dir>   avatar to drive in --mode transfer\n"
       "  --bundle           multi-keyframe identity bundle (rgb/rgbd, Face2Face \u00a76)\n"
       "  --bundle-keyframes <k>   keyframes for --bundle (default 7)\n"
       "  --timers           print per-stage timings\n";
@@ -1717,8 +1799,8 @@ int main(int argc, char** argv)
         else if (arg == "--live-width" && i + 1 < argc) live.width = std::stoi(argv[++i]);
         else if (arg == "--live-frames" && i + 1 < argc) live.maxFrames = std::stoi(argv[++i]);
         else if (arg == "--live-nodisplay") live.display = false;
+        else if (arg == "--transfer-target" && i + 1 < argc) live.transferTarget = argv[++i];
         else if (arg == "--photo-refine") live.photoRefine = true;
-        else if (arg == "--photo-texture") live.photoTexture = true;
         else if (arg == "--optimize-focal") live.optimizeFocal = true;
         else if (arg == "--bundle") kBundlePersonalise = true;
         else if (arg == "--bundle-keyframes" && i + 1 < argc) kBundleKeyframes = std::stoi(argv[++i]);
@@ -1746,6 +1828,13 @@ int main(int argc, char** argv)
                                /*useDepth=*/mode == "rgbd");
     } else if (mode == "live-cpu") {
         runLiveCpu(bfm, sparseReg, live);
+    } else if (mode == "transfer") {
+        if (live.transferTarget.empty()) {
+            std::cerr << "transfer: need --transfer-target <biwi-dir> (the avatar "
+                         "to drive), e.g. --transfer-target data/BK-1/05\n";
+            return 1;
+        }
+        runTransferLive(bfm, sparseReg, live);
     } else if (mode == "live-gpu") {
         runLiveGpu(bfm, sparseReg, live);
     } else if (mode == "dense") {

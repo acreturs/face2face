@@ -26,12 +26,12 @@ public:
         // priors / fit weights
         double sparseReg          = 30.0;
         double exprRegPersonalise = 200.0;   // see cfg::kExprRegWeight in main
-        double exprRegTrack       = 18.0;   // see cfg::kTrackExprRegWeight in main
+        double exprRegTrack       = 5.0;    // see cfg::kTrackExprRegWeight in main
         // Temporal expression prior for track(): damps per-frame jitter in the
         // solve; holding an articulation costs nothing (unlike exprRegTrack).
         double exprTemporalReg    = 50.0;
         double albedoRegWeight    = 3.0;     // see cfg::kAlbedoRegWeight in main
-        double smoothAlpha        = 0.6;     // EMA: new = a·fit + (1−a)·prev
+        double smoothAlpha        = 0.1;     // EMA: new = a·fit + (1−a)·prev  (low=laggy)
         // personalise stage
         int  contourItersPersonalise = 40;
         int  photoIterations         = 20;
