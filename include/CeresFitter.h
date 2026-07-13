@@ -263,4 +263,38 @@ public:
         const std::vector<LandmarkObservation>* landmarks   = nullptr,
         double                            landmarkWeight    = 0.0
     );
+
+    // Increment 2 — dense-photometric identity BUNDLE (Face2Face §6 + Eq. 4).
+    // Refines the SHARED identity α using the per-pixel photometric term E_col
+    // from ALL keyframes jointly (+ the E_lan landmark anchor), with per-frame
+    // pose+expression FIXED (from the geometric fitIdentityBundle) and shared
+    // albedo β + lighting γ (keyframes from one Biwi room share illumination).
+    // Because α is the only free block, the multi-view dense solve stays
+    // tractable on CPU. Per-frame vectors are parallel. Returns the refined α;
+    // writes the shared β and γ to the out-params (for rendering).
+    static Eigen::VectorXd fitIdentityPhotometricBundle(
+        const Eigen::MatrixX3f&          meanShape,
+        const Eigen::MatrixXf&           shapeBasis,
+        const Eigen::VectorXf&           shapeSigma,
+        const Eigen::MatrixXf&           exprBasis,
+        const Eigen::VectorXf&           exprSigma,
+        const Eigen::MatrixX3i&          triangles,
+        const Eigen::MatrixX3f&          meanAlbedo,
+        const Eigen::MatrixXf&           colorBasis,
+        const Eigen::VectorXf&           colorSigma,
+        const std::vector<cv::Mat>&      bgrs,
+        const std::vector<std::vector<LandmarkObservation>>& observations,
+        const std::vector<PoseParameters>&  poses,
+        const std::vector<Eigen::VectorXd>& exprs,
+        const Eigen::Matrix3f&           intrinsics,
+        const Eigen::VectorXd&           alphaInit,
+        Eigen::VectorXd&                 betaOut,
+        light::SHCoeffs&                 shOut,
+        double                           shapeReg       = 5.0,
+        double                           albedoReg      = 3.0,
+        double                           landmarkWeight = 20.0,
+        int                              numIterations  = 6,
+        int                              pixelStride    = 2,
+        int                              maxImageWidth  = 320
+    );
 };

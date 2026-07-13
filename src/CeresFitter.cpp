@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <limits>
 #include <vector>
+#include <memory>
 #include <utility>
 
 namespace {
@@ -2358,4 +2359,257 @@ FitParameters CeresFitter::fitPhotometric(
               << "\n  albedoCoeff=" << result.albedoCoefficients.transpose()
               << "\n  sh(DC rgb)="  << result.sh.row(0) << '\n';
     return result;
+}
+
+Eigen::VectorXd CeresFitter::fitIdentityPhotometricBundle(
+    const Eigen::MatrixX3f&          meanShape,
+    const Eigen::MatrixXf&           shapeBasis,
+    const Eigen::VectorXf&           shapeSigma,
+    const Eigen::MatrixXf&           exprBasis,
+    const Eigen::VectorXf&           exprSigma,
+    const Eigen::MatrixX3i&          triangles,
+    const Eigen::MatrixX3f&          meanAlbedo,
+    const Eigen::MatrixXf&           colorBasis,
+    const Eigen::VectorXf&           colorSigma,
+    const std::vector<cv::Mat>&      bgrs,
+    const std::vector<std::vector<LandmarkObservation>>& observations,
+    const std::vector<PoseParameters>&  poses,
+    const std::vector<Eigen::VectorXd>& exprs,
+    const Eigen::Matrix3f&           intrinsics,
+    const Eigen::VectorXd&           alphaInit,
+    Eigen::VectorXd&                 betaOut,
+    light::SHCoeffs&                 shOut,
+    double                           shapeReg,
+    double                           albedoReg,
+    double                           landmarkWeight,
+    int                              numIterations,
+    int                              pixelStride,
+    int                              maxImageWidth)
+{
+    const int F = static_cast<int>(bgrs.size());
+    Eigen::VectorXd alphaV = alphaInit;
+    if (F == 0) return alphaV;
+    if (pixelStride < 1) pixelStride = 1;
+    const int N = static_cast<int>(meanShape.rows());
+    const Eigen::Matrix3d Mm = proj::BFM_TO_CAM.cast<double>();
+
+    // Shared identity basis (camera-aligned), precomputed once.
+    std::vector<std::array<Eigen::Vector3d, kShapeCoefficientCount>> vBasis(N);
+    for (int v = 0; v < N; ++v)
+        for (int k = 0; k < kShapeCoefficientCount; ++k)
+            vBasis[v][k] = Mm * Eigen::Vector3d(shapeBasis(3*v+0,k)*shapeSigma(k),
+                                                shapeBasis(3*v+1,k)*shapeSigma(k),
+                                                shapeBasis(3*v+2,k)*shapeSigma(k));
+
+    // Per-keyframe setup (once): downscale image + K, build the differentiable
+    // input image, the neutral+expression base shape, camera-aligned vMean, and
+    // a renderer. Pose is a constant parameter block (α is the only free one).
+    std::vector<cv::Mat>                        rgbF(F);
+    std::vector<int>                            Hf(F), Wf(F);
+    std::vector<double>                         scaleF(F);
+    std::vector<Eigen::Matrix3f>                Kf(F);
+    std::vector<std::vector<double>>            imageData(F);
+    std::vector<std::unique_ptr<PhotoGrid>>     grids(F);
+    std::vector<std::unique_ptr<PhotoInterp>>   interps(F);
+    std::vector<Eigen::MatrixX3f>               exprShape(F);   // mean + expr_f
+    std::vector<std::vector<Eigen::Vector3d>>   vMeanF(F, std::vector<Eigen::Vector3d>(N));
+    std::vector<std::array<double, 3>>          aaK(F), ttK(F);
+    std::vector<Eigen::Matrix3f>                Rf(F);
+    std::vector<Eigen::Vector3f>                tf(F);
+    std::vector<std::unique_ptr<Renderer>>      renderers(F);
+
+    for (int f = 0; f < F; ++f) {
+        const double s = std::min(1.0, static_cast<double>(maxImageWidth) / bgrs[f].cols);
+        cv::Mat scaled; cv::resize(bgrs[f], scaled, cv::Size(), s, s, cv::INTER_AREA);
+        scaleF[f] = s;
+        Kf[f] = intrinsics;
+        Kf[f](0,0) *= float(s); Kf[f](1,1) *= float(s);
+        Kf[f](0,2) *= float(s); Kf[f](1,2) *= float(s);
+        Hf[f] = scaled.rows; Wf[f] = scaled.cols;
+        cv::Mat rgb; cv::cvtColor(scaled, rgb, cv::COLOR_BGR2RGB);
+        rgb.convertTo(rgb, CV_32FC3, bgrs[f].depth() == CV_8U ? 1.0/255.0 : 1.0);
+        rgbF[f] = rgb;
+        imageData[f].resize(size_t(Hf[f]) * Wf[f] * 3);
+        for (int y = 0; y < Hf[f]; ++y)
+            for (int x = 0; x < Wf[f]; ++x) {
+                const cv::Vec3f& px = rgb.at<cv::Vec3f>(y, x);
+                const size_t idx = (size_t(y) * Wf[f] + x) * 3;
+                imageData[f][idx+0]=px[0]; imageData[f][idx+1]=px[1]; imageData[f][idx+2]=px[2];
+            }
+        grids[f]   = std::make_unique<PhotoGrid>(imageData[f].data(), 0, Hf[f], 0, Wf[f]);
+        interps[f] = std::make_unique<PhotoInterp>(*grids[f]);
+
+        // base shape = mean + expression_f (identity added per iteration via α).
+        Eigen::VectorXf ecoef(kExpressionCoefficientCount);
+        for (int j = 0; j < kExpressionCoefficientCount; ++j)
+            ecoef(j) = (j < exprs[f].size()) ? float(exprs[f](j)) : 0.0f;
+        const Eigen::VectorXf exprFlat = exprBasis.leftCols(kExpressionCoefficientCount) *
+            exprSigma.head(kExpressionCoefficientCount).cwiseProduct(ecoef);
+        exprShape[f] = meanShape;
+        for (int v = 0; v < N; ++v)
+            exprShape[f].row(v) += exprFlat.segment(3*v, 3).transpose();
+        for (int v = 0; v < N; ++v)
+            vMeanF[f][v] = Mm * exprShape[f].row(v).transpose().cast<double>();
+
+        Rf[f] = poses[f].rotationMatrix();
+        tf[f] = poses[f].translation.cast<float>();
+        const Eigen::AngleAxisd aaEig(Rf[f].cast<double>());
+        const Eigen::Vector3d av = aaEig.angle() * aaEig.axis();
+        aaK[f] = {av.x(), av.y(), av.z()};
+        ttK[f] = {poses[f].translation.x(), poses[f].translation.y(), poses[f].translation.z()};
+        renderers[f] = std::make_unique<Renderer>(Hf[f], Wf[f], triangles);
+    }
+
+    const int Kb = std::min<int>({kAlbedoCoefficientCount,
+                                  int(colorBasis.cols()), int(colorSigma.size())});
+    Eigen::VectorXd beta = (betaOut.size() == Kb) ? betaOut : Eigen::VectorXd::Zero(std::max(Kb,0));
+    light::SHCoeffs sh = light::defaultWhite();
+    std::array<double, kShapeCoefficientCount> alpha{};
+    for (int k = 0; k < kShapeCoefficientCount && k < alphaV.size(); ++k) alpha[k] = alphaV(k);
+
+    // Multi-frame appearance sample: a visible vertex in one keyframe, with its
+    // camera-frame normal (pose-dependent) and observed colour.
+    struct BSample { int vertex; Eigen::Vector3f n; Eigen::Vector3d obs; };
+
+    std::cout << "\nPHOTOMETRIC BUNDLE: " << F << " keyframes @ " << maxImageWidth
+              << "px, refining shared identity\n";
+
+    for (int it = 0; it < numIterations; ++it) {
+        // (1) current shape per keyframe (mean + expr_f + α), normals, samples.
+        Eigen::VectorXf ac(kShapeCoefficientCount);
+        for (int k = 0; k < kShapeCoefficientCount; ++k) ac(k) = float(alpha[k]);
+        const Eigen::VectorXf idFlat = shapeBasis.leftCols(kShapeCoefficientCount) *
+            shapeSigma.head(kShapeCoefficientCount).cwiseProduct(ac);
+
+        std::vector<Eigen::MatrixX3f> shapeF(F);
+        std::vector<BSample> samples;
+        for (int f = 0; f < F; ++f) {
+            shapeF[f] = exprShape[f];
+            for (int v = 0; v < N; ++v) shapeF[f].row(v) += idFlat.segment(3*v,3).transpose();
+            const Eigen::MatrixX3f nCam =
+                proj::normalsToCameraFrame(Renderer::computeNormals(shapeF[f], triangles), Rf[f]);
+            const Eigen::MatrixX3f camV = proj::toCameraFrame(shapeF[f], Rf[f], tf[f]);
+            const proj::Pixels uv = proj::project(camV, Kf[f]);
+            for (int v = 0; v < N; v += 4) {
+                if (nCam(v,2) >= 0.0f || camV(v,2) <= 1e-3f) continue;
+                const float u = uv(v,0), vp = uv(v,1);
+                if (u < 1.f || vp < 1.f || u >= Wf[f]-2.f || vp >= Hf[f]-2.f) continue;
+                const cv::Vec3f o = rgbF[f].at<cv::Vec3f>(int(vp), int(u));
+                samples.push_back({v, nCam.row(v).transpose(),
+                                   Eigen::Vector3d(o[0], o[1], o[2])});
+            }
+        }
+
+        // (2) shared lighting γ + albedo β (multi-frame linear LS; SH→β→SH).
+        Eigen::MatrixX3f curAlbedo = albedoFromBeta(meanAlbedo, colorBasis, colorSigma, beta);
+        auto estimateSH = [&]() {
+            std::array<Eigen::Matrix<double,9,9>,3> AtA;
+            std::array<Eigen::Matrix<double,9,1>,3> Atb;
+            for (int c = 0; c < 3; ++c) { AtA[c] = 1e-2*Eigen::Matrix<double,9,9>::Identity(); Atb[c].setZero(); }
+            for (const BSample& s : samples) {
+                const Eigen::Matrix<double,9,1> b = light::shBasis(s.n).cast<double>();
+                for (int c = 0; c < 3; ++c) {
+                    const double a = curAlbedo(s.vertex, c);
+                    AtA[c].noalias() += (a*a)*(b*b.transpose());
+                    Atb[c].noalias() += (a*s.obs[c])*b;
+                }
+            }
+            for (int c = 0; c < 3; ++c) sh.col(c) = AtA[c].ldlt().solve(Atb[c]).cast<float>();
+        };
+        if (!samples.empty()) {
+            estimateSH();
+            if (Kb > 0) {
+                Eigen::MatrixXd AtA = albedoReg * Eigen::MatrixXd::Identity(Kb, Kb);
+                Eigen::VectorXd Atb = Eigen::VectorXd::Zero(Kb), row(Kb);
+                for (const BSample& s : samples) {
+                    const Eigen::RowVector3f shading = light::shBasis(s.n).transpose() * sh;
+                    for (int c = 0; c < 3; ++c) {
+                        const double sc = shading(c);
+                        for (int k = 0; k < Kb; ++k)
+                            row(k) = sc * colorBasis(3*s.vertex+c, k) * colorSigma(k);
+                        const double target = s.obs[c] - sc * meanAlbedo(s.vertex, c);
+                        AtA.noalias() += row * row.transpose();
+                        Atb.noalias() += row * target;
+                    }
+                }
+                beta = AtA.ldlt().solve(Atb).cwiseMax(-3.0).cwiseMin(3.0);
+                curAlbedo = albedoFromBeta(meanAlbedo, colorBasis, colorSigma, beta);
+                estimateSH();
+            }
+        }
+
+        // (3) joint α solve: dense photometric (E_col) + landmarks (E_lan) from
+        //     ALL keyframes, per-frame pose fixed → shared α.
+        ceres::Problem problem;
+        long usedPix = 0;
+        for (int f = 0; f < F; ++f) {
+            const RenderInput in{ .shape = shapeF[f], .albedo = curAlbedo,
+                .R = Rf[f], .t = tf[f], .K = Kf[f], .sh = sh };
+            const RenderOutput out = renderers[f]->render(in);
+            for (int y = 0; y < Hf[f]; y += pixelStride)
+                for (int x = 0; x < Wf[f]; x += pixelStride) {
+                    if (!out.mask.at<uchar>(y,x)) continue;
+                    const int tri = out.triIdx.at<int>(y,x);
+                    if (tri < 0) continue;
+                    const cv::Vec3f rc = out.image.at<cv::Vec3f>(y,x);
+                    const Eigen::Vector3d target(rc[0], rc[1], rc[2]);
+                    const cv::Vec3f bw = out.bary.at<cv::Vec3f>(y,x);
+                    const int i0=triangles(tri,0), i1=triangles(tri,1), i2=triangles(tri,2);
+                    const Eigen::Vector3d bMean =
+                        bw[0]*vMeanF[f][i0] + bw[1]*vMeanF[f][i1] + bw[2]*vMeanF[f][i2];
+                    std::array<Eigen::Vector3d, kShapeCoefficientCount> bBasis;
+                    for (int k = 0; k < kShapeCoefficientCount; ++k)
+                        bBasis[k] = bw[0]*vBasis[i0][k] + bw[1]*vBasis[i1][k] + bw[2]*vBasis[i2][k];
+                    problem.AddResidualBlock(
+                        new ceres::AutoDiffCostFunction<PhotometricPixelResidual, 3,
+                            3, 3, kShapeCoefficientCount>(
+                            new PhotometricPixelResidual(bMean, bBasis, target, Kf[f],
+                                                         *interps[f], 1.0)),
+                        new ceres::HuberLoss(0.1),
+                        aaK[f].data(), ttK[f].data(), alpha.data());
+                    ++usedPix;
+                }
+            // E_lan anchor (interior landmarks) at the working resolution.
+            for (const LandmarkObservation& o : observations[f]) {
+                if (o.vertexIndex < 0 || o.vertexIndex >= N) continue;
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<LandmarkShapeReprojectionResidual,
+                        2, 3, 3, kShapeCoefficientCount>(
+                        new LandmarkShapeReprojectionResidual(
+                            exprShape[f].row(o.vertexIndex).transpose(), o.vertexIndex,
+                            shapeBasis, shapeSigma, o.imagePoint * scaleF[f], Kf[f])),
+                    new ceres::ScaledLoss(new ceres::HuberLoss(4.0),
+                                          landmarkWeight, ceres::TAKE_OWNERSHIP),
+                    aaK[f].data(), ttK[f].data(), alpha.data());
+            }
+            problem.SetParameterBlockConstant(aaK[f].data());
+            problem.SetParameterBlockConstant(ttK[f].data());
+        }
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<ShapeRegularizationResidual,
+                kShapeCoefficientCount, kShapeCoefficientCount>(
+                new ShapeRegularizationResidual(shapeReg)),
+            nullptr, alpha.data());
+        for (int k = 0; k < kShapeCoefficientCount; ++k) {
+            problem.SetParameterLowerBound(alpha.data(), k, -3.0);
+            problem.SetParameterUpperBound(alpha.data(), k,  3.0);
+        }
+
+        ceres::Solver::Options options;
+        options.linear_solver_type = ceres::DENSE_QR;
+        options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+        options.max_num_iterations = 15;
+        options.minimizer_progress_to_stdout = false;
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
+
+        double idn = 0.0; for (double v : alpha) idn += v*v;
+        std::cout << "  photo-bundle it " << it << " | pixels " << usedPix
+                  << " | |id|=" << std::sqrt(idn) << " | " << summary.BriefReport() << '\n';
+    }
+
+    for (int k = 0; k < kShapeCoefficientCount; ++k) alphaV(k) = alpha[k];
+    betaOut = beta; shOut = sh;
+    std::cout << "Photometric bundle done. |id|=" << alphaV.norm() << '\n';
+    return alphaV;
 }

@@ -160,12 +160,37 @@ bool FaceTracker::personaliseBundle(
         cfg_.depthVertexStride);
     identity_ = b.identity;
 
-    // Appearance + photometric identity refinement on the frontal anchor frame,
-    // starting from the bundled pose/expression.
+    // ── Increment 2: dense-photometric identity bundle ──
+    // Refine the shared identity with the per-pixel photometric term (E_col)
+    // from ALL keyframes jointly — the multi-view analysis-by-synthesis the
+    // paper relies on — with per-frame pose+expression fixed from the geometric
+    // bundle. Returns the shared albedo β + lighting γ too.
+    if (cfg_.personaliseOptimizeShape) {
+        Eigen::VectorXd beta;
+        light::SHCoeffs sh;
+        identity_ = CeresFitter::fitIdentityPhotometricBundle(
+            meanShape, bfm_.shape_basis_raw(), bfm_.shape_sigma(),
+            bfm_.expr_basis_raw(), bfm_.expr_sigma(), bfm_.faces(),
+            bfm_.albedo(), bfm_.color_basis_raw(), bfm_.color_sigma(),
+            bgrs, obs, b.poses, b.exprs, K_, identity_, beta, sh,
+            cfg_.photoShapeReg, cfg_.albedoRegWeight, cfg_.photoLandmarkWeight,
+            /*numIterations=*/6, /*pixelStride=*/2, /*maxImageWidth=*/320);
+        beta_   = beta;
+        prevSh_ = sh;
+    } else {
+        beta_   = Eigen::VectorXd();
+        prevSh_ = light::defaultWhite();
+    }
+
+    // Commit the tracking state from the frontal anchor keyframe.
     prevCentroid_ = centroid(obs[anchor]);
     haveCentroid_ = true;
     gateFails_    = 0;
-    finalizeAppearance(bgrs[anchor], obs[anchor], b.poses[anchor], b.exprs[anchor]);
+    prevPose_     = b.poses[anchor];
+    prevExpr_     = b.exprs[anchor];
+    havePrev2_    = false;
+    frameIdx_     = 0;
+    personalised_ = true;
     std::cout << "[tracker] BUNDLE personalise from " << F << " keyframes, |id|="
               << identity_.norm() << '\n';
     return true;
