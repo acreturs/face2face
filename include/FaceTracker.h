@@ -85,6 +85,26 @@ public:
                      double initZ,
                      const std::vector<Eigen::Vector3d>* depthCloud = nullptr);
 
+    // Multi-keyframe identity BUNDLE (Face2Face §6, offline). Jointly solves one
+    // shared identity over several yaw-diverse keyframes, then estimates
+    // appearance + a photometric identity refinement on the frontal `anchor`.
+    // Per-keyframe vectors are parallel; depthClouds[i] may be null (RGB).
+    bool personaliseBundle(const std::vector<cv::Mat>& bgrs,
+                           const std::vector<std::vector<LandmarkObservation>>& obs,
+                           const std::vector<double>& initZs,
+                           const std::vector<const std::vector<Eigen::Vector3d>*>& depthClouds,
+                           int anchor);
+
+    // Interior-landmark reprojection RMS of the CURRENT (tracked) state against
+    // `obs` — the identity-quality metric for the bundle vs single-frame study.
+    double currentInteriorRms(const std::vector<LandmarkObservation>& obs) const {
+        return interiorRms(obs, currentShape(), prevPose_);
+    }
+
+    // Signed yaw proxy: (nose.x − eye-midpoint.x)/eye-dist. 0=frontal. NaN if the
+    // three anchor points (nose 8156, pupils 4540/11681) are missing.
+    static double yawProxy(const std::vector<LandmarkObservation>& obs);
+
     // Returns false if the frame was skipped (no landmarks / gated detection).
     // observations may be empty when a depth cloud drives the fit.
     bool track(const cv::Mat& bgr,
@@ -105,6 +125,12 @@ public:
 private:
     // Mean 2D position of the interior (fixed-vertex) observations.
     static Eigen::Vector2d centroid(const std::vector<LandmarkObservation>& obs);
+    // Appearance (albedo+lighting) + photometric identity refinement, then
+    // commit the tracking state. Shared by personalise() and personaliseBundle().
+    void finalizeAppearance(const cv::Mat& bgr,
+                            const std::vector<LandmarkObservation>& obs,
+                            const PoseParameters& pose,
+                            const Eigen::VectorXd& expr);
     // Interior-landmark reprojection RMS of `shape` under `pose` — the
     // safeguard for the photometric pose refinement.
     double interiorRms(const std::vector<LandmarkObservation>& obs,

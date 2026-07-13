@@ -105,31 +105,97 @@ bool FaceTracker::personalise(const cv::Mat& bgr,
         std::cout << "[tracker] personalised focal: " << focal << " px\n";
     }
     identity_ = geo.shapeCoefficients;
+    finalizeAppearance(bgr, observations, geo.pose, geo.exprCoefficients);
+    return true;
+}
 
-    // ── Appearance + PHOTOMETRIC IDENTITY refinement (coarse-to-fine) ─────────
-    // Depth is too coarse (~3 mm Kinect noise) for the fine surface detail that
-    // carries identity — the soft brow/cheek/jaw that read as feminine sit
-    // below that floor and default to the androgynous mean. The RGB SHADING
-    // carries that detail, so we drive it with an analysis-by-synthesis
-    // photometric fit: render the current model, compare per-pixel to the
-    // photo, and move SHAPE (+ albedo + lighting) to match. Run coarse-to-fine
-    // (each level warm-starts the next) so it doesn't stick in a local minimum,
-    // with POSE FIXED at the reliable geometry pose so the shape gradient is not
-    // confounded by pose drift. Each level's shape delta is accepted only if it
-    // does not blow up the landmark reprojection (guard against a photometric
-    // step corrupting the pose-critical fit under bad lighting/albedo).
-    const Eigen::VectorXf exprF = geo.exprCoefficients.cast<float>();
-    prevPose_ = geo.pose;                     // geometry pose is the reference
-    beta_     = Eigen::VectorXd();            // accumulated across levels
+double FaceTracker::yawProxy(const std::vector<LandmarkObservation>& obs)
+{
+    Eigen::Vector2d nose(-1, -1), eyeR(-1, -1), eyeL(-1, -1);
+    for (const LandmarkObservation& o : obs) {
+        if      (o.vertexIndex ==  8156) nose = o.imagePoint;
+        else if (o.vertexIndex ==  4540) eyeR = o.imagePoint;
+        else if (o.vertexIndex == 11681) eyeL = o.imagePoint;
+    }
+    if (nose.x() < 0 || eyeR.x() < 0 || eyeL.x() < 0)
+        return std::numeric_limits<double>::quiet_NaN();
+    const double eyeDist = (eyeL - eyeR).norm();
+    if (eyeDist < 1.0) return std::numeric_limits<double>::quiet_NaN();
+    return (nose.x() - 0.5 * (eyeL.x() + eyeR.x())) / eyeDist;
+}
+
+bool FaceTracker::personaliseBundle(
+    const std::vector<cv::Mat>& bgrs,
+    const std::vector<std::vector<LandmarkObservation>>& obs,
+    const std::vector<double>& initZs,
+    const std::vector<const std::vector<Eigen::Vector3d>*>& depthClouds,
+    int anchor)
+{
+    const int F = static_cast<int>(bgrs.size());
+    if (F == 0 || anchor < 0 || anchor >= F || obs[anchor].empty()) return false;
+
+    const Eigen::MatrixX3f meanShape = bfm_.mean_shape();
+    const double initZ = initZs[anchor];
+    const double zMin = 0.4 * initZ, zMax = 2.5 * initZ;
+
+    // Per-keyframe pose init: cheap landmark-only fit on the mean shape.
+    std::vector<BundleFrame> bframes(F);
+    for (int f = 0; f < F; ++f) {
+        std::vector<LandmarkObservation> interior;
+        std::copy_if(obs[f].begin(), obs[f].end(), std::back_inserter(interior),
+                     [](const LandmarkObservation& o) { return o.vertexIndex >= 0; });
+        PoseParameters init;
+        init.translation = Eigen::Vector3d(0.0, 0.0, initZs[f]);
+        bframes[f].observations = obs[f];
+        bframes[f].initialPose  = CeresFitter::fitPose(
+            meanShape, interior, K_, init, 0.4 * initZs[f], 2.5 * initZs[f]);
+        bframes[f].depthCloud   = depthClouds[f];
+    }
+
+    const BundleResult b = CeresFitter::fitIdentityBundle(
+        meanShape, bfm_.shape_basis_raw(), bfm_.shape_sigma(),
+        bfm_.expr_basis_raw(), bfm_.expr_sigma(), bfm_.faces(),
+        bframes, K_, cfg_.sparseReg, cfg_.exprRegPersonalise, zMin, zMax,
+        /*numOuterIterations=*/5, cfg_.depthPointToPlaneWeight, cfg_.depthWeight,
+        cfg_.depthVertexStride);
+    identity_ = b.identity;
+
+    // Appearance + photometric identity refinement on the frontal anchor frame,
+    // starting from the bundled pose/expression.
+    prevCentroid_ = centroid(obs[anchor]);
+    haveCentroid_ = true;
+    gateFails_    = 0;
+    finalizeAppearance(bgrs[anchor], obs[anchor], b.poses[anchor], b.exprs[anchor]);
+    std::cout << "[tracker] BUNDLE personalise from " << F << " keyframes, |id|="
+              << identity_.norm() << '\n';
+    return true;
+}
+
+// Appearance (albedo β + SH lighting) + coarse-to-fine PHOTOMETRIC IDENTITY
+// refinement, then commit the tracking state. Shared by the single-frame and
+// bundle personalise paths. `pose`/`expr` are the reference geometry fit.
+//
+// The depth is too coarse (~3 mm Kinect noise) for the fine surface detail that
+// carries identity; the RGB SHADING carries it. We render the current model,
+// compare per-pixel to the photo, and move SHAPE (+ albedo + lighting) to match
+// (analysis-by-synthesis), coarse-to-fine, pose fixed, with a JOINT landmark
+// anchor (E_col + E_lan) so a low shape-reg cannot drift the geometry.
+void FaceTracker::finalizeAppearance(const cv::Mat& bgr,
+                                     const std::vector<LandmarkObservation>& observations,
+                                     const PoseParameters& pose,
+                                     const Eigen::VectorXd& expr)
+{
+    const Eigen::VectorXf exprF = expr.cast<float>();
+    prevPose_ = pose;
+    beta_     = Eigen::VectorXd();
     prevSh_   = light::defaultWhite();
     const double rmsBefore = interiorRms(
-        observations, bfm_.shape(identity_.cast<float>(), exprF), geo.pose);
+        observations, bfm_.shape(identity_.cast<float>(), exprF), pose);
 
     for (const int width : cfg_.personalisePhotoPyramid) {
-        const Eigen::MatrixX3f fitted =
-            bfm_.shape(identity_.cast<float>(), exprF);
+        const Eigen::MatrixX3f fitted = bfm_.shape(identity_.cast<float>(), exprF);
         FitParameters pin;
-        pin.pose = geo.pose;                  // fixed (optimizePose=false below)
+        pin.pose = pose;
         pin.shapeCoefficients  = Eigen::VectorXd::Zero(kShapeCoefficientCount);
         pin.albedoCoefficients = beta_;
         pin.sh = prevSh_;
@@ -147,26 +213,23 @@ bool FaceTracker::personalise(const cv::Mat& bgr,
             p.shapeCoefficients.size() == identity_.size()) {
             const Eigen::VectorXd refined = identity_ + p.shapeCoefficients;
             const double after = interiorRms(
-                observations, bfm_.shape(refined.cast<float>(), exprF), geo.pose);
-            const double deltaNorm = p.shapeCoefficients.norm();
-            if (after <= rmsBefore * 1.15) {  // looser than 1.05: coarse-to-fine
+                observations, bfm_.shape(refined.cast<float>(), exprF), pose);
+            if (after <= rmsBefore * 1.15) {
                 identity_ = refined;
                 std::cout << "[tracker] photometric id refine @" << width
                           << "px kept (RMS " << rmsBefore << "->" << after
-                          << ", |Δα|=" << deltaNorm << ")\n";
+                          << ", |Δα|=" << p.shapeCoefficients.norm() << ")\n";
             } else {
                 std::cout << "[tracker] photometric id refine @" << width
-                          << "px rejected (RMS " << rmsBefore << "->" << after
-                          << ")\n";
+                          << "px rejected (RMS " << rmsBefore << "->" << after << ")\n";
             }
         }
     }
 
-    prevExpr_ = geo.exprCoefficients;
+    prevExpr_ = expr;
     havePrev2_ = false;
     frameIdx_  = 0;
     personalised_ = true;
-    return true;
 }
 
 bool FaceTracker::track(const cv::Mat& bgr,

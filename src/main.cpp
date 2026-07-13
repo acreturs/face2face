@@ -16,6 +16,7 @@
 #include <opencv2/highgui.hpp>   // imshow/waitKey for --mode live
 
 #include <algorithm>
+#include <numeric>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
@@ -66,6 +67,11 @@ std::string kDetector = "yunet";
 // the MediaPipe coprocess (best landmarks) but never overrides an explicit
 // choice.
 bool kDetectorExplicit = false;
+
+// Multi-keyframe identity bundling (Face2Face §6), offline video only. Opt-in
+// via --bundle; default is the single-frame personalise (for A/B comparison).
+bool kBundlePersonalise = false;
+int  kBundleKeyframes   = 7;   // target keyframe count (--bundle-keyframes)
 
 // ── output layout ──  each run writes into data/out/<tag>/ (biwi_video_rgb,
 // biwi_dense, debug, …) so modes never clobber each other.
@@ -492,6 +498,39 @@ static void writeFitOutputs(
 // ─────────────────────────────────────────────────────────────────────────────
 // ENTRY POINT: rgb / rgbd video reconstruction on a Biwi sequence
 // ─────────────────────────────────────────────────────────────────────────────
+// Keyframe selection for the identity bundle (Face2Face §6). Identity is
+// resolved by multi-view PARALLAX, so we pick keyframes spanning the widest
+// range of yaw: farthest-point sampling in yaw-proxy space, seeded with the
+// most frontal frame (anchors metric scale + gives the cleanest albedo). Only
+// well-detected frames (all 3 pose anchors present) are candidates. Returns the
+// selected frame indices; the first is the frontal anchor.
+static std::vector<int> selectBundleKeyframes(
+    const std::vector<double>& yaw,   // NaN where undetected
+    int k)
+{
+    std::vector<int> cand;
+    for (int i = 0; i < static_cast<int>(yaw.size()); ++i)
+        if (!std::isnan(yaw[i])) cand.push_back(i);
+    if (cand.empty()) return {};
+
+    std::vector<int> sel;
+    int frontal = cand[0];
+    for (int i : cand) if (std::abs(yaw[i]) < std::abs(yaw[frontal])) frontal = i;
+    sel.push_back(frontal);                                   // anchor first
+    while (static_cast<int>(sel.size()) < k && sel.size() < cand.size()) {
+        int best = -1; double bestSep = -1.0;
+        for (int i : cand) {
+            if (std::find(sel.begin(), sel.end(), i) != sel.end()) continue;
+            double minD = 1e30;
+            for (int s : sel) minD = std::min(minD, std::abs(yaw[i] - yaw[s]));
+            if (minD > bestSep) { bestSep = minD; best = i; }
+        }
+        if (best < 0) break;
+        sel.push_back(best);
+    }
+    return sel;
+}
+
 // Personalise identity + albedo on frame 0 (the expensive full fit), then TRACK
 // only pose + expression (+ lighting) on the rest, warm-started from the
 // previous frame with identity/albedo frozen (see FaceTracker). Dispatched from:
@@ -592,6 +631,12 @@ static void runVideoReconstruction(
         tc.depthVertexStride      = kDepthVertexStride;
         FaceTracker tracker(bfm, cal.K_rgb, tc);
 
+        // Identity-quality metric: interior-landmark reprojection RMS of the
+        // frozen identity at each TRACKED frame. A better identity generalises
+        // across poses → lower RMS, especially on frames far from the
+        // personalise view. Reported as mean/median at the end.
+        std::vector<double> trackRms;
+
         for (size_t i = 0; i < frames.size(); ++i) {
             const BiwiFrame& f = frames[i];
             const Eigen::Vector3d headRgb = cal.R_rgb * f.headCenter + cal.t_rgb;
@@ -600,14 +645,49 @@ static void runVideoReconstruction(
             const std::vector<Eigen::Vector3d>* cloudPtr = useDepth ? &cloud : nullptr;
 
             if (!tracker.personalised()) {
-                const std::vector<LandmarkObservation> obs = frameLandmarks(f);
                 ScopedTimer t("personalise");
-                if (!tracker.personalise(f.rgb, obs, headRgb.z(), cloudPtr)) {
-                    std::cerr << "video: no landmarks on the first frame — "
-                                 "cannot personalise\n";
-                    return;
+                bool ok = false;
+                if (kBundlePersonalise) {
+                    // ── Multi-keyframe bundle: select yaw-diverse keyframes from
+                    //    the sequence, gather their landmarks + depth, solve one
+                    //    shared identity jointly, then track the rest. ──
+                    std::vector<double> yaw(frames.size(),
+                                            std::numeric_limits<double>::quiet_NaN());
+                    std::vector<std::vector<LandmarkObservation>> allObs(frames.size());
+                    for (size_t j = 0; j < frames.size(); ++j) {
+                        allObs[j] = frameLandmarks(frames[j]);
+                        yaw[j] = FaceTracker::yawProxy(allObs[j]);
+                    }
+                    const std::vector<int> kf =
+                        selectBundleKeyframes(yaw, kBundleKeyframes);
+                    if (kf.empty()) { std::cerr << "video: no detectable keyframe\n"; return; }
+                    std::vector<cv::Mat> bgrs;
+                    std::vector<std::vector<LandmarkObservation>> obs;
+                    std::vector<double> initZs;
+                    std::vector<std::vector<Eigen::Vector3d>> clouds(kf.size());
+                    std::vector<const std::vector<Eigen::Vector3d>*> cloudPtrs;
+                    std::cout << "[bundle] keyframes (frame:yaw):";
+                    for (size_t m = 0; m < kf.size(); ++m) {
+                        const BiwiFrame& kff = frames[kf[m]];
+                        bgrs.push_back(kff.rgb);
+                        obs.push_back(allObs[kf[m]]);
+                        const Eigen::Vector3d hr = cal.R_rgb * kff.headCenter + cal.t_rgb;
+                        initZs.push_back(hr.z());
+                        if (useDepth) { clouds[m] = headCloudRgb(kff);
+                                        cloudPtrs.push_back(&clouds[m]); }
+                        else            cloudPtrs.push_back(nullptr);
+                        std::cout << ' ' << kff.frameNumber << ':'
+                                  << std::fixed << std::setprecision(2) << yaw[kf[m]];
+                    }
+                    std::cout << '\n';
+                    ok = tracker.personaliseBundle(bgrs, obs, initZs, cloudPtrs, 0);
+                } else {
+                    const std::vector<LandmarkObservation> obs = frameLandmarks(f);
+                    ok = tracker.personalise(f.rgb, obs, headRgb.z(), cloudPtr);
                 }
-                std::cout << "[personalise] frame " << f.frameNumber
+                if (!ok) { std::cerr << "video: could not personalise\n"; return; }
+                std::cout << "[personalise] "
+                          << (kBundlePersonalise ? "BUNDLE" : "single-frame")
                           << " — identity + albedo fixed for the rest\n";
             } else {
                 // BOTH modes track from per-frame landmarks: they are the only
@@ -623,6 +703,7 @@ static void runVideoReconstruction(
                 ScopedTimer t("track");
                 if (!tracker.track(f.rgb, obs, headRgb.z(), cloudPtr))
                     continue;   // gated / unusable frame (tracker logged why)
+                if (!obs.empty()) trackRms.push_back(tracker.currentInteriorRms(obs));
             }
 
             // 3-panel composite: overlay | reconstruction @ tracked pose |
@@ -659,6 +740,19 @@ static void runVideoReconstruction(
         }
         if (writer.isOpened()) writer.release();
         std::cout << "Wrote tracking video → " << dir << "/tracking.mp4  (+ frames/)\n";
+
+        // Identity-quality summary (the bundle-vs-single metric).
+        if (!trackRms.empty()) {
+            std::vector<double> s = trackRms;
+            std::sort(s.begin(), s.end());
+            const double mean = std::accumulate(s.begin(), s.end(), 0.0) / s.size();
+            const double median = s[s.size() / 2];
+            std::cout << "[METRIC] " << (useDepth ? "rgbd" : "rgb") << " "
+                      << (kBundlePersonalise ? "BUNDLE " : "single ")
+                      << "interior-reproj RMS over " << s.size() << " tracked frames:"
+                      << "  mean " << mean << " px  median " << median
+                      << " px  p90 " << s[static_cast<size_t>(s.size() * 0.9)] << " px\n";
+        }
     } catch (const std::exception& e) {
         std::cerr << "Biwi video skipped: " << e.what() << '\n';
     }
@@ -1588,6 +1682,8 @@ static void printUsage()
       "  --photo-texture    live: project the personalise frame onto the mesh\n"
       "                     and render with that texture (overlay + mask window)\n"
       "  --optimize-focal   solve fx=fy during personalise (experimental)\n"
+      "  --bundle           multi-keyframe identity bundle (rgb/rgbd, Face2Face \u00a76)\n"
+      "  --bundle-keyframes <k>   keyframes for --bundle (default 7)\n"
       "  --timers           print per-stage timings\n";
 }
 
@@ -1624,6 +1720,8 @@ int main(int argc, char** argv)
         else if (arg == "--photo-refine") live.photoRefine = true;
         else if (arg == "--photo-texture") live.photoTexture = true;
         else if (arg == "--optimize-focal") live.optimizeFocal = true;
+        else if (arg == "--bundle") kBundlePersonalise = true;
+        else if (arg == "--bundle-keyframes" && i + 1 < argc) kBundleKeyframes = std::stoi(argv[++i]);
         else if (arg == "--timers") ScopedTimer::enabled = true;
         else { std::cerr << "unknown argument: " << arg << "\n\n"; printUsage(); return 1; }
     }

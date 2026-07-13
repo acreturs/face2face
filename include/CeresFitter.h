@@ -51,6 +51,22 @@ struct FitParameters {
 using DenseIterationCallback =
     std::function<void(int iteration, const FitParameters& current, double rmseMM)>;
 
+// ── Non-rigid model-based bundling (Face2Face §6) ────────────────────────────
+// One keyframe fed to fitIdentityBundle: its 2D observations, a per-frame pose
+// init, and (optionally, RGBD) its depth cloud in THIS keyframe's camera frame.
+struct BundleFrame {
+    std::vector<LandmarkObservation>          observations;
+    PoseParameters                            initialPose;
+    const std::vector<Eigen::Vector3d>*       depthCloud = nullptr;  // nullable
+};
+
+// Result of the bundle: ONE shared identity, per-frame pose + expression.
+struct BundleResult {
+    Eigen::VectorXd              identity;   // shared α
+    std::vector<PoseParameters>  poses;      // per keyframe
+    std::vector<Eigen::VectorXd> exprs;      // per keyframe
+};
+
 std::vector<LandmarkObservation> loadLandmarkObservations(
     const std::string& path
 );
@@ -151,6 +167,34 @@ public:
         int                                  vertexStride         = 8,
         double                               pointToPlaneWeight   = 1.0,
         const DenseIterationCallback&        onIteration          = nullptr
+    );
+
+    // Non-rigid model-based bundling (Face2Face §6). Jointly solves ONE shared
+    // identity α with per-frame {pose, expression} over several keyframes at
+    // different viewing angles, in a single block-dense Ceres problem. Each
+    // keyframe contributes interior-landmark reprojection + jaw-contour (sliding
+    // silhouette, re-matched each outer iteration) + optional depth ICP, all
+    // pointing at the shared α. Multi-view parallax + shared-identity
+    // consistency is what resolves the depth ambiguity that a single view
+    // cannot, so the identity reg can be near-zero without over-fitting.
+    // Returns the shared α and each keyframe's pose/expr.
+    static BundleResult fitIdentityBundle(
+        const Eigen::MatrixX3f&          meanShape,
+        const Eigen::MatrixXf&           shapeBasis,
+        const Eigen::VectorXf&           shapeSigma,
+        const Eigen::MatrixXf&           exprBasis,
+        const Eigen::VectorXf&           exprSigma,
+        const Eigen::MatrixX3i&          triangles,
+        const std::vector<BundleFrame>&  frames,
+        const Eigen::Matrix3f&           intrinsics,
+        double                           regularizationWeight    = 3.0,
+        double                           exprRegWeight           = 30.0,
+        double                           zMin                    = 200.0,
+        double                           zMax                    = 2000.0,
+        int                              numOuterIterations      = 5,
+        double                           depthPointToPlaneWeight = 1.0,
+        double                           depthWeight             = 1.0,
+        int                              depthVertexStride       = 8
     );
 
     // Photometric (appearance) fit against a single RGB image — the analysis-by-
