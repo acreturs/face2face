@@ -270,7 +270,13 @@ struct DepthPointResidual {
         const Eigen::VectorXf& shapeSigma,
         const Eigen::Vector3d& targetPoint,
         const Eigen::Vector3d& targetNormal,
-        double pointToPlaneWeight
+        double pointToPlaneWeight,
+        // Current expression displacement of this vertex (camera-aligned, mm),
+        // held CONSTANT within the solve. Without it the residual models the
+        // NEUTRAL vertex while the correspondence was found against the
+        // expressed shape — the mismatch biases pose (and identity) by the
+        // expression displacement. Refreshed each outer/ICP iteration.
+        const Eigen::Vector3d& exprOffsetAligned = Eigen::Vector3d::Zero()
     )
         : targetX_(targetPoint.x()),
           targetY_(targetPoint.y()),
@@ -281,7 +287,8 @@ struct DepthPointResidual {
           sqrtPlaneWeight_(std::sqrt(pointToPlaneWeight))
     {
         const Eigen::Vector3d alignedMean =
-            proj::BFM_TO_CAM.cast<double>() * meanPoint.cast<double>();
+            proj::BFM_TO_CAM.cast<double>() * meanPoint.cast<double>() +
+            exprOffsetAligned;
 
         meanX_ = alignedMean.x();
         meanY_ = alignedMean.y();
@@ -466,7 +473,13 @@ private:
 // block is held constant these are numerically identical to fixed-intrinsics
 // reprojection. `WithExpr` selects whether the expression basis contributes
 // (contour→identity routing uses the identity-only variant).
-template <bool WithExpr>
+// WithId selects whether the IDENTITY basis is a parameter block. During
+// TRACKING identity is frozen, but a constant parameter block still costs its
+// full autodiff-jet width per residual evaluation — with 180 identity coeffs
+// that is ~3× the whole functor. WithId=false instead expects the identity
+// displacement PRE-BAKED into `meanPoint` and drops the block entirely
+// (blocks: angleAxis, translation, expr, focal).
+template <bool WithExpr, bool WithId = true>
 struct LandmarkFocalReprojectionResidual {
     LandmarkFocalReprojectionResidual(
         const Eigen::Vector3f& meanPoint, int vertexIndex,
@@ -479,13 +492,14 @@ struct LandmarkFocalReprojectionResidual {
         const Eigen::Matrix3d M = proj::BFM_TO_CAM.cast<double>();
         const Eigen::Vector3d m = M * meanPoint.cast<double>();
         meanX_ = m.x(); meanY_ = m.y(); meanZ_ = m.z();
-        for (int k = 0; k < kShapeCoefficientCount; ++k) {
-            const Eigen::Vector3d a = M * Eigen::Vector3d(
-                shapeBasis(3 * vertexIndex + 0, k) * shapeSigma(k),
-                shapeBasis(3 * vertexIndex + 1, k) * shapeSigma(k),
-                shapeBasis(3 * vertexIndex + 2, k) * shapeSigma(k));
-            idX_[k] = a.x(); idY_[k] = a.y(); idZ_[k] = a.z();
-        }
+        if constexpr (WithId)
+            for (int k = 0; k < kShapeCoefficientCount; ++k) {
+                const Eigen::Vector3d a = M * Eigen::Vector3d(
+                    shapeBasis(3 * vertexIndex + 0, k) * shapeSigma(k),
+                    shapeBasis(3 * vertexIndex + 1, k) * shapeSigma(k),
+                    shapeBasis(3 * vertexIndex + 2, k) * shapeSigma(k));
+                idX_[k] = a.x(); idY_[k] = a.y(); idZ_[k] = a.z();
+            }
         if constexpr (WithExpr)
             for (int j = 0; j < kExpressionCoefficientCount; ++j) {
                 const Eigen::Vector3d a = M * Eigen::Vector3d(
@@ -501,11 +515,12 @@ struct LandmarkFocalReprojectionResidual {
     bool project(const T* angleAxis, const T* translation, const T* idCoeff,
                  const T* exprCoeff, const T* focal, T* residuals) const {
         T p[3] = { T(meanX_), T(meanY_), T(meanZ_) };
-        for (int k = 0; k < kShapeCoefficientCount; ++k) {
-            p[0] += T(idX_[k]) * idCoeff[k];
-            p[1] += T(idY_[k]) * idCoeff[k];
-            p[2] += T(idZ_[k]) * idCoeff[k];
-        }
+        if constexpr (WithId)
+            for (int k = 0; k < kShapeCoefficientCount; ++k) {
+                p[0] += T(idX_[k]) * idCoeff[k];
+                p[1] += T(idY_[k]) * idCoeff[k];
+                p[2] += T(idZ_[k]) * idCoeff[k];
+            }
         if constexpr (WithExpr)
             for (int j = 0; j < kExpressionCoefficientCount; ++j) {
                 p[0] += T(exX_[j]) * exprCoeff[j];
@@ -522,28 +537,34 @@ struct LandmarkFocalReprojectionResidual {
         return true;
     }
 
-    // WithExpr=true: blocks angleAxis, translation, id, expr, focal.
+    // 5 blocks — only <WithExpr=true, WithId=true>: aa, t, id, expr, focal.
     // Ceres calls the overload matching the declared block count, so the
-    // unused arity is never instantiated.
+    // unused arities are never instantiated.
     template <typename T>
     bool operator()(const T* const angleAxis, const T* const translation,
                     const T* const idCoeff, const T* const exprCoeff,
                     const T* const focal, T* residuals) const {
         return project(angleAxis, translation, idCoeff, exprCoeff, focal, residuals);
     }
-    // WithExpr=false: blocks angleAxis, translation, id, focal
+    // 4 blocks — <false,true>: aa, t, id, focal;  <true,false>: aa, t, expr, focal.
     template <typename T>
     bool operator()(const T* const angleAxis, const T* const translation,
-                    const T* const idCoeff, const T* const focal,
+                    const T* const coeff, const T* const focal,
                     T* residuals) const {
-        return project(angleAxis, translation, idCoeff,
-                       static_cast<const T*>(nullptr), focal, residuals);
+        if constexpr (WithId)
+            return project(angleAxis, translation, coeff,
+                           static_cast<const T*>(nullptr), focal, residuals);
+        else
+            return project(angleAxis, translation,
+                           static_cast<const T*>(nullptr), coeff, focal, residuals);
     }
 
 private:
+    // Conditionally-sized storage: a dummy 1-element array when the basis is
+    // compiled out, so the frozen-identity functor doesn't carry 3×180 doubles.
     double meanX_, meanY_, meanZ_;
-    std::array<double, kShapeCoefficientCount>      idX_, idY_, idZ_;
-    std::array<double, kExpressionCoefficientCount> exX_, exY_, exZ_;
+    std::array<double, WithId ? kShapeCoefficientCount : 1>      idX_, idY_, idZ_;
+    std::array<double, WithExpr ? kExpressionCoefficientCount : 1> exX_, exY_, exZ_;
     double observedU_, observedV_, cx_, cy_;
 };
 
@@ -573,6 +594,29 @@ struct CoeffPriorResidual {
         return true;
     }
     double sqrtWeight_;
+};
+
+// L2 prior anchored at a TARGET vector: √w · (coeff − target). Used as the
+// TEMPORAL expression prior during tracking — a zero-anchored prior strong
+// enough to damp landmark noise also fights any sustained articulation (it
+// pulls an open mouth shut every frame), while this one only resists CHANGE:
+// holding an expression costs nothing, jitter is damped in-solve.
+template <int Count>
+struct CoeffAnchorResidual {
+    CoeffAnchorResidual(double weight, const Eigen::VectorXd& target)
+        : sqrtWeight_(std::sqrt(weight))
+    {
+        for (int k = 0; k < Count; ++k)
+            target_[k] = k < target.size() ? target(k) : 0.0;
+    }
+    template <typename T>
+    bool operator()(const T* const coeff, T* residuals) const {
+        for (int k = 0; k < Count; ++k)
+            residuals[k] = T(sqrtWeight_) * (coeff[k] - T(target_[k]));
+        return true;
+    }
+    double sqrtWeight_;
+    std::array<double, Count> target_;
 };
 
 } // namespace
@@ -684,7 +728,7 @@ PoseParameters CeresFitter::fitPose(
 
         problem.AddResidualBlock(
             costFunction,
-            nullptr,
+            new ceres::HuberLoss(10.0),   // px — robust to one bad detection
             angleAxis,
             translation
         );
@@ -968,7 +1012,8 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
     const Eigen::VectorXd&                   initialExpr,
     bool                                     optimizeIdentity,
     bool                                     optimizeFocal,
-    double*                                  focalInOut
+    double*                                  focalInOut,
+    double                                   exprTemporalWeight
 )
 {
     if (shapeBasis.cols() < kShapeCoefficientCount ||
@@ -1083,17 +1128,55 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
         ceres::Problem problem;
 
         // (b) interior landmarks → fixed reprojection residuals (pose+id+expr).
+        // Huber: detectors regress OCCLUDED points under yaw/pitch (MediaPipe
+        // hallucinates the far side of the face) — without a robust loss one
+        // bad landmark quadratically drags the whole pose.
+        // The delta must scale with FACE size, not image size: a fully open
+        // mouth displaces the lip/chin landmarks by ~10 % of the face (25 mm ≈
+        // 26 px on a webcam face) — with a fixed ~1 %-of-image delta those
+        // legitimate residuals sat deep in Huber's linear region, so their
+        // pull was clamped to a constant the expression prior easily beat,
+        // and the mouth never opened. 5 % of face size keeps true detector
+        // garbage (> half the mouth region) suppressed while letting
+        // expression-scale residuals act quadratically.
+        const double interiorHuber = std::max(0.01 * imgW, 0.05 * faceSize);
+        // Same reasoning for the jaw contour (it drops ~as far as the chin
+        // when the mouth opens), slightly wider since its correspondences are
+        // re-matched and inherently noisier.
+        const double contourHuber  = std::max(0.02 * imgW, 0.08 * faceSize);
+        // Tracking (identity frozen): bake the constant identity displacement
+        // into the functor's mean and DROP the identity parameter block — a
+        // constant block still costs its full autodiff-jet width, which with
+        // 180 identity coeffs was ~3× the per-residual evaluation.
+        const auto bakedMean = [&](int v) -> Eigen::Vector3f {
+            return meanShape.row(v).transpose() + dispFlat.segment(3 * v, 3);
+        };
         for (const LandmarkObservation& o : fixed) {
             if (o.vertexIndex < 0 || o.vertexIndex >= N) continue;
-            problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<LandmarkFocalReprojectionResidual<true>,
-                    2, 3, 3, kShapeCoefficientCount, kExpressionCoefficientCount, 1>(
-                    new LandmarkFocalReprojectionResidual<true>(
-                        meanShape.row(o.vertexIndex).transpose(), o.vertexIndex,
-                        shapeBasis, shapeSigma, exprBasis, exprSigma,
-                        o.imagePoint, intrinsics)),
-                new ceres::ScaledLoss(nullptr, reprojW, ceres::TAKE_OWNERSHIP),
-                angleAxis, translation, shapeCoefficients, exprCoefficients, &focal);
+            ceres::LossFunction* loss =
+                new ceres::ScaledLoss(new ceres::HuberLoss(interiorHuber),
+                                      reprojW, ceres::TAKE_OWNERSHIP);
+            if (optimizeIdentity) {
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<LandmarkFocalReprojectionResidual<true>,
+                        2, 3, 3, kShapeCoefficientCount, kExpressionCoefficientCount, 1>(
+                        new LandmarkFocalReprojectionResidual<true>(
+                            meanShape.row(o.vertexIndex).transpose(), o.vertexIndex,
+                            shapeBasis, shapeSigma, exprBasis, exprSigma,
+                            o.imagePoint, intrinsics)),
+                    loss,
+                    angleAxis, translation, shapeCoefficients, exprCoefficients, &focal);
+            } else {
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<LandmarkFocalReprojectionResidual<true, false>,
+                        2, 3, 3, kExpressionCoefficientCount, 1>(
+                        new LandmarkFocalReprojectionResidual<true, false>(
+                            bakedMean(o.vertexIndex), o.vertexIndex,
+                            shapeBasis, shapeSigma, exprBasis, exprSigma,
+                            o.imagePoint, intrinsics)),
+                    loss,
+                    angleAxis, translation, exprCoefficients, &focal);
+            }
         }
 
         // (c) contour points → nearest projected SILHOUETTE vertex (re-matched
@@ -1129,20 +1212,22 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
                             meanShape.row(best).transpose(), best,
                             shapeBasis, shapeSigma, exprBasis, exprSigma,
                             o.imagePoint, intrinsics)),
-                    new ceres::ScaledLoss(new ceres::HuberLoss(0.02 * imgW),
+                    new ceres::ScaledLoss(new ceres::HuberLoss(contourHuber),
                                           reprojW, ceres::TAKE_OWNERSHIP),
                     angleAxis, translation, shapeCoefficients, &focal);
             } else {
+                // Identity frozen (tracking) → identity baked into the mean,
+                // no identity block (see interior-landmark comment above).
                 problem.AddResidualBlock(
-                    new ceres::AutoDiffCostFunction<LandmarkFocalReprojectionResidual<true>,
-                        2, 3, 3, kShapeCoefficientCount, kExpressionCoefficientCount, 1>(
-                        new LandmarkFocalReprojectionResidual<true>(
-                            meanShape.row(best).transpose(), best,
+                    new ceres::AutoDiffCostFunction<LandmarkFocalReprojectionResidual<true, false>,
+                        2, 3, 3, kExpressionCoefficientCount, 1>(
+                        new LandmarkFocalReprojectionResidual<true, false>(
+                            bakedMean(best), best,
                             shapeBasis, shapeSigma, exprBasis, exprSigma,
                             o.imagePoint, intrinsics)),
-                    new ceres::ScaledLoss(new ceres::HuberLoss(0.02 * imgW),
+                    new ceres::ScaledLoss(new ceres::HuberLoss(contourHuber),
                                           reprojW, ceres::TAKE_OWNERSHIP),
-                    angleAxis, translation, shapeCoefficients, exprCoefficients, &focal);
+                    angleAxis, translation, exprCoefficients, &focal);
             }
         }
 
@@ -1186,14 +1271,27 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
             for (const DCorr& c : dcorr) {
                 if (c.d2 > trimD2) continue;
                 ++depthMatched;
+                // Expression displacement of this vertex at the current outer
+                // iterate (BFM frame → camera-aligned), constant in the solve.
+                const Eigen::Vector3d exprOffset =
+                    proj::BFM_TO_CAM.cast<double>() *
+                    exprFlat.segment(3 * c.vertex, 3).cast<double>();
                 problem.AddResidualBlock(
                     new ceres::AutoDiffCostFunction<DepthPointResidual,
                         4, 3, 3, kShapeCoefficientCount>(
                         new DepthPointResidual(
                             meanShape.row(c.vertex).transpose(), c.vertex,
                             shapeBasis, shapeSigma,
-                            c.target, c.normal, depthPointToPlaneWeight)),
-                    new ceres::ScaledLoss(new ceres::HuberLoss(10.0),   // 10 mm
+                            c.target, c.normal, depthPointToPlaneWeight,
+                            exprOffset)),
+                    // 22 mm, not 10: a distinctive nose/cheekbone/jaw is often
+                    // 10–30 mm from the BFM mean — exactly the deviations a
+                    // 10 mm Huber treated as half-outliers, capping the depth's
+                    // pull toward the true (e.g. softer, feminine) face where it
+                    // matters most. The 20% trim already rejects gross outliers
+                    // (hair/neck are >50 mm off), so 22 mm lets real identity
+                    // through while still robustifying.
+                    new ceres::ScaledLoss(new ceres::HuberLoss(22.0),
                                           sqrtDepthWeight * sqrtDepthWeight,
                                           ceres::TAKE_OWNERSHIP),
                     angleAxis, translation, shapeCoefficients);
@@ -1226,6 +1324,15 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
                 kExpressionCoefficientCount, kExpressionCoefficientCount>(
                 new CoeffPriorResidual<kExpressionCoefficientCount>(exprRegWeight)),
             nullptr, exprCoefficients);
+        // Temporal prior (tracking only): resist expression CHANGE, not
+        // expression itself — see CoeffAnchorResidual.
+        if (exprTemporalWeight > 0.0 && initialExpr.size() > 0)
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<CoeffAnchorResidual<kExpressionCoefficientCount>,
+                    kExpressionCoefficientCount, kExpressionCoefficientCount>(
+                    new CoeffAnchorResidual<kExpressionCoefficientCount>(
+                        exprTemporalWeight, initialExpr)),
+                nullptr, exprCoefficients);
         if (problem.HasParameterBlock(translation)) {
             problem.SetParameterLowerBound(translation, 2, zMin);
             problem.SetParameterUpperBound(translation, 2, zMax);
@@ -1265,9 +1372,13 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
                 problem.SetParameterBlockConstant(&focal);
             }
         }
+        // ±3.5, not ±3: a fully open mouth needs ‖δ‖ ≈ 4.5 spread over the
+        // first few modes (≈ ±2.7 each; measured on the BFM-2017 basis), and
+        // wider articulation pushes single modes past 3 — the box was clipping
+        // legitimate expressions. The L2 prior still discourages the extremes.
         for (int j = 0; j < kExpressionCoefficientCount; ++j) {
-            problem.SetParameterLowerBound(exprCoefficients, j, -3.0);
-            problem.SetParameterUpperBound(exprCoefficients, j,  3.0);
+            problem.SetParameterLowerBound(exprCoefficients, j, -3.5);
+            problem.SetParameterUpperBound(exprCoefficients, j,  3.5);
         }
 
         ceres::Solver::Options options;
@@ -1300,7 +1411,8 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
         std::cout << "  focal: " << intrinsics(0, 0) << " → " << focal << " px\n";
     std::cout << "Contour fit done. translation="
               << result.pose.translation.transpose()
-              << "\n  exprCoeff=" << result.exprCoefficients.transpose() << '\n';
+              << "  |id|=" << result.shapeCoefficients.norm()
+              << "  |expr|=" << result.exprCoefficients.norm() << '\n';
     return result;
 }
 
@@ -1652,7 +1764,9 @@ FitParameters CeresFitter::fitPhotometric(
     bool                              optimizeAlbedo,
     bool                              optimizePose,
     const DenseIterationCallback&     onIteration,
-    int                               maxImageWidth
+    int                               maxImageWidth,
+    const std::vector<LandmarkObservation>* landmarks,
+    double                            landmarkWeight
 )
 {
     if (shapeBasis.cols() < kShapeCoefficientCount ||
@@ -1883,6 +1997,27 @@ FitParameters CeresFitter::fitPhotometric(
                                          angleAxis, translation, shapeCoefficients);
             }
 
+        // (d2) JOINT landmark term (Face2Face E_lan): anchor the shape solve to
+        //      the detected interior landmarks so the low-reg dense photometric
+        //      cannot drift the geometry via shape-from-shading ambiguity. Same
+        //      pose+shape blocks as the pixel residuals. Observations are in
+        //      full-res pixels → scale to the working resolution (K was scaled
+        //      by `scale`). Only when the caller opts in (landmarks + weight>0).
+        if (solveGeometry && landmarks && landmarkWeight > 0.0) {
+            for (const LandmarkObservation& o : *landmarks) {
+                if (o.vertexIndex < 0 || o.vertexIndex >= meanShape.rows()) continue;
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<LandmarkShapeReprojectionResidual,
+                        2, 3, 3, kShapeCoefficientCount>(
+                        new LandmarkShapeReprojectionResidual(
+                            meanShape.row(o.vertexIndex).transpose(), o.vertexIndex,
+                            shapeBasis, shapeSigma, o.imagePoint * scale, K)),
+                    new ceres::ScaledLoss(new ceres::HuberLoss(4.0),
+                                          landmarkWeight, ceres::TAKE_OWNERSHIP),
+                    angleAxis, translation, shapeCoefficients);
+            }
+        }
+
         if (used == 0) {
             std::cout << "  photo " << it
                       << " | no covered pixels — stopping\n";
@@ -1926,8 +2061,10 @@ FitParameters CeresFitter::fitPhotometric(
 
         const double rmse = std::sqrt(sumSquared / used);   // render−photo RMSE, [0,1]
         std::cout << "  photo " << it << " | pixels " << used
-                  << " | render-photo RMSE(before solve) " << rmse << " | "
-                  << summary.BriefReport() << '\n';
+                  << " | render-photo RMSE(before solve) " << rmse;
+        if (solveGeometry) std::cout << " | " << summary.BriefReport();
+        else               std::cout << " | linear appearance estimate only";
+        std::cout << '\n';
 
         if (onIteration) {
             FitParameters current;

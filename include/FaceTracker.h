@@ -25,9 +25,12 @@ public:
     struct Config {
         // priors / fit weights
         double sparseReg          = 30.0;
-        double exprRegPersonalise = 500.0;
-        double exprRegTrack       = 120.0;
-        double albedoRegWeight    = 50.0;
+        double exprRegPersonalise = 200.0;   // see cfg::kExprRegWeight in main
+        double exprRegTrack       = 18.0;   // see cfg::kTrackExprRegWeight in main
+        // Temporal expression prior for track(): damps per-frame jitter in the
+        // solve; holding an articulation costs nothing (unlike exprRegTrack).
+        double exprTemporalReg    = 50.0;
+        double albedoRegWeight    = 3.0;     // see cfg::kAlbedoRegWeight in main
         double smoothAlpha        = 0.6;     // EMA: new = a·fit + (1−a)·prev
         // personalise stage
         int  contourItersPersonalise = 40;
@@ -35,10 +38,25 @@ public:
         int  photoPixelStride        = 1;
         bool personaliseOptimizeShape = true;   // matches the offline video path
         bool optimizeFocal            = false;  // solve fx=fy during personalise
+        // Coarse-to-fine working widths for the photometric IDENTITY refinement
+        // at personalise. Each level warm-starts the next; the last should be
+        // near the native frame width for maximum surface detail. This is the
+        // fine-geometry (e.g. femininity) driver the depth is too coarse for.
+        std::vector<int> personalisePhotoPyramid = {256, 512};
+        // Photometric-shape solve reg (Face2Face keeps identity reg near-zero;
+        // the JOINT landmark anchor below makes a low value safe) and the joint
+        // landmark-anchor weight (paper w_lan ≫ w_col). Decoupled from the
+        // geometric sparseReg so the dense photometric can actually move shape.
+        double photoShapeReg       = 5.0;
+        double photoLandmarkWeight = 20.0;
         // track stage
         int  contourItersTrack     = 10;
         int  trackPhotoIterations  = 2;     // lighting-refresh photometric call
-        bool trackPhotoOptimizePose = true; // offline parity (its pose is unused)
+        // false: the refresh's pose result was ALWAYS discarded, but solving it
+        // (a) burned a full per-pixel Ceres solve per frame and (b) left the SH
+        // estimate taken at a pose ≠ the tracked one. Pure linear estimate at
+        // the tracked pose is faster and consistent.
+        bool trackPhotoOptimizePose = false;
         int  lightingEvery         = 1;     // refresh lighting every k frames
         // depth term
         double depthPointToPlaneWeight = 1.0;

@@ -21,8 +21,13 @@ struct PoseParameters {
     Eigen::Matrix3f rotationMatrix() const;
 };
 
-constexpr int kShapeCoefficientCount = 30;
-constexpr int kAlbedoCoefficientCount = 30;       // BFM colour (albedo) PCA coeffs
+constexpr int kShapeCoefficientCount = 180;
+constexpr int kAlbedoCoefficientCount = 180;       // BFM colour (albedo) PCA coeffs
+// 30, not 80: only ~10 mouth/brow landmarks constrain expression, and BFM
+// expression modes 30–80 add just ~4% of variance (92%→99%) — 50 nearly-
+// unobservable DOF the solver fills with a high-norm, jittery, asymmetric
+// combination (‖δ‖≈5–7 for a near-closed mouth). Optimising the first 30 keeps
+// 92% of the expression range while removing the instability at its source.
 constexpr int kExpressionCoefficientCount = 30;   // BFM expression PCA coeffs
 
 struct FitParameters {
@@ -124,7 +129,12 @@ public:
         // prior anchors the metric face size, which is what disambiguates
         // focal from distance. Only sensible during personalisation.
         bool                                     optimizeFocal        = false,
-        double*                                  focalInOut           = nullptr
+        double*                                  focalInOut           = nullptr,
+        // ── temporal expression prior (tracking) ──  weight on
+        // ‖δ − initialExpr‖²: damps frame-to-frame expression jitter IN the
+        // solve without fighting a held articulation the way the zero-anchored
+        // prior does. 0 = off (personalise / single-frame fits).
+        double                                   exprTemporalWeight   = 0.0
     );
 
     // Dense fit: outer ICP loop (re-find nearest-vertex correspondences →
@@ -196,6 +206,17 @@ public:
         const DenseIterationCallback&     onIteration       = nullptr,
         // Working-resolution cap (image + intrinsics are downscaled together).
         // The realtime path calls this per pyramid level (e.g. 100 then 200).
-        int                               maxImageWidth     = 400
+        int                               maxImageWidth     = 400,
+        // ── JOINT E_col + E_lan (Face2Face Eq. 3) ──  When `landmarks` is
+        // non-null and `landmarkWeight` > 0, the interior landmark reprojection
+        // residuals are added to the per-pixel photometric SHAPE solve, on the
+        // same pose+shape blocks. The dense photometric alone is
+        // appearance-limited and shape-from-shading-ambiguous; the landmark
+        // term anchors the shape inside the solve (paper w_lan ≫ w_col), which
+        // is what makes a LOW shapeRegWeight safe — the coupling the paper
+        // relies on. Default (nullptr / 0) reproduces the old behaviour exactly,
+        // so existing callers (tracking lighting refresh) are unaffected.
+        const std::vector<LandmarkObservation>* landmarks   = nullptr,
+        double                            landmarkWeight    = 0.0
     );
 };

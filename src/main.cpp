@@ -17,6 +17,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <csignal>
+#include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -27,6 +30,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <sys/wait.h>   // MediaPipe landmark coprocess (live mode)
+#include <unistd.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config — every path and tunable lives here, grouped by concern.
@@ -56,6 +62,10 @@ const std::string kYuNetPath    = modelPath("face_detection_yunet.onnx");
 //               offline; its 468-pt mesh adds vertical mouth points + a denser,
 //               more pose-robust jaw than LBF.
 std::string kDetector = "yunet";
+// Whether --detector was passed on the CLI. Live mode upgrades the DEFAULT to
+// the MediaPipe coprocess (best landmarks) but never overrides an explicit
+// choice.
+bool kDetectorExplicit = false;
 
 // ── output layout ──  each run writes into data/out/<tag>/ (biwi_video_rgb,
 // biwi_dense, debug, …) so modes never clobber each other.
@@ -72,21 +82,36 @@ std::string outDir(const std::string& tag) {
 constexpr float kFrontalRenderDepthMM = 350.0f;
 
 // ── sparse / contour landmark fit ──
-constexpr double kDefaultSparseReg  = 100.0;  // interior-only fit (--sparse-reg)
+// 30, not 100: the contour fit normalises its reprojection residuals by face
+// size (see reprojW), and its doc explicitly calls for a LOWER identity reg so
+// the silhouette can actually widen the face — 100 kept the identity pinned to
+// the mean. Override per run with --sparse-reg.
+constexpr double kDefaultSparseReg  = 30.0;   // identity reg (--sparse-reg)
 constexpr int    kContourOuterIters = 40;
-// Expression prior for the SINGLE-FRAME fit. Kept much stiffer than the identity
-// reg: only 5 interior landmarks (2 mouth corners) drive expression here, which
-// cannot reliably determine 30 coeffs — so a neutral face must stay neutral
-// instead of over-articulating (jaw-open) to absorb landmark noise. Video
-// tracking uses a lower value (identity frozen → expression must move).
-constexpr double kExprRegWeight = 500.0;
-// Expression prior for video TRACKING (identity frozen, so expression must stay
-// mobile to follow the mouth) — looser than the single-frame value above, but
-// far stiffer than the identity reg so a neutral frame stays neutral.
-constexpr double kTrackExprRegWeight = 120.0;
+// Expression prior for the PERSONALISE fit. Stiffer than the identity reg so
+// that identity, not expression, explains the face — but no longer 500: that
+// value dated from the 5-point YuNet era (2 mouth corners = almost no
+// expression signal). With the 21-interior + 14-jaw MediaPipe set the data
+// genuinely observes expression, and an over-stiff prior forces any non-
+// neutral personalise mouth into the IDENTITY (permanently wrong chin).
+constexpr double kExprRegWeight = 200.0;
+// ZERO-anchored expression prior for TRACKING (identity frozen → expression
+// must carry all articulation). Weak (10, was 120): a fully open mouth needs
+// ‖δ‖ ≈ 4.5 (measured on the BFM basis), and any zero prior strong enough to
+// damp landmark noise also pulls a HELD articulation shut every frame — at
+// 120 the mouth never opened past a few mm, at 30 it stopped halfway. Jitter
+// damping is instead done by the TEMPORAL prior (FaceTracker::Config
+// exprTemporalReg, ‖δ − δ_prev‖²), which costs nothing for a held expression.
+constexpr double kTrackExprRegWeight = 18.0;
 
 // ── photometric (appearance) fit ──
-constexpr double kAlbedoRegWeight  = 50.0;
+// 3, not 50: the albedo LS AtA-diagonal is ~47 (measured on this BFM), so λ=50
+// halved even the strongest colour mode and forced the rest to ~0 — ‖β‖≈0.3,
+// i.e. every reconstruction wore the androgynous MEAN skin/lips/brows (why
+// female subjects failed to read as themselves). λ=3 gives ~0.94 fit factor so
+// the person's actual colouring comes through; still enough to resist baking
+// lighting/beard/background into the skin.
+constexpr double kAlbedoRegWeight  = 3.0;
 constexpr int    kPhotoIterations  = 20;
 constexpr int    kPhotoPixelStride = 1;
 
@@ -585,16 +610,15 @@ static void runVideoReconstruction(
                 std::cout << "[personalise] frame " << f.frameNumber
                           << " — identity + albedo fixed for the rest\n";
             } else {
-                // RGB-only tracks from per-frame landmarks; depth tracks from
-                // the cloud (no landmarks needed → empty observations).
-                std::vector<LandmarkObservation> obs;
-                if (!useDepth) {
-                    obs = frameLandmarks(f);
-                    if (obs.empty()) {
-                        std::cout << "  skip frame " << f.frameNumber
-                                  << " (no landmarks)\n";
-                        continue;
-                    }
+                // BOTH modes track from per-frame landmarks: they are the only
+                // data term that drives EXPRESSION (the depth cloud drives pose
+                // only — see fitPoseAndShapeContour). In rgbd mode a frame
+                // without landmarks still tracks pose from the cloud alone.
+                std::vector<LandmarkObservation> obs = frameLandmarks(f);
+                if (obs.empty() && !useDepth) {
+                    std::cout << "  skip frame " << f.frameNumber
+                              << " (no landmarks)\n";
+                    continue;
                 }
                 ScopedTimer t("track");
                 if (!tracker.track(f.rgb, obs, headRgb.z(), cloudPtr))
@@ -641,6 +665,135 @@ static void runVideoReconstruction(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// MediaPipe landmark coprocess (live mode)
+// ─────────────────────────────────────────────────────────────────────────────
+// MediaPipe is Bazel-built and cannot link into this binary, and the offline
+// pre-pass files obviously don't exist for a camera stream. This client runs
+// python/mp_landmark_server.py as a child process and streams frames to it:
+//   stdin : 8-byte header (int32 width, int32 height) + raw BGR bytes
+//   stdout: "N\n" then N lines "bfm_vertex_index u v"  (-1 = jaw contour)
+// giving live the SAME 21-interior + 14-jaw landmark set as the offline
+// MediaPipe path — the 5-point YuNet set is nearly coplanar (no chin/brows/eye
+// corners), which is what left live pitch/identity so weakly constrained.
+// Falls back cleanly: if no python with mediapipe is found, start() fails and
+// the caller keeps using the in-process YuNet detector.
+class MpLandmarkStream {
+public:
+    ~MpLandmarkStream() { stop(); }
+
+    bool start()
+    {
+        // A dead child must surface as a failed read, not a fatal SIGPIPE.
+        std::signal(SIGPIPE, SIG_IGN);
+        // The devcontainer bakes mediapipe into python3; on a Mac host it is
+        // usually a pyenv/homebrew versioned binary. First one that starts
+        // and prints READY wins.
+        for (const char* py : {"python3", "python3.12", "python3.11", "python3.10"})
+            if (startWith(py)) {
+                std::cout << "live: MediaPipe landmark server up (" << py << ")\n";
+                return true;
+            }
+        return false;
+    }
+
+    bool running() const { return pid_ > 0; }
+
+    // Returns the frame's observations (empty = no face). On pipe failure the
+    // stream shuts down and running() turns false — caller falls back.
+    std::vector<LandmarkObservation> detect(const cv::Mat& bgr)
+    {
+        std::vector<LandmarkObservation> obs;
+        if (pid_ <= 0) return obs;
+        cv::Mat frame = bgr.isContinuous() ? bgr : bgr.clone();
+        const int32_t wh[2] = {frame.cols, frame.rows};
+        if (!writeAll(wh, sizeof wh) ||
+            !writeAll(frame.data, static_cast<size_t>(frame.cols) * frame.rows * 3)) {
+            fail("write");
+            return obs;
+        }
+        char line[128];
+        if (!std::fgets(line, sizeof line, rx_)) { fail("read"); return obs; }
+        const int n = std::atoi(line);
+        for (int i = 0; i < n; ++i) {
+            if (!std::fgets(line, sizeof line, rx_)) { fail("read"); return {}; }
+            int vertexIndex; double u, v;
+            if (std::sscanf(line, "%d %lf %lf", &vertexIndex, &u, &v) == 3)
+                obs.push_back({vertexIndex, Eigen::Vector2d(u, v)});
+        }
+        return obs;
+    }
+
+private:
+    bool startWith(const char* python)
+    {
+        int toChild[2], fromChild[2];
+        if (pipe(toChild) != 0) return false;
+        if (pipe(fromChild) != 0) { close(toChild[0]); close(toChild[1]); return false; }
+
+        const pid_t pid = fork();
+        if (pid < 0) {
+            for (int fd : {toChild[0], toChild[1], fromChild[0], fromChild[1]}) close(fd);
+            return false;
+        }
+        if (pid == 0) {                                    // child
+            dup2(toChild[0], STDIN_FILENO);
+            dup2(fromChild[1], STDOUT_FILENO);
+            for (int fd : {toChild[0], toChild[1], fromChild[0], fromChild[1]}) close(fd);
+            execlp(python, python, "python/mp_landmark_server.py", nullptr);
+            _exit(127);                                    // exec failed
+        }
+        close(toChild[0]);
+        close(fromChild[1]);
+        pid_ = pid;
+        tx_  = toChild[1];
+        rx_  = fdopen(fromChild[0], "r");
+
+        // Handshake: the server prints READY after the (slow) mediapipe import.
+        // A python without mediapipe exits immediately → fgets returns NULL.
+        char line[64];
+        if (rx_ && std::fgets(line, sizeof line, rx_) &&
+            std::string(line).rfind("READY", 0) == 0)
+            return true;
+        stop();
+        return false;
+    }
+
+    bool writeAll(const void* data, size_t n)
+    {
+        const char* p = static_cast<const char*>(data);
+        while (n > 0) {
+            const ssize_t w = write(tx_, p, n);
+            if (w <= 0) return false;
+            p += w;
+            n -= static_cast<size_t>(w);
+        }
+        return true;
+    }
+
+    void fail(const char* what)
+    {
+        std::cerr << "live: MediaPipe landmark server " << what
+                  << " failed — falling back to YuNet\n";
+        stop();
+    }
+
+    void stop()
+    {
+        if (pid_ <= 0) return;
+        if (tx_ >= 0) close(tx_);
+        if (rx_) std::fclose(rx_);
+        kill(pid_, SIGTERM);
+        int status;
+        waitpid(pid_, &status, 0);
+        pid_ = -1; tx_ = -1; rx_ = nullptr;
+    }
+
+    pid_t pid_ = -1;
+    int   tx_  = -1;
+    FILE* rx_  = nullptr;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Realtime camera mode (--mode live) — HOST ONLY (Docker has no camera access)
 // ─────────────────────────────────────────────────────────────────────────────
 struct LiveOptions {
@@ -656,7 +809,108 @@ struct LiveOptions {
     // --optimize-focal; robust recovery needs multi-keyframe bundling (plan §3).
     bool        optimizeFocal = false;
     double      initZ         = 500.0;  // webcam ≈ arm's length (mm)
+    // --photo-texture: at personalise time, project the camera frame onto the
+    // fitted mesh (per-vertex photo colours, like the offline textured
+    // overlays) and render with THAT instead of the BFM albedo — in the main
+    // overlay AND the mask debug window. Makes drift instantly visible: the
+    // texture is sampled once, so any later misalignment shows as the painted
+    // features sliding off the real ones.
+    bool        photoTexture  = false;
 };
+
+// Personalisation quality gate: the identity (and, with --optimize-focal, the
+// focal) is fitted ONCE and kept for the whole session, so refusing a turned
+// or tiny first face is much cheaper than living with a mis-personalised
+// model. Yaw proxy: on a frontal face the nose tip sits near the horizontal
+// midpoint of the pupils; under yaw it shifts toward one eye. Both the YuNet
+// and MediaPipe sets carry these three vertices (4540/11681 pupils, 8156 nose).
+static bool frontalEnough(const std::vector<LandmarkObservation>& obs)
+{
+    Eigen::Vector2d nose(-1, -1), eyeR(-1, -1), eyeL(-1, -1);
+    for (const LandmarkObservation& o : obs) {
+        if      (o.vertexIndex ==  8156) nose = o.imagePoint;
+        else if (o.vertexIndex ==  4540) eyeR = o.imagePoint;
+        else if (o.vertexIndex == 11681) eyeL = o.imagePoint;
+    }
+    if (nose.x() < 0 || eyeR.x() < 0 || eyeL.x() < 0) return false;
+    const double eyeDist = (eyeL - eyeR).norm();
+    if (eyeDist < 25.0) return false;                        // face too small/far
+    const Eigen::Vector2d mid = 0.5 * (eyeL + eyeR);
+    return std::abs(nose.x() - mid.x()) < 0.35 * eyeDist;    // |yaw| ≲ 25–30°
+}
+
+// Projective texture for live (--photo-texture): sample the photo's colour at
+// every camera-facing vertex's projection (1×1 getRectSubPix = bilinear);
+// averted / off-image vertices keep the fallback albedo. Same recipe as the
+// offline `rgb_overlay_textured`, minus the RGB↔depth extrinsics (live has a
+// single camera). Captured ONCE at personalise time — lighting is baked into
+// the samples, so render it with flat white SH, not the estimated lighting.
+static Eigen::MatrixX3f projectiveTexture(const cv::Mat&          bgr,
+                                          const Eigen::MatrixX3f& shape,
+                                          const Eigen::MatrixX3i& faces,
+                                          const Eigen::MatrixX3f& fallback,
+                                          const PoseParameters&   pose,
+                                          const Eigen::Matrix3f&  K)
+{
+    Eigen::MatrixX3f tex = fallback;
+    const Eigen::Matrix3f  R   = pose.rotationMatrix();
+    const Eigen::Vector3f  t   = pose.translation.cast<float>();
+    const Eigen::MatrixX3f cam = proj::toCameraFrame(shape, R, t);
+    const Eigen::MatrixX3f nrm =
+        proj::normalsToCameraFrame(Renderer::computeNormals(shape, faces), R);
+
+    int sampled = 0;
+    for (int i = 0; i < cam.rows(); ++i) {
+        if (cam(i, 2) <= 1.0f) continue;
+        // visible ≈ normal faces the camera (the face is frontally convex).
+        const Eigen::Vector3f dir = cam.row(i).normalized();
+        if (nrm.row(i).dot(dir) > -0.25f) continue;
+        const float u = K(0, 0) * cam(i, 0) / cam(i, 2) + K(0, 2);
+        const float v = K(1, 1) * cam(i, 1) / cam(i, 2) + K(1, 2);
+        if (u < 1.0f || v < 1.0f || u >= bgr.cols - 2.0f || v >= bgr.rows - 2.0f)
+            continue;
+        cv::Mat patch;
+        cv::getRectSubPix(bgr, {1, 1}, {u, v}, patch);
+        const cv::Vec3b c = patch.at<cv::Vec3b>(0, 0);
+        tex.row(i) = Eigen::RowVector3f(c[2] / 255.0f, c[1] / 255.0f, c[0] / 255.0f);
+        ++sampled;
+    }
+    std::cout << "live: photo texture captured (" << sampled << " / "
+              << cam.rows() << " vertices)\n";
+    return tex;
+}
+
+// Keypoint debug view: the camera frame with the detected observations
+// (green = interior, cyan = jaw contour) and — once personalised — the
+// corresponding PROJECTED model vertices (red crosses + yellow error vector),
+// so a bad pose/landmark is visible as a long yellow line.
+static cv::Mat drawKeypointsDebug(const cv::Mat&                          frame,
+                                  const std::vector<LandmarkObservation>& obs,
+                                  const proj::Pixels*                     projected)
+{
+    cv::Mat out = frame.clone();
+    for (const LandmarkObservation& o : obs) {
+        const cv::Point det(static_cast<int>(o.imagePoint.x() + 0.5),
+                            static_cast<int>(o.imagePoint.y() + 0.5));
+        if (o.vertexIndex < 0) {                       // contour (matched later)
+            cv::circle(out, det, 3, {255, 255, 0}, -1, cv::LINE_AA);
+            continue;
+        }
+        cv::circle(out, det, 3, {0, 220, 0}, -1, cv::LINE_AA);
+        if (projected && o.vertexIndex < projected->rows() &&
+            (*projected)(o.vertexIndex, 0) >= 0) {
+            const cv::Point mdl(
+                static_cast<int>((*projected)(o.vertexIndex, 0) + 0.5f),
+                static_cast<int>((*projected)(o.vertexIndex, 1) + 0.5f));
+            cv::line(out, det, mdl, {0, 255, 255}, 1, cv::LINE_AA);
+            cv::drawMarker(out, mdl, {0, 0, 255}, cv::MARKER_CROSS, 7, 1,
+                           cv::LINE_AA);
+        }
+    }
+    cv::putText(out, "green detected | red model | cyan contour", {8, 24},
+                cv::FONT_HERSHEY_SIMPLEX, 0.45, {0, 220, 0}, 1, cv::LINE_AA);
+    return out;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ENTRY POINT: live-cpu — realtime reconstruction from the Mac camera (CPU)
@@ -737,11 +991,21 @@ static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions
               << " px" << (lo.optimizeFocal ? " (optimised during personalise)" : "")
               << "\n      keys: q quit | p re-personalise | s snapshot\n";
 
-    if (kDetector == "mediapipe")
-        std::cout << "live: --detector mediapipe is offline-only — using YuNet\n";
+    // Landmark source. Preferred: the MediaPipe coprocess (same dense 21+14
+    // landmark set as the offline modes — chin/brows/eye corners are what make
+    // pitch and identity observable; YuNet's 5 points are nearly coplanar).
+    // Used by default and for --detector mediapipe; an explicit
+    // --detector yunet|lbf skips it. YuNet stays as the automatic fallback.
+    MpLandmarkStream mpStream;
+    if (kDetector == "mediapipe" || !kDetectorExplicit) {
+        if (!mpStream.start())
+            std::cout << "live: MediaPipe landmark server unavailable (needs a "
+                         "python3 with mediapipe installed — pip install "
+                         "mediapipe==0.10.18) — using YuNet\n";
+    }
     LandmarkDetector detector(kLbfModelPath,
                               kDetector == "lbf" ? "" : kYuNetPath);
-    if (!detector.ok()) {
+    if (!detector.ok() && !mpStream.running()) {
         std::cerr << "live: landmark detector unavailable (models/ missing?)\n";
         return;
     }
@@ -755,6 +1019,12 @@ static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions
     tc.contourItersPersonalise = kContourOuterIters;
     tc.photoIterations        = 20;            // one-off → keep startup snappy
     tc.photoPixelStride       = 2;
+    // Lighting + albedo only at personalise: the per-pixel SHAPE refinement
+    // carries a kShapeCoefficientCount-wide autodiff jet per covered pixel
+    // (plus a 53k × K basis precompute) — with a large identity count that is
+    // seconds of startup for a refinement that measures out at ‖Δα‖ ≈ 0.01.
+    // The offline modes keep it.
+    tc.personaliseOptimizeShape = false;
     tc.contourItersTrack      = 3;             // warm-started → converges fast
     tc.trackPhotoIterations   = 1;
     tc.trackPhotoOptimizePose = false;         // lighting = pure linear estimate
@@ -768,38 +1038,97 @@ static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions
     double fpsEma = 0.0;
     long processed = 0, written = 0;
 
+    // --photo-texture state: captured once per personalisation.
+    Eigen::MatrixX3f photoTex;
+    bool             havePhotoTex = false;
+
     for (;;) {
         if (!cap.read(raw) || raw.empty()) break;
         const auto t0 = std::chrono::steady_clock::now();
         frame = prep(raw);
 
         std::vector<LandmarkObservation> obs;
-        { ScopedTimer t("live/detect"); obs = detector.detect(frame); }
+        {
+            ScopedTimer t("live/detect");
+            obs = mpStream.running() ? mpStream.detect(frame)
+                                     : detector.detect(frame);
+        }
 
         bool tracked = false;
         if (!tracker.personalised()) {
-            if (!obs.empty()) {
+            // Identity is locked in for the whole session by this one frame —
+            // only personalise on a frontal-enough, large-enough face.
+            if (!obs.empty() && frontalEnough(obs)) {
                 ScopedTimer t("live/personalise");
                 tracked = tracker.personalise(frame, obs, lo.initZ);
+                if (tracked && lo.photoTexture) {
+                    photoTex = projectiveTexture(
+                        frame, tracker.currentShape(), bfm.faces(),
+                        tracker.currentAlbedo(), tracker.pose(), tracker.K());
+                    havePhotoTex = true;
+                }
             }
         } else {
             ScopedTimer t("live/track");
             tracked = tracker.track(frame, obs, lo.initZ);
         }
 
-        cv::Mat vis;
+        // Rendered-model views (shared by the overlay and the mask window).
+        // Photo texture has the capture frame's lighting baked in → flat SH.
+        cv::Mat vis, maskVis, kpVis;
         if (tracker.personalised()) {
             ScopedTimer t("live/render");
+            const bool textured = havePhotoTex;
+            const Eigen::MatrixX3f shape = tracker.currentShape();
             const RenderInput in{
-                .shape  = tracker.currentShape(),
-                .albedo = tracker.currentAlbedo(),
+                .shape  = shape,
+                .albedo = textured ? photoTex : tracker.currentAlbedo(),
                 .R      = tracker.pose().rotationMatrix(),
                 .t      = tracker.pose().translation.cast<float>(),
                 .K      = tracker.K(),
-                .sh     = tracker.sh() };
-            vis = blendRenderOnPhoto(renderer.render(in), frame);
+                .sh     = textured ? light::defaultWhite() : tracker.sh() };
+            const RenderOutput r = renderer.render(in);
+            vis = blendRenderOnPhoto(r, frame);
+
+            // Mask debug window: the reconstruction alone on black, annotated
+            // with the current fit state.
+            cv::cvtColor(r.image, maskVis, cv::COLOR_RGB2BGR);
+            maskVis.convertTo(maskVis, CV_8UC3, 255.0);
+            {
+                const PoseParameters&  p  = tracker.pose();
+                const Eigen::VectorXd& ex = tracker.expr();
+                std::ostringstream l1, l2, l3;
+                l1 << "t [mm]  " << std::fixed << std::setprecision(1)
+                   << p.translation.x() << "  " << p.translation.y() << "  "
+                   << p.translation.z();
+                l2 << "rot [deg]  " << std::fixed << std::setprecision(1)
+                   << p.angleAxis.x() * 180.0 / M_PI << "  "
+                   << p.angleAxis.y() * 180.0 / M_PI << "  "
+                   << p.angleAxis.z() * 180.0 / M_PI;
+                l3 << "|id| " << std::setprecision(2) << tracker.identity().norm()
+                   << "  |expr| " << (ex.size() ? ex.norm() : 0.0)
+                   << "  albedo: " << (textured ? "photo-texture" : "BFM beta")
+                   << "  f " << static_cast<int>(tracker.K()(0, 0)) << "px";
+                int y = 22;
+                for (const std::ostringstream* s : {&l1, &l2, &l3}) {
+                    cv::putText(maskVis, s->str(), {8, y},
+                                cv::FONT_HERSHEY_SIMPLEX, 0.5, {0, 220, 0}, 1,
+                                cv::LINE_AA);
+                    y += 22;
+                }
+            }
+
+            // Keypoint debug window: detections + projected model landmarks.
+            const proj::Pixels projected = proj::projectMesh(
+                shape, in.R, in.t, tracker.K());
+            kpVis = drawKeypointsDebug(frame, obs, &projected);
         } else {
-            vis = frame.clone();
+            vis     = frame.clone();
+            maskVis = cv::Mat::zeros(frame.size(), CV_8UC3);
+            cv::putText(maskVis, "not personalised yet", {8, 22},
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, {0, 220, 0}, 1,
+                        cv::LINE_AA);
+            kpVis = drawKeypointsDebug(frame, obs, nullptr);
         }
 
         const double ms = std::chrono::duration<double, std::milli>(
@@ -807,7 +1136,7 @@ static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions
         fpsEma = fpsEma <= 0.0 ? 1000.0 / ms : 0.9 * fpsEma + 0.1 * (1000.0 / ms);
         std::ostringstream hud;
         hud << (tracker.personalised() ? (tracked ? "track" : "hold")
-                                       : "looking for a face...")
+                                       : "looking for a frontal face...")
             << "  " << std::fixed << std::setprecision(1) << fpsEma << " fps"
             << "  f=" << static_cast<int>(tracker.K()(0, 0)) << "px";
         cv::putText(vis, hud.str(), {8, 24}, cv::FONT_HERSHEY_SIMPLEX, 0.6,
@@ -817,19 +1146,27 @@ static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions
         if (lo.maxFrames > 0) {                 // headless test: dump frames
             std::ostringstream n;
             n << liveDir << "/live_" << std::setw(4) << std::setfill('0')
-              << written++ << ".png";
-            cv::imwrite(n.str(), vis);
+              << written++;
+            cv::imwrite(n.str() + ".png", vis);
+            cv::imwrite(n.str() + "_mask.png", maskVis);
+            cv::imwrite(n.str() + "_kp.png", kpVis);
         }
         if (lo.display) {
             cv::imshow("face2face live", vis);
+            cv::imshow("face2face mask", maskVis);
+            cv::imshow("face2face keypoints", kpVis);
             const int key = cv::waitKey(1) & 0xFF;
             if (key == 'q' || key == 27) break;
             if (key == 'p') {                   // re-personalise from scratch
                 tracker.reset(K0);
+                havePhotoTex = false;           // recaptured next personalise
                 std::cout << "live: re-personalising…\n";
             }
-            if (key == 's')
+            if (key == 's') {
                 cv::imwrite(liveDir + "/snapshot.png", vis);
+                cv::imwrite(liveDir + "/snapshot_mask.png", maskVis);
+                cv::imwrite(liveDir + "/snapshot_kp.png", kpVis);
+            }
         }
         if (lo.maxFrames > 0 && processed >= lo.maxFrames) break;
     }
@@ -1240,12 +1577,16 @@ static void printUsage()
       "Options:\n"
       "  --biwi-dir <path> | --biwi-seq <NN>   Biwi subject folder\n"
       "  --frames <n>       frame count for rgb/rgbd (default 30)\n"
-      "  --sparse-reg <λ>   identity/expression reg (default 100)\n"
+      "  --sparse-reg <λ>   identity/expression reg (default 30)\n"
       "  --icp-iters <n>    dense/full ICP rounds (default 30)\n"
-      "  --detector <yunet|lbf|mediapipe>   landmark backend (default yunet)\n"
+      "  --detector <yunet|lbf|mediapipe>   landmark backend (default: yunet;\n"
+      "                     live-cpu defaults to the MediaPipe coprocess and\n"
+      "                     falls back to yunet if no python3 has mediapipe)\n"
       "  --camera <i> | --live-source <path> | --live-width <px>\n"
       "  --live-frames <n> --live-nodisplay   headless live test\n"
       "  --photo-refine     pyramid photometric pose refinement (live)\n"
+      "  --photo-texture    live: project the personalise frame onto the mesh\n"
+      "                     and render with that texture (overlay + mask window)\n"
       "  --optimize-focal   solve fx=fy during personalise (experimental)\n"
       "  --timers           print per-stage timings\n";
 }
@@ -1270,7 +1611,10 @@ int main(int argc, char** argv)
         else if (arg == "--biwi-dir" && i + 1 < argc) kBiwiDir = argv[++i];   // e.g. data/BK-1/01
         else if (arg == "--icp-iters" && i + 1 < argc) icpIters = std::stoi(argv[++i]);
         else if (arg == "--frames" && i + 1 < argc) numFrames = std::stoi(argv[++i]);
-        else if (arg == "--detector" && i + 1 < argc) kDetector = argv[++i];  // yunet|lbf|mediapipe
+        else if (arg == "--detector" && i + 1 < argc) {                      // yunet|lbf|mediapipe
+            kDetector = argv[++i];
+            kDetectorExplicit = true;
+        }
         // ── live / realtime flags ──
         else if (arg == "--camera" && i + 1 < argc) live.camera = std::stoi(argv[++i]);
         else if (arg == "--live-source" && i + 1 < argc) live.source = argv[++i];
@@ -1278,6 +1622,7 @@ int main(int argc, char** argv)
         else if (arg == "--live-frames" && i + 1 < argc) live.maxFrames = std::stoi(argv[++i]);
         else if (arg == "--live-nodisplay") live.display = false;
         else if (arg == "--photo-refine") live.photoRefine = true;
+        else if (arg == "--photo-texture") live.photoTexture = true;
         else if (arg == "--optimize-focal") live.optimizeFocal = true;
         else if (arg == "--timers") ScopedTimer::enabled = true;
         else { std::cerr << "unknown argument: " << arg << "\n\n"; printUsage(); return 1; }
