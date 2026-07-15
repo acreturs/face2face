@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <limits>
 #include <vector>
+#include <memory>
 #include <utility>
 
 namespace {
@@ -270,7 +271,13 @@ struct DepthPointResidual {
         const Eigen::VectorXf& shapeSigma,
         const Eigen::Vector3d& targetPoint,
         const Eigen::Vector3d& targetNormal,
-        double pointToPlaneWeight
+        double pointToPlaneWeight,
+        // Current expression displacement of this vertex (camera-aligned, mm),
+        // held CONSTANT within the solve. Without it the residual models the
+        // NEUTRAL vertex while the correspondence was found against the
+        // expressed shape — the mismatch biases pose (and identity) by the
+        // expression displacement. Refreshed each outer/ICP iteration.
+        const Eigen::Vector3d& exprOffsetAligned = Eigen::Vector3d::Zero()
     )
         : targetX_(targetPoint.x()),
           targetY_(targetPoint.y()),
@@ -281,7 +288,8 @@ struct DepthPointResidual {
           sqrtPlaneWeight_(std::sqrt(pointToPlaneWeight))
     {
         const Eigen::Vector3d alignedMean =
-            proj::BFM_TO_CAM.cast<double>() * meanPoint.cast<double>();
+            proj::BFM_TO_CAM.cast<double>() * meanPoint.cast<double>() +
+            exprOffsetAligned;
 
         meanX_ = alignedMean.x();
         meanY_ = alignedMean.y();
@@ -466,7 +474,13 @@ private:
 // block is held constant these are numerically identical to fixed-intrinsics
 // reprojection. `WithExpr` selects whether the expression basis contributes
 // (contour→identity routing uses the identity-only variant).
-template <bool WithExpr>
+// WithId selects whether the IDENTITY basis is a parameter block. During
+// TRACKING identity is frozen, but a constant parameter block still costs its
+// full autodiff-jet width per residual evaluation — with 180 identity coeffs
+// that is ~3× the whole functor. WithId=false instead expects the identity
+// displacement PRE-BAKED into `meanPoint` and drops the block entirely
+// (blocks: angleAxis, translation, expr, focal).
+template <bool WithExpr, bool WithId = true>
 struct LandmarkFocalReprojectionResidual {
     LandmarkFocalReprojectionResidual(
         const Eigen::Vector3f& meanPoint, int vertexIndex,
@@ -479,13 +493,14 @@ struct LandmarkFocalReprojectionResidual {
         const Eigen::Matrix3d M = proj::BFM_TO_CAM.cast<double>();
         const Eigen::Vector3d m = M * meanPoint.cast<double>();
         meanX_ = m.x(); meanY_ = m.y(); meanZ_ = m.z();
-        for (int k = 0; k < kShapeCoefficientCount; ++k) {
-            const Eigen::Vector3d a = M * Eigen::Vector3d(
-                shapeBasis(3 * vertexIndex + 0, k) * shapeSigma(k),
-                shapeBasis(3 * vertexIndex + 1, k) * shapeSigma(k),
-                shapeBasis(3 * vertexIndex + 2, k) * shapeSigma(k));
-            idX_[k] = a.x(); idY_[k] = a.y(); idZ_[k] = a.z();
-        }
+        if constexpr (WithId)
+            for (int k = 0; k < kShapeCoefficientCount; ++k) {
+                const Eigen::Vector3d a = M * Eigen::Vector3d(
+                    shapeBasis(3 * vertexIndex + 0, k) * shapeSigma(k),
+                    shapeBasis(3 * vertexIndex + 1, k) * shapeSigma(k),
+                    shapeBasis(3 * vertexIndex + 2, k) * shapeSigma(k));
+                idX_[k] = a.x(); idY_[k] = a.y(); idZ_[k] = a.z();
+            }
         if constexpr (WithExpr)
             for (int j = 0; j < kExpressionCoefficientCount; ++j) {
                 const Eigen::Vector3d a = M * Eigen::Vector3d(
@@ -501,11 +516,12 @@ struct LandmarkFocalReprojectionResidual {
     bool project(const T* angleAxis, const T* translation, const T* idCoeff,
                  const T* exprCoeff, const T* focal, T* residuals) const {
         T p[3] = { T(meanX_), T(meanY_), T(meanZ_) };
-        for (int k = 0; k < kShapeCoefficientCount; ++k) {
-            p[0] += T(idX_[k]) * idCoeff[k];
-            p[1] += T(idY_[k]) * idCoeff[k];
-            p[2] += T(idZ_[k]) * idCoeff[k];
-        }
+        if constexpr (WithId)
+            for (int k = 0; k < kShapeCoefficientCount; ++k) {
+                p[0] += T(idX_[k]) * idCoeff[k];
+                p[1] += T(idY_[k]) * idCoeff[k];
+                p[2] += T(idZ_[k]) * idCoeff[k];
+            }
         if constexpr (WithExpr)
             for (int j = 0; j < kExpressionCoefficientCount; ++j) {
                 p[0] += T(exX_[j]) * exprCoeff[j];
@@ -522,28 +538,34 @@ struct LandmarkFocalReprojectionResidual {
         return true;
     }
 
-    // WithExpr=true: blocks angleAxis, translation, id, expr, focal.
+    // 5 blocks — only <WithExpr=true, WithId=true>: aa, t, id, expr, focal.
     // Ceres calls the overload matching the declared block count, so the
-    // unused arity is never instantiated.
+    // unused arities are never instantiated.
     template <typename T>
     bool operator()(const T* const angleAxis, const T* const translation,
                     const T* const idCoeff, const T* const exprCoeff,
                     const T* const focal, T* residuals) const {
         return project(angleAxis, translation, idCoeff, exprCoeff, focal, residuals);
     }
-    // WithExpr=false: blocks angleAxis, translation, id, focal
+    // 4 blocks — <false,true>: aa, t, id, focal;  <true,false>: aa, t, expr, focal.
     template <typename T>
     bool operator()(const T* const angleAxis, const T* const translation,
-                    const T* const idCoeff, const T* const focal,
+                    const T* const coeff, const T* const focal,
                     T* residuals) const {
-        return project(angleAxis, translation, idCoeff,
-                       static_cast<const T*>(nullptr), focal, residuals);
+        if constexpr (WithId)
+            return project(angleAxis, translation, coeff,
+                           static_cast<const T*>(nullptr), focal, residuals);
+        else
+            return project(angleAxis, translation,
+                           static_cast<const T*>(nullptr), coeff, focal, residuals);
     }
 
 private:
+    // Conditionally-sized storage: a dummy 1-element array when the basis is
+    // compiled out, so the frozen-identity functor doesn't carry 3×180 doubles.
     double meanX_, meanY_, meanZ_;
-    std::array<double, kShapeCoefficientCount>      idX_, idY_, idZ_;
-    std::array<double, kExpressionCoefficientCount> exX_, exY_, exZ_;
+    std::array<double, WithId ? kShapeCoefficientCount : 1>      idX_, idY_, idZ_;
+    std::array<double, WithExpr ? kExpressionCoefficientCount : 1> exX_, exY_, exZ_;
     double observedU_, observedV_, cx_, cy_;
 };
 
@@ -573,6 +595,29 @@ struct CoeffPriorResidual {
         return true;
     }
     double sqrtWeight_;
+};
+
+// L2 prior anchored at a TARGET vector: √w · (coeff − target). Used as the
+// TEMPORAL expression prior during tracking — a zero-anchored prior strong
+// enough to damp landmark noise also fights any sustained articulation (it
+// pulls an open mouth shut every frame), while this one only resists CHANGE:
+// holding an expression costs nothing, jitter is damped in-solve.
+template <int Count>
+struct CoeffAnchorResidual {
+    CoeffAnchorResidual(double weight, const Eigen::VectorXd& target)
+        : sqrtWeight_(std::sqrt(weight))
+    {
+        for (int k = 0; k < Count; ++k)
+            target_[k] = k < target.size() ? target(k) : 0.0;
+    }
+    template <typename T>
+    bool operator()(const T* const coeff, T* residuals) const {
+        for (int k = 0; k < Count; ++k)
+            residuals[k] = T(sqrtWeight_) * (coeff[k] - T(target_[k]));
+        return true;
+    }
+    double sqrtWeight_;
+    std::array<double, Count> target_;
 };
 
 } // namespace
@@ -684,7 +729,7 @@ PoseParameters CeresFitter::fitPose(
 
         problem.AddResidualBlock(
             costFunction,
-            nullptr,
+            new ceres::HuberLoss(10.0),   // px — robust to one bad detection
             angleAxis,
             translation
         );
@@ -968,7 +1013,8 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
     const Eigen::VectorXd&                   initialExpr,
     bool                                     optimizeIdentity,
     bool                                     optimizeFocal,
-    double*                                  focalInOut
+    double*                                  focalInOut,
+    double                                   exprTemporalWeight
 )
 {
     if (shapeBasis.cols() < kShapeCoefficientCount ||
@@ -1083,17 +1129,55 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
         ceres::Problem problem;
 
         // (b) interior landmarks → fixed reprojection residuals (pose+id+expr).
+        // Huber: detectors regress OCCLUDED points under yaw/pitch (MediaPipe
+        // hallucinates the far side of the face) — without a robust loss one
+        // bad landmark quadratically drags the whole pose.
+        // The delta must scale with FACE size, not image size: a fully open
+        // mouth displaces the lip/chin landmarks by ~10 % of the face (25 mm ≈
+        // 26 px on a webcam face) — with a fixed ~1 %-of-image delta those
+        // legitimate residuals sat deep in Huber's linear region, so their
+        // pull was clamped to a constant the expression prior easily beat,
+        // and the mouth never opened. 5 % of face size keeps true detector
+        // garbage (> half the mouth region) suppressed while letting
+        // expression-scale residuals act quadratically.
+        const double interiorHuber = std::max(0.01 * imgW, 0.05 * faceSize);
+        // Same reasoning for the jaw contour (it drops ~as far as the chin
+        // when the mouth opens), slightly wider since its correspondences are
+        // re-matched and inherently noisier.
+        const double contourHuber  = std::max(0.02 * imgW, 0.08 * faceSize);
+        // Tracking (identity frozen): bake the constant identity displacement
+        // into the functor's mean and DROP the identity parameter block — a
+        // constant block still costs its full autodiff-jet width, which with
+        // 180 identity coeffs was ~3× the per-residual evaluation.
+        const auto bakedMean = [&](int v) -> Eigen::Vector3f {
+            return meanShape.row(v).transpose() + dispFlat.segment(3 * v, 3);
+        };
         for (const LandmarkObservation& o : fixed) {
             if (o.vertexIndex < 0 || o.vertexIndex >= N) continue;
-            problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<LandmarkFocalReprojectionResidual<true>,
-                    2, 3, 3, kShapeCoefficientCount, kExpressionCoefficientCount, 1>(
-                    new LandmarkFocalReprojectionResidual<true>(
-                        meanShape.row(o.vertexIndex).transpose(), o.vertexIndex,
-                        shapeBasis, shapeSigma, exprBasis, exprSigma,
-                        o.imagePoint, intrinsics)),
-                new ceres::ScaledLoss(nullptr, reprojW, ceres::TAKE_OWNERSHIP),
-                angleAxis, translation, shapeCoefficients, exprCoefficients, &focal);
+            ceres::LossFunction* loss =
+                new ceres::ScaledLoss(new ceres::HuberLoss(interiorHuber),
+                                      reprojW, ceres::TAKE_OWNERSHIP);
+            if (optimizeIdentity) {
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<LandmarkFocalReprojectionResidual<true>,
+                        2, 3, 3, kShapeCoefficientCount, kExpressionCoefficientCount, 1>(
+                        new LandmarkFocalReprojectionResidual<true>(
+                            meanShape.row(o.vertexIndex).transpose(), o.vertexIndex,
+                            shapeBasis, shapeSigma, exprBasis, exprSigma,
+                            o.imagePoint, intrinsics)),
+                    loss,
+                    angleAxis, translation, shapeCoefficients, exprCoefficients, &focal);
+            } else {
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<LandmarkFocalReprojectionResidual<true, false>,
+                        2, 3, 3, kExpressionCoefficientCount, 1>(
+                        new LandmarkFocalReprojectionResidual<true, false>(
+                            bakedMean(o.vertexIndex), o.vertexIndex,
+                            shapeBasis, shapeSigma, exprBasis, exprSigma,
+                            o.imagePoint, intrinsics)),
+                    loss,
+                    angleAxis, translation, exprCoefficients, &focal);
+            }
         }
 
         // (c) contour points → nearest projected SILHOUETTE vertex (re-matched
@@ -1129,20 +1213,22 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
                             meanShape.row(best).transpose(), best,
                             shapeBasis, shapeSigma, exprBasis, exprSigma,
                             o.imagePoint, intrinsics)),
-                    new ceres::ScaledLoss(new ceres::HuberLoss(0.02 * imgW),
+                    new ceres::ScaledLoss(new ceres::HuberLoss(contourHuber),
                                           reprojW, ceres::TAKE_OWNERSHIP),
                     angleAxis, translation, shapeCoefficients, &focal);
             } else {
+                // Identity frozen (tracking) → identity baked into the mean,
+                // no identity block (see interior-landmark comment above).
                 problem.AddResidualBlock(
-                    new ceres::AutoDiffCostFunction<LandmarkFocalReprojectionResidual<true>,
-                        2, 3, 3, kShapeCoefficientCount, kExpressionCoefficientCount, 1>(
-                        new LandmarkFocalReprojectionResidual<true>(
-                            meanShape.row(best).transpose(), best,
+                    new ceres::AutoDiffCostFunction<LandmarkFocalReprojectionResidual<true, false>,
+                        2, 3, 3, kExpressionCoefficientCount, 1>(
+                        new LandmarkFocalReprojectionResidual<true, false>(
+                            bakedMean(best), best,
                             shapeBasis, shapeSigma, exprBasis, exprSigma,
                             o.imagePoint, intrinsics)),
-                    new ceres::ScaledLoss(new ceres::HuberLoss(0.02 * imgW),
+                    new ceres::ScaledLoss(new ceres::HuberLoss(contourHuber),
                                           reprojW, ceres::TAKE_OWNERSHIP),
-                    angleAxis, translation, shapeCoefficients, exprCoefficients, &focal);
+                    angleAxis, translation, exprCoefficients, &focal);
             }
         }
 
@@ -1186,14 +1272,27 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
             for (const DCorr& c : dcorr) {
                 if (c.d2 > trimD2) continue;
                 ++depthMatched;
+                // Expression displacement of this vertex at the current outer
+                // iterate (BFM frame → camera-aligned), constant in the solve.
+                const Eigen::Vector3d exprOffset =
+                    proj::BFM_TO_CAM.cast<double>() *
+                    exprFlat.segment(3 * c.vertex, 3).cast<double>();
                 problem.AddResidualBlock(
                     new ceres::AutoDiffCostFunction<DepthPointResidual,
                         4, 3, 3, kShapeCoefficientCount>(
                         new DepthPointResidual(
                             meanShape.row(c.vertex).transpose(), c.vertex,
                             shapeBasis, shapeSigma,
-                            c.target, c.normal, depthPointToPlaneWeight)),
-                    new ceres::ScaledLoss(new ceres::HuberLoss(10.0),   // 10 mm
+                            c.target, c.normal, depthPointToPlaneWeight,
+                            exprOffset)),
+                    // 22 mm, not 10: a distinctive nose/cheekbone/jaw is often
+                    // 10–30 mm from the BFM mean — exactly the deviations a
+                    // 10 mm Huber treated as half-outliers, capping the depth's
+                    // pull toward the true (e.g. softer, feminine) face where it
+                    // matters most. The 20% trim already rejects gross outliers
+                    // (hair/neck are >50 mm off), so 22 mm lets real identity
+                    // through while still robustifying.
+                    new ceres::ScaledLoss(new ceres::HuberLoss(22.0),
                                           sqrtDepthWeight * sqrtDepthWeight,
                                           ceres::TAKE_OWNERSHIP),
                     angleAxis, translation, shapeCoefficients);
@@ -1226,6 +1325,15 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
                 kExpressionCoefficientCount, kExpressionCoefficientCount>(
                 new CoeffPriorResidual<kExpressionCoefficientCount>(exprRegWeight)),
             nullptr, exprCoefficients);
+        // Temporal prior (tracking only): resist expression CHANGE, not
+        // expression itself — see CoeffAnchorResidual.
+        if (exprTemporalWeight > 0.0 && initialExpr.size() > 0)
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<CoeffAnchorResidual<kExpressionCoefficientCount>,
+                    kExpressionCoefficientCount, kExpressionCoefficientCount>(
+                    new CoeffAnchorResidual<kExpressionCoefficientCount>(
+                        exprTemporalWeight, initialExpr)),
+                nullptr, exprCoefficients);
         if (problem.HasParameterBlock(translation)) {
             problem.SetParameterLowerBound(translation, 2, zMin);
             problem.SetParameterUpperBound(translation, 2, zMax);
@@ -1265,9 +1373,13 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
                 problem.SetParameterBlockConstant(&focal);
             }
         }
+        // ±3.5, not ±3: a fully open mouth needs ‖δ‖ ≈ 4.5 spread over the
+        // first few modes (≈ ±2.7 each; measured on the BFM-2017 basis), and
+        // wider articulation pushes single modes past 3 — the box was clipping
+        // legitimate expressions. The L2 prior still discourages the extremes.
         for (int j = 0; j < kExpressionCoefficientCount; ++j) {
-            problem.SetParameterLowerBound(exprCoefficients, j, -3.0);
-            problem.SetParameterUpperBound(exprCoefficients, j,  3.0);
+            problem.SetParameterLowerBound(exprCoefficients, j, -3.5);
+            problem.SetParameterUpperBound(exprCoefficients, j,  3.5);
         }
 
         ceres::Solver::Options options;
@@ -1300,8 +1412,269 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
         std::cout << "  focal: " << intrinsics(0, 0) << " → " << focal << " px\n";
     std::cout << "Contour fit done. translation="
               << result.pose.translation.transpose()
-              << "\n  exprCoeff=" << result.exprCoefficients.transpose() << '\n';
+              << "  |id|=" << result.shapeCoefficients.norm()
+              << "  |expr|=" << result.exprCoefficients.norm() << '\n';
     return result;
+}
+
+BundleResult CeresFitter::fitIdentityBundle(
+    const Eigen::MatrixX3f&          meanShape,
+    const Eigen::MatrixXf&           shapeBasis,
+    const Eigen::VectorXf&           shapeSigma,
+    const Eigen::MatrixXf&           exprBasis,
+    const Eigen::VectorXf&           exprSigma,
+    const Eigen::MatrixX3i&          triangles,
+    const std::vector<BundleFrame>&  frames,
+    const Eigen::Matrix3f&           intrinsics,
+    double                           regularizationWeight,
+    double                           exprRegWeight,
+    double                           zMin,
+    double                           zMax,
+    int                              numOuterIterations,
+    double                           depthPointToPlaneWeight,
+    double                           depthWeight,
+    int                              depthVertexStride)
+{
+    const int F = static_cast<int>(frames.size());
+    if (F == 0) throw std::runtime_error("fitIdentityBundle: no keyframes");
+    if (depthVertexStride < 1) depthVertexStride = 1;
+    const int   N    = static_cast<int>(meanShape.rows());
+    const float imgW = 2.0f * intrinsics(0, 2);
+    const double sqrtDepthWeight = std::sqrt(depthWeight);
+    const double focalFixed = intrinsics(0, 0);
+
+    // Shared identity; per-frame pose + expression. std::vector storage is
+    // stable (never resized after init), so Ceres' pointers stay valid.
+    std::array<double, kShapeCoefficientCount> id{};
+    std::vector<std::array<double, 3>>                           aa(F), tt(F);
+    std::vector<std::array<double, kExpressionCoefficientCount>> ex(F);
+    double focal = focalFixed;   // shared, held constant (matches contour fit)
+
+    // Per-frame constants: face-size reprojection weight, split interior/contour
+    // observations, and (if present) the depth cloud's normals.
+    std::vector<double> reprojW(F);
+    std::vector<std::vector<LandmarkObservation>> fixed(F), contour(F);
+    std::vector<std::vector<Eigen::Vector3d>>     cloudNormals(F);
+    int totalDepthPts = 0;
+    for (int f = 0; f < F; ++f) {
+        for (int a = 0; a < 3; ++a) {
+            aa[f][a] = frames[f].initialPose.angleAxis[a];
+            tt[f][a] = frames[f].initialPose.translation[a];
+        }
+        ex[f].fill(0.0);
+        double uMin = 1e30, uMax = -1e30, vMin = 1e30, vMax = -1e30;
+        for (const LandmarkObservation& o : frames[f].observations) {
+            (o.vertexIndex >= 0 ? fixed[f] : contour[f]).push_back(o);
+            uMin = std::min(uMin, o.imagePoint.x()); uMax = std::max(uMax, o.imagePoint.x());
+            vMin = std::min(vMin, o.imagePoint.y()); vMax = std::max(vMax, o.imagePoint.y());
+        }
+        const double faceSize = std::max(1.0, std::hypot(uMax - uMin, vMax - vMin));
+        reprojW[f] = std::pow(200.0 / faceSize, 2.0);
+        if (frames[f].depthCloud && !frames[f].depthCloud->empty()) {
+            cloudNormals[f] = estimateCloudNormals(*frames[f].depthCloud, 8);
+            totalDepthPts += static_cast<int>(frames[f].depthCloud->size());
+        }
+    }
+    const bool anyDepth = totalDepthPts > 0;
+
+    std::cout << "\nIDENTITY BUNDLE: " << F << " keyframes"
+              << (anyDepth ? " (+depth)" : " (RGB)")
+              << ", reg=" << regularizationWeight << '\n';
+
+    for (int outer = 0; outer < numOuterIterations; ++outer) {
+        ceres::Problem problem;
+        int totalContour = 0, totalDepth = 0;
+
+        for (int f = 0; f < F; ++f) {
+            // (a) reconstruct this keyframe's shape (shared id + its expression).
+            Eigen::VectorXf idc(kShapeCoefficientCount);
+            for (int k = 0; k < kShapeCoefficientCount; ++k) idc(k) = float(id[k]);
+            const Eigen::VectorXf dispFlat = shapeBasis.leftCols(kShapeCoefficientCount) *
+                shapeSigma.head(kShapeCoefficientCount).cwiseProduct(idc);
+            Eigen::VectorXf ecoef(kExpressionCoefficientCount);
+            for (int j = 0; j < kExpressionCoefficientCount; ++j) ecoef(j) = float(ex[f][j]);
+            const Eigen::VectorXf exprFlat = exprBasis.leftCols(kExpressionCoefficientCount) *
+                exprSigma.head(kExpressionCoefficientCount).cwiseProduct(ecoef);
+            Eigen::MatrixX3f shape = meanShape;
+            for (int v = 0; v < N; ++v)
+                shape.row(v) += (dispFlat.segment(3 * v, 3) +
+                                 exprFlat.segment(3 * v, 3)).transpose();
+
+            const double ang = std::sqrt(aa[f][0]*aa[f][0]+aa[f][1]*aa[f][1]+aa[f][2]*aa[f][2]);
+            Eigen::Matrix3f R = Eigen::Matrix3f::Identity();
+            if (ang > 1e-12) {
+                const Eigen::Vector3d ax(aa[f][0]/ang, aa[f][1]/ang, aa[f][2]/ang);
+                R = Eigen::AngleAxisd(ang, ax).toRotationMatrix().cast<float>();
+            }
+            const Eigen::Vector3f t(static_cast<float>(tt[f][0]),
+                                    static_cast<float>(tt[f][1]),
+                                    static_cast<float>(tt[f][2]));
+            const Eigen::MatrixX3f Vcam = proj::toCameraFrame(shape, R, t);
+            const proj::Pixels     uv   = proj::project(Vcam, intrinsics);
+            const Eigen::MatrixX3f nCam =
+                proj::normalsToCameraFrame(Renderer::computeNormals(shape, triangles), R);
+            double sumU = 0.0; int cnt = 0;
+            for (int v = 0; v < N; ++v)
+                if (Vcam(v, 2) > 1e-3f && uv(v, 0) >= 0) { sumU += uv(v, 0); ++cnt; }
+            const double centerU = cnt ? sumU / cnt : intrinsics(0, 2);
+
+            const double interiorHuber = std::max(0.01 * imgW, 0.05 * (200.0 / std::sqrt(reprojW[f])));
+            const double contourHuber  = std::max(0.02 * imgW, 0.08 * (200.0 / std::sqrt(reprojW[f])));
+
+            // (b) interior landmarks → pose(f)+id+expr(f)+focal.
+            for (const LandmarkObservation& o : fixed[f]) {
+                if (o.vertexIndex < 0 || o.vertexIndex >= N) continue;
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<LandmarkFocalReprojectionResidual<true>,
+                        2, 3, 3, kShapeCoefficientCount, kExpressionCoefficientCount, 1>(
+                        new LandmarkFocalReprojectionResidual<true>(
+                            meanShape.row(o.vertexIndex).transpose(), o.vertexIndex,
+                            shapeBasis, shapeSigma, exprBasis, exprSigma,
+                            o.imagePoint, intrinsics)),
+                    new ceres::ScaledLoss(new ceres::HuberLoss(interiorHuber),
+                                          reprojW[f], ceres::TAKE_OWNERSHIP),
+                    aa[f].data(), tt[f].data(), id.data(), ex[f].data(), &focal);
+            }
+
+            // (c) jaw contour → nearest projected silhouette vertex → IDENTITY.
+            for (const LandmarkObservation& o : contour[f]) {
+                const double lu = o.imagePoint.x(), lv = o.imagePoint.y();
+                const bool lateral  = std::abs(lu - centerU) > 0.03 * imgW;
+                const bool leftSide = lu < centerU;
+                int best = -1; double bestD2 = 1e30;
+                for (int v = 0; v < N; ++v) {
+                    if (Vcam(v, 2) <= 1e-3f) continue;
+                    if (std::abs(nCam(v, 2)) > 0.5f) continue;
+                    const double du = uv(v, 0), dv = uv(v, 1);
+                    if (du < 0 || dv < 0) continue;
+                    if (std::abs(dv - lv) > 0.12 * imgW) continue;
+                    if (lateral && (du < centerU) != leftSide) continue;
+                    const double d2 = (du-lu)*(du-lu) + (dv-lv)*(dv-lv);
+                    if (d2 < bestD2) { bestD2 = d2; best = v; }
+                }
+                if (best < 0 || std::sqrt(bestD2) > 0.12 * imgW) continue;
+                ++totalContour;
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<LandmarkFocalReprojectionResidual<false>,
+                        2, 3, 3, kShapeCoefficientCount, 1>(
+                        new LandmarkFocalReprojectionResidual<false>(
+                            meanShape.row(best).transpose(), best,
+                            shapeBasis, shapeSigma, exprBasis, exprSigma,
+                            o.imagePoint, intrinsics)),
+                    new ceres::ScaledLoss(new ceres::HuberLoss(contourHuber),
+                                          reprojW[f], ceres::TAKE_OWNERSHIP),
+                    aa[f].data(), tt[f].data(), id.data(), &focal);
+            }
+
+            // (c2) depth ICP → pose(f)+identity (expression baked constant).
+            if (frames[f].depthCloud && !frames[f].depthCloud->empty()) {
+                const std::vector<Eigen::Vector3d>& cloud = *frames[f].depthCloud;
+                struct DCorr { int vertex; Eigen::Vector3d target, normal; double d2; };
+                std::vector<DCorr> dcorr; dcorr.reserve(cloud.size());
+                for (size_t ci = 0; ci < cloud.size(); ++ci) {
+                    const Eigen::Vector3d& tp = cloud[ci];
+                    int best = -1; double bestD2 = std::numeric_limits<double>::max();
+                    for (int v = 0; v < N; v += depthVertexStride) {
+                        const double d2 =
+                            (Vcam.row(v).transpose().cast<double>() - tp).squaredNorm();
+                        if (d2 < bestD2) { bestD2 = d2; best = v; }
+                    }
+                    if (best >= 0) dcorr.push_back({best, tp, cloudNormals[f][ci], bestD2});
+                }
+                double trimD2 = std::numeric_limits<double>::max();
+                if (!dcorr.empty()) {
+                    std::vector<double> ds; ds.reserve(dcorr.size());
+                    for (const DCorr& c : dcorr) ds.push_back(c.d2);
+                    std::sort(ds.begin(), ds.end());
+                    trimD2 = ds[std::min(ds.size()-1, size_t(ds.size()*0.80))];
+                }
+                for (const DCorr& c : dcorr) {
+                    if (c.d2 > trimD2) continue;
+                    ++totalDepth;
+                    const Eigen::Vector3d exprOffset = proj::BFM_TO_CAM.cast<double>() *
+                        exprFlat.segment(3 * c.vertex, 3).cast<double>();
+                    problem.AddResidualBlock(
+                        new ceres::AutoDiffCostFunction<DepthPointResidual,
+                            4, 3, 3, kShapeCoefficientCount>(
+                            new DepthPointResidual(
+                                meanShape.row(c.vertex).transpose(), c.vertex,
+                                shapeBasis, shapeSigma,
+                                c.target, c.normal, depthPointToPlaneWeight, exprOffset)),
+                        new ceres::ScaledLoss(new ceres::HuberLoss(22.0),
+                                              sqrtDepthWeight * sqrtDepthWeight,
+                                              ceres::TAKE_OWNERSHIP),
+                        aa[f].data(), tt[f].data(), id.data());
+                }
+            }
+
+            // per-frame expression prior + bounds.
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<CoeffPriorResidual<kExpressionCoefficientCount>,
+                    kExpressionCoefficientCount, kExpressionCoefficientCount>(
+                    new CoeffPriorResidual<kExpressionCoefficientCount>(exprRegWeight)),
+                nullptr, ex[f].data());
+            for (int j = 0; j < kExpressionCoefficientCount; ++j) {
+                problem.SetParameterLowerBound(ex[f].data(), j, -3.5);
+                problem.SetParameterUpperBound(ex[f].data(), j,  3.5);
+            }
+            if (problem.HasParameterBlock(tt[f].data())) {
+                problem.SetParameterLowerBound(tt[f].data(), 2, zMin);
+                problem.SetParameterUpperBound(tt[f].data(), 2, zMax);
+            }
+            if (problem.HasParameterBlock(aa[f].data()))
+                for (int a = 0; a < 3; ++a) {
+                    problem.SetParameterLowerBound(aa[f].data(), a, -1.5);
+                    problem.SetParameterUpperBound(aa[f].data(), a,  1.5);
+                }
+        }
+
+        // Shared identity prior. With depth, scale by the (per-frame-average)
+        // point count to prevent railing; without depth keep it fixed and low —
+        // multi-view landmark/contour parallax over F frames is what safely
+        // constrains α (paper w_reg≈0).
+        const double effReg = anyDepth
+            ? regularizationWeight *
+                  std::max(1.0, (totalDepth / static_cast<double>(F)) / 600.0)
+            : regularizationWeight;
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<ShapeRegularizationResidual,
+                kShapeCoefficientCount, kShapeCoefficientCount>(
+                new ShapeRegularizationResidual(effReg)),
+            nullptr, id.data());
+        for (int k = 0; k < kShapeCoefficientCount; ++k) {
+            problem.SetParameterLowerBound(id.data(), k, -3.0);
+            problem.SetParameterUpperBound(id.data(), k,  3.0);
+        }
+        if (problem.HasParameterBlock(&focal))
+            problem.SetParameterBlockConstant(&focal);   // intrinsics fixed here
+
+        ceres::Solver::Options options;
+        options.linear_solver_type = ceres::DENSE_QR;
+        options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+        options.max_num_iterations = 40;
+        options.minimizer_progress_to_stdout = false;
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
+
+        double idNorm = 0.0; for (double v : id) idNorm += v * v;
+        std::cout << "  bundle outer " << outer << " | contour " << totalContour
+                  << (anyDepth ? " | depth " + std::to_string(totalDepth) : "")
+                  << " | |id|=" << std::sqrt(idNorm)
+                  << " | " << summary.BriefReport() << '\n';
+    }
+
+    BundleResult out;
+    out.identity.resize(kShapeCoefficientCount);
+    for (int k = 0; k < kShapeCoefficientCount; ++k) out.identity(k) = id[k];
+    out.poses.resize(F); out.exprs.resize(F);
+    for (int f = 0; f < F; ++f) {
+        out.poses[f].angleAxis   = Eigen::Vector3d(aa[f][0], aa[f][1], aa[f][2]);
+        out.poses[f].translation = Eigen::Vector3d(tt[f][0], tt[f][1], tt[f][2]);
+        out.exprs[f].resize(kExpressionCoefficientCount);
+        for (int j = 0; j < kExpressionCoefficientCount; ++j) out.exprs[f](j) = ex[f][j];
+    }
+    std::cout << "Identity bundle done. |id|=" << out.identity.norm() << '\n';
+    return out;
 }
 
 // Estimate a per-point surface normal via k-nearest-neighbour PCA (smallest
@@ -1652,7 +2025,9 @@ FitParameters CeresFitter::fitPhotometric(
     bool                              optimizeAlbedo,
     bool                              optimizePose,
     const DenseIterationCallback&     onIteration,
-    int                               maxImageWidth
+    int                               maxImageWidth,
+    const std::vector<LandmarkObservation>* landmarks,
+    double                            landmarkWeight
 )
 {
     if (shapeBasis.cols() < kShapeCoefficientCount ||
@@ -1883,6 +2258,27 @@ FitParameters CeresFitter::fitPhotometric(
                                          angleAxis, translation, shapeCoefficients);
             }
 
+        // (d2) JOINT landmark term (Face2Face E_lan): anchor the shape solve to
+        //      the detected interior landmarks so the low-reg dense photometric
+        //      cannot drift the geometry via shape-from-shading ambiguity. Same
+        //      pose+shape blocks as the pixel residuals. Observations are in
+        //      full-res pixels → scale to the working resolution (K was scaled
+        //      by `scale`). Only when the caller opts in (landmarks + weight>0).
+        if (solveGeometry && landmarks && landmarkWeight > 0.0) {
+            for (const LandmarkObservation& o : *landmarks) {
+                if (o.vertexIndex < 0 || o.vertexIndex >= meanShape.rows()) continue;
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<LandmarkShapeReprojectionResidual,
+                        2, 3, 3, kShapeCoefficientCount>(
+                        new LandmarkShapeReprojectionResidual(
+                            meanShape.row(o.vertexIndex).transpose(), o.vertexIndex,
+                            shapeBasis, shapeSigma, o.imagePoint * scale, K)),
+                    new ceres::ScaledLoss(new ceres::HuberLoss(4.0),
+                                          landmarkWeight, ceres::TAKE_OWNERSHIP),
+                    angleAxis, translation, shapeCoefficients);
+            }
+        }
+
         if (used == 0) {
             std::cout << "  photo " << it
                       << " | no covered pixels — stopping\n";
@@ -1926,8 +2322,10 @@ FitParameters CeresFitter::fitPhotometric(
 
         const double rmse = std::sqrt(sumSquared / used);   // render−photo RMSE, [0,1]
         std::cout << "  photo " << it << " | pixels " << used
-                  << " | render-photo RMSE(before solve) " << rmse << " | "
-                  << summary.BriefReport() << '\n';
+                  << " | render-photo RMSE(before solve) " << rmse;
+        if (solveGeometry) std::cout << " | " << summary.BriefReport();
+        else               std::cout << " | linear appearance estimate only";
+        std::cout << '\n';
 
         if (onIteration) {
             FitParameters current;
@@ -1961,4 +2359,257 @@ FitParameters CeresFitter::fitPhotometric(
               << "\n  albedoCoeff=" << result.albedoCoefficients.transpose()
               << "\n  sh(DC rgb)="  << result.sh.row(0) << '\n';
     return result;
+}
+
+Eigen::VectorXd CeresFitter::fitIdentityPhotometricBundle(
+    const Eigen::MatrixX3f&          meanShape,
+    const Eigen::MatrixXf&           shapeBasis,
+    const Eigen::VectorXf&           shapeSigma,
+    const Eigen::MatrixXf&           exprBasis,
+    const Eigen::VectorXf&           exprSigma,
+    const Eigen::MatrixX3i&          triangles,
+    const Eigen::MatrixX3f&          meanAlbedo,
+    const Eigen::MatrixXf&           colorBasis,
+    const Eigen::VectorXf&           colorSigma,
+    const std::vector<cv::Mat>&      bgrs,
+    const std::vector<std::vector<LandmarkObservation>>& observations,
+    const std::vector<PoseParameters>&  poses,
+    const std::vector<Eigen::VectorXd>& exprs,
+    const Eigen::Matrix3f&           intrinsics,
+    const Eigen::VectorXd&           alphaInit,
+    Eigen::VectorXd&                 betaOut,
+    light::SHCoeffs&                 shOut,
+    double                           shapeReg,
+    double                           albedoReg,
+    double                           landmarkWeight,
+    int                              numIterations,
+    int                              pixelStride,
+    int                              maxImageWidth)
+{
+    const int F = static_cast<int>(bgrs.size());
+    Eigen::VectorXd alphaV = alphaInit;
+    if (F == 0) return alphaV;
+    if (pixelStride < 1) pixelStride = 1;
+    const int N = static_cast<int>(meanShape.rows());
+    const Eigen::Matrix3d Mm = proj::BFM_TO_CAM.cast<double>();
+
+    // Shared identity basis (camera-aligned), precomputed once.
+    std::vector<std::array<Eigen::Vector3d, kShapeCoefficientCount>> vBasis(N);
+    for (int v = 0; v < N; ++v)
+        for (int k = 0; k < kShapeCoefficientCount; ++k)
+            vBasis[v][k] = Mm * Eigen::Vector3d(shapeBasis(3*v+0,k)*shapeSigma(k),
+                                                shapeBasis(3*v+1,k)*shapeSigma(k),
+                                                shapeBasis(3*v+2,k)*shapeSigma(k));
+
+    // Per-keyframe setup (once): downscale image + K, build the differentiable
+    // input image, the neutral+expression base shape, camera-aligned vMean, and
+    // a renderer. Pose is a constant parameter block (α is the only free one).
+    std::vector<cv::Mat>                        rgbF(F);
+    std::vector<int>                            Hf(F), Wf(F);
+    std::vector<double>                         scaleF(F);
+    std::vector<Eigen::Matrix3f>                Kf(F);
+    std::vector<std::vector<double>>            imageData(F);
+    std::vector<std::unique_ptr<PhotoGrid>>     grids(F);
+    std::vector<std::unique_ptr<PhotoInterp>>   interps(F);
+    std::vector<Eigen::MatrixX3f>               exprShape(F);   // mean + expr_f
+    std::vector<std::vector<Eigen::Vector3d>>   vMeanF(F, std::vector<Eigen::Vector3d>(N));
+    std::vector<std::array<double, 3>>          aaK(F), ttK(F);
+    std::vector<Eigen::Matrix3f>                Rf(F);
+    std::vector<Eigen::Vector3f>                tf(F);
+    std::vector<std::unique_ptr<Renderer>>      renderers(F);
+
+    for (int f = 0; f < F; ++f) {
+        const double s = std::min(1.0, static_cast<double>(maxImageWidth) / bgrs[f].cols);
+        cv::Mat scaled; cv::resize(bgrs[f], scaled, cv::Size(), s, s, cv::INTER_AREA);
+        scaleF[f] = s;
+        Kf[f] = intrinsics;
+        Kf[f](0,0) *= float(s); Kf[f](1,1) *= float(s);
+        Kf[f](0,2) *= float(s); Kf[f](1,2) *= float(s);
+        Hf[f] = scaled.rows; Wf[f] = scaled.cols;
+        cv::Mat rgb; cv::cvtColor(scaled, rgb, cv::COLOR_BGR2RGB);
+        rgb.convertTo(rgb, CV_32FC3, bgrs[f].depth() == CV_8U ? 1.0/255.0 : 1.0);
+        rgbF[f] = rgb;
+        imageData[f].resize(size_t(Hf[f]) * Wf[f] * 3);
+        for (int y = 0; y < Hf[f]; ++y)
+            for (int x = 0; x < Wf[f]; ++x) {
+                const cv::Vec3f& px = rgb.at<cv::Vec3f>(y, x);
+                const size_t idx = (size_t(y) * Wf[f] + x) * 3;
+                imageData[f][idx+0]=px[0]; imageData[f][idx+1]=px[1]; imageData[f][idx+2]=px[2];
+            }
+        grids[f]   = std::make_unique<PhotoGrid>(imageData[f].data(), 0, Hf[f], 0, Wf[f]);
+        interps[f] = std::make_unique<PhotoInterp>(*grids[f]);
+
+        // base shape = mean + expression_f (identity added per iteration via α).
+        Eigen::VectorXf ecoef(kExpressionCoefficientCount);
+        for (int j = 0; j < kExpressionCoefficientCount; ++j)
+            ecoef(j) = (j < exprs[f].size()) ? float(exprs[f](j)) : 0.0f;
+        const Eigen::VectorXf exprFlat = exprBasis.leftCols(kExpressionCoefficientCount) *
+            exprSigma.head(kExpressionCoefficientCount).cwiseProduct(ecoef);
+        exprShape[f] = meanShape;
+        for (int v = 0; v < N; ++v)
+            exprShape[f].row(v) += exprFlat.segment(3*v, 3).transpose();
+        for (int v = 0; v < N; ++v)
+            vMeanF[f][v] = Mm * exprShape[f].row(v).transpose().cast<double>();
+
+        Rf[f] = poses[f].rotationMatrix();
+        tf[f] = poses[f].translation.cast<float>();
+        const Eigen::AngleAxisd aaEig(Rf[f].cast<double>());
+        const Eigen::Vector3d av = aaEig.angle() * aaEig.axis();
+        aaK[f] = {av.x(), av.y(), av.z()};
+        ttK[f] = {poses[f].translation.x(), poses[f].translation.y(), poses[f].translation.z()};
+        renderers[f] = std::make_unique<Renderer>(Hf[f], Wf[f], triangles);
+    }
+
+    const int Kb = std::min<int>({kAlbedoCoefficientCount,
+                                  int(colorBasis.cols()), int(colorSigma.size())});
+    Eigen::VectorXd beta = (betaOut.size() == Kb) ? betaOut : Eigen::VectorXd::Zero(std::max(Kb,0));
+    light::SHCoeffs sh = light::defaultWhite();
+    std::array<double, kShapeCoefficientCount> alpha{};
+    for (int k = 0; k < kShapeCoefficientCount && k < alphaV.size(); ++k) alpha[k] = alphaV(k);
+
+    // Multi-frame appearance sample: a visible vertex in one keyframe, with its
+    // camera-frame normal (pose-dependent) and observed colour.
+    struct BSample { int vertex; Eigen::Vector3f n; Eigen::Vector3d obs; };
+
+    std::cout << "\nPHOTOMETRIC BUNDLE: " << F << " keyframes @ " << maxImageWidth
+              << "px, refining shared identity\n";
+
+    for (int it = 0; it < numIterations; ++it) {
+        // (1) current shape per keyframe (mean + expr_f + α), normals, samples.
+        Eigen::VectorXf ac(kShapeCoefficientCount);
+        for (int k = 0; k < kShapeCoefficientCount; ++k) ac(k) = float(alpha[k]);
+        const Eigen::VectorXf idFlat = shapeBasis.leftCols(kShapeCoefficientCount) *
+            shapeSigma.head(kShapeCoefficientCount).cwiseProduct(ac);
+
+        std::vector<Eigen::MatrixX3f> shapeF(F);
+        std::vector<BSample> samples;
+        for (int f = 0; f < F; ++f) {
+            shapeF[f] = exprShape[f];
+            for (int v = 0; v < N; ++v) shapeF[f].row(v) += idFlat.segment(3*v,3).transpose();
+            const Eigen::MatrixX3f nCam =
+                proj::normalsToCameraFrame(Renderer::computeNormals(shapeF[f], triangles), Rf[f]);
+            const Eigen::MatrixX3f camV = proj::toCameraFrame(shapeF[f], Rf[f], tf[f]);
+            const proj::Pixels uv = proj::project(camV, Kf[f]);
+            for (int v = 0; v < N; v += 4) {
+                if (nCam(v,2) >= 0.0f || camV(v,2) <= 1e-3f) continue;
+                const float u = uv(v,0), vp = uv(v,1);
+                if (u < 1.f || vp < 1.f || u >= Wf[f]-2.f || vp >= Hf[f]-2.f) continue;
+                const cv::Vec3f o = rgbF[f].at<cv::Vec3f>(int(vp), int(u));
+                samples.push_back({v, nCam.row(v).transpose(),
+                                   Eigen::Vector3d(o[0], o[1], o[2])});
+            }
+        }
+
+        // (2) shared lighting γ + albedo β (multi-frame linear LS; SH→β→SH).
+        Eigen::MatrixX3f curAlbedo = albedoFromBeta(meanAlbedo, colorBasis, colorSigma, beta);
+        auto estimateSH = [&]() {
+            std::array<Eigen::Matrix<double,9,9>,3> AtA;
+            std::array<Eigen::Matrix<double,9,1>,3> Atb;
+            for (int c = 0; c < 3; ++c) { AtA[c] = 1e-2*Eigen::Matrix<double,9,9>::Identity(); Atb[c].setZero(); }
+            for (const BSample& s : samples) {
+                const Eigen::Matrix<double,9,1> b = light::shBasis(s.n).cast<double>();
+                for (int c = 0; c < 3; ++c) {
+                    const double a = curAlbedo(s.vertex, c);
+                    AtA[c].noalias() += (a*a)*(b*b.transpose());
+                    Atb[c].noalias() += (a*s.obs[c])*b;
+                }
+            }
+            for (int c = 0; c < 3; ++c) sh.col(c) = AtA[c].ldlt().solve(Atb[c]).cast<float>();
+        };
+        if (!samples.empty()) {
+            estimateSH();
+            if (Kb > 0) {
+                Eigen::MatrixXd AtA = albedoReg * Eigen::MatrixXd::Identity(Kb, Kb);
+                Eigen::VectorXd Atb = Eigen::VectorXd::Zero(Kb), row(Kb);
+                for (const BSample& s : samples) {
+                    const Eigen::RowVector3f shading = light::shBasis(s.n).transpose() * sh;
+                    for (int c = 0; c < 3; ++c) {
+                        const double sc = shading(c);
+                        for (int k = 0; k < Kb; ++k)
+                            row(k) = sc * colorBasis(3*s.vertex+c, k) * colorSigma(k);
+                        const double target = s.obs[c] - sc * meanAlbedo(s.vertex, c);
+                        AtA.noalias() += row * row.transpose();
+                        Atb.noalias() += row * target;
+                    }
+                }
+                beta = AtA.ldlt().solve(Atb).cwiseMax(-3.0).cwiseMin(3.0);
+                curAlbedo = albedoFromBeta(meanAlbedo, colorBasis, colorSigma, beta);
+                estimateSH();
+            }
+        }
+
+        // (3) joint α solve: dense photometric (E_col) + landmarks (E_lan) from
+        //     ALL keyframes, per-frame pose fixed → shared α.
+        ceres::Problem problem;
+        long usedPix = 0;
+        for (int f = 0; f < F; ++f) {
+            const RenderInput in{ .shape = shapeF[f], .albedo = curAlbedo,
+                .R = Rf[f], .t = tf[f], .K = Kf[f], .sh = sh };
+            const RenderOutput out = renderers[f]->render(in);
+            for (int y = 0; y < Hf[f]; y += pixelStride)
+                for (int x = 0; x < Wf[f]; x += pixelStride) {
+                    if (!out.mask.at<uchar>(y,x)) continue;
+                    const int tri = out.triIdx.at<int>(y,x);
+                    if (tri < 0) continue;
+                    const cv::Vec3f rc = out.image.at<cv::Vec3f>(y,x);
+                    const Eigen::Vector3d target(rc[0], rc[1], rc[2]);
+                    const cv::Vec3f bw = out.bary.at<cv::Vec3f>(y,x);
+                    const int i0=triangles(tri,0), i1=triangles(tri,1), i2=triangles(tri,2);
+                    const Eigen::Vector3d bMean =
+                        bw[0]*vMeanF[f][i0] + bw[1]*vMeanF[f][i1] + bw[2]*vMeanF[f][i2];
+                    std::array<Eigen::Vector3d, kShapeCoefficientCount> bBasis;
+                    for (int k = 0; k < kShapeCoefficientCount; ++k)
+                        bBasis[k] = bw[0]*vBasis[i0][k] + bw[1]*vBasis[i1][k] + bw[2]*vBasis[i2][k];
+                    problem.AddResidualBlock(
+                        new ceres::AutoDiffCostFunction<PhotometricPixelResidual, 3,
+                            3, 3, kShapeCoefficientCount>(
+                            new PhotometricPixelResidual(bMean, bBasis, target, Kf[f],
+                                                         *interps[f], 1.0)),
+                        new ceres::HuberLoss(0.1),
+                        aaK[f].data(), ttK[f].data(), alpha.data());
+                    ++usedPix;
+                }
+            // E_lan anchor (interior landmarks) at the working resolution.
+            for (const LandmarkObservation& o : observations[f]) {
+                if (o.vertexIndex < 0 || o.vertexIndex >= N) continue;
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<LandmarkShapeReprojectionResidual,
+                        2, 3, 3, kShapeCoefficientCount>(
+                        new LandmarkShapeReprojectionResidual(
+                            exprShape[f].row(o.vertexIndex).transpose(), o.vertexIndex,
+                            shapeBasis, shapeSigma, o.imagePoint * scaleF[f], Kf[f])),
+                    new ceres::ScaledLoss(new ceres::HuberLoss(4.0),
+                                          landmarkWeight, ceres::TAKE_OWNERSHIP),
+                    aaK[f].data(), ttK[f].data(), alpha.data());
+            }
+            problem.SetParameterBlockConstant(aaK[f].data());
+            problem.SetParameterBlockConstant(ttK[f].data());
+        }
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<ShapeRegularizationResidual,
+                kShapeCoefficientCount, kShapeCoefficientCount>(
+                new ShapeRegularizationResidual(shapeReg)),
+            nullptr, alpha.data());
+        for (int k = 0; k < kShapeCoefficientCount; ++k) {
+            problem.SetParameterLowerBound(alpha.data(), k, -3.0);
+            problem.SetParameterUpperBound(alpha.data(), k,  3.0);
+        }
+
+        ceres::Solver::Options options;
+        options.linear_solver_type = ceres::DENSE_QR;
+        options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+        options.max_num_iterations = 15;
+        options.minimizer_progress_to_stdout = false;
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
+
+        double idn = 0.0; for (double v : alpha) idn += v*v;
+        std::cout << "  photo-bundle it " << it << " | pixels " << usedPix
+                  << " | |id|=" << std::sqrt(idn) << " | " << summary.BriefReport() << '\n';
+    }
+
+    for (int k = 0; k < kShapeCoefficientCount; ++k) alphaV(k) = alpha[k];
+    betaOut = beta; shOut = sh;
+    std::cout << "Photometric bundle done. |id|=" << alphaV.norm() << '\n';
+    return alphaV;
 }

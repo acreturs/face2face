@@ -55,16 +55,29 @@ LandmarkDetector::LandmarkDetector(const std::string& lbfModelPath,
                                    const std::string& yunetPath,
                                    const std::string& cascadePath)
 {
-    // Preferred: YuNet CNN detector (robust to head pose).
+    // Preferred: YuNet CNN detector (robust to head pose). Its ONNX model needs
+    // OpenCV's >= 4.8 DNN backend — on older builds create() succeeds but the
+    // first detect() throws "Layer id=-1 not found". Guard up front so we fall
+    // back to Haar with an ACTIONABLE message instead of a scary per-frame DNN
+    // error each run.
+    const int ocv = cv::getVersionMajor() * 100 + cv::getVersionMinor();
     if (!yunetPath.empty() && std::filesystem::exists(yunetPath)) {
-        try {
-            yunet_ = cv::FaceDetectorYN::create(
-                yunetPath, "", cv::Size(320, 320),
-                /*score=*/0.6f, /*nms=*/0.3f, /*top_k=*/5000);
-        } catch (const cv::Exception& e) {
-            std::cerr << "LandmarkDetector: YuNet load failed (" << e.what()
-                      << ") — falling back to Haar\n";
-            yunet_.release();
+        if (ocv < 408) {
+            std::cerr << "LandmarkDetector: YuNet needs OpenCV >= 4.8 but this "
+                         "build links " << cv::getVersionMajor() << '.'
+                      << cv::getVersionMinor() << " — using the Haar detector.\n"
+                         "  Rebuild the devcontainer (Dev Containers: Rebuild "
+                         "Container) to get OpenCV 4.9 + YuNet.\n";
+        } else {
+            try {
+                yunet_ = cv::FaceDetectorYN::create(
+                    yunetPath, "", cv::Size(320, 320),
+                    /*score=*/0.6f, /*nms=*/0.3f, /*top_k=*/5000);
+            } catch (const cv::Exception& e) {
+                std::cerr << "LandmarkDetector: YuNet load failed (" << e.what()
+                          << ") — falling back to Haar\n";
+                yunet_.release();
+            }
         }
     }
 
@@ -160,8 +173,19 @@ std::vector<LandmarkObservation> LandmarkDetector::detect(const cv::Mat& bgr)
     if (!faceBox(bgr, box, &yuPts)) return obs;
 
     // LBF 68-point fit on the box (used for the jaw contour, and for the interior
-    // when YuNet is not available).
-    std::vector<cv::Rect> one{box};
+    // when YuNet is not available). LBF was trained on Haar-style boxes; YuNet's
+    // tighter rectangle systematically shifts its regression. A centred square
+    // at 1.1× the larger side scored closest to the Haar convention (measured
+    // against MediaPipe landmarks on Biwi frames).
+    cv::Rect lbfBox = box;
+    if (!yuPts.empty()) {
+        const int side = static_cast<int>(1.1f * std::max(box.width, box.height));
+        lbfBox = cv::Rect(box.x + box.width / 2 - side / 2,
+                          box.y + box.height / 2 - side / 2, side, side);
+        lbfBox &= cv::Rect(0, 0, bgr.cols, bgr.rows);
+        if (lbfBox.area() <= 0) lbfBox = box;
+    }
+    std::vector<cv::Rect> one{lbfBox};
     std::vector<std::vector<cv::Point2f>> landmarks;
     const bool haveLbf = facemark_->fit(bgr, one, landmarks) &&
                          !landmarks.empty() && landmarks[0].size() >= 68;

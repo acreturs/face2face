@@ -21,25 +21,58 @@ import re
 import sys
 
 import cv2
-import mediapipe as mp
+
+try:
+    import mediapipe as mp
+except ImportError:
+    sys.exit(
+        "mediapipe is not installed.\n"
+        "  It is baked into the devcontainer image — the usual fix is to REBUILD\n"
+        "  the container (Dev Containers: Rebuild Container).\n"
+        "  For a quick one-off install in the current container instead:\n"
+        "    pip3 install --break-system-packages --no-deps mediapipe==0.10.18\n"
+        "    pip3 install --break-system-packages 'protobuf>=4.25.3,<5' "
+        "attrs flatbuffers absl-py")
 
 # MediaPipe canonical-mesh index -> BFM vertex index (subject-anatomical on
 # both sides; verified against the BFM named-landmark table).
 # 468/473 are the iris centres (refine_landmarks=True).
+#
+# 21 interior points, not 8: the original set (irises, nose tip, 4 mouth
+# points, chin) is nearly COPLANAR, which leaves pitch/yaw poorly conditioned —
+# small landmark noise tips the whole pose, worst on side views. Eye corners,
+# eyelids, brows and the subnasale add depth variation and lateral spread; the
+# solver's Huber loss handles the ones MediaPipe regresses while occluded.
 MP_TO_BFM = [
     (468,  4540),   # right.eye.pupil.center
     (473, 11681),   # left.eye.pupil.center
     (1,    8156),   # center.nose.tip
+    (2,    8168),   # center.nose.attachement_to_philtrum (subnasale)
     (61,   5779),   # right.lips.corner
     (291, 10598),   # left.lips.corner
     (0,    8181),   # center.lips.upper.outer  (vertical mouth signal)
     (17,   8199),   # center.lips.lower.outer
     (152, 47844),   # center.chin.tip
+    (33,   2736),   # right.eye.corner_outer
+    (133,  6219),   # right.eye.corner_inner
+    (362,  9892),   # left.eye.corner_inner
+    (263, 13360),   # left.eye.corner_outer
+    (159,  4663),   # right.eye.top
+    (145,  4417),   # right.eye.bottom
+    (386, 11546),   # left.eye.top
+    (374, 11687),   # left.eye.bottom
+    (105, 39560),   # right.eyebrow.bend.upper
+    (107, 40088),   # right.eyebrow.inner_upper
+    (334, 41360),   # left.eyebrow.bend.upper
+    (336, 40827),   # left.eyebrow.inner_upper
 ]
 
 # Jawline (from FACEMESH_FACE_OVAL, sides only) -> contour observations (-1).
-MP_JAW = [58, 172, 136, 150,      # subject-right side
-          288, 397, 365, 379]     # subject-left side
+# 7 per side (was 4): the extra ear-adjacent (132/361) and chin-adjacent
+# (176/148, 400/378) points tighten the silhouette that constrains face
+# width/length — the identity signal the interior landmarks cannot provide.
+MP_JAW = [132, 58, 172, 136, 150, 176, 148,      # subject-right side
+          361, 288, 397, 365, 379, 400, 378]     # subject-left side
 
 _mesh = None
 

@@ -188,10 +188,13 @@ std::vector<bool> Renderer::backfaceMask(const Eigen::MatrixX3f& V_cam,
         const Eigen::Vector3f v1 = V_cam.row(triangles(f, 1));
         const Eigen::Vector3f v2 = V_cam.row(triangles(f, 2));
 
-        // z-component of (v1 - v0) × (v2 - v0); front-facing when negative
-        const float n_z = (v1.x() - v0.x()) * (v2.y() - v0.y()) -
-                          (v1.y() - v0.y()) * (v2.x() - v0.x());
-        frontFacing.push_back(n_z < 0);
+        // Perspective-correct facing test: the triangle faces the camera when
+        // its normal points against the VIEW RAY to it, i.e. n·v0 < 0 (camera
+        // at the origin). The previous n_z-only test is the orthographic
+        // approximation and mislabels grazing triangles near the silhouette —
+        // exactly the region the contour matcher and photometric term rely on.
+        const Eigen::Vector3f n = (v1 - v0).cross(v2 - v0);
+        frontFacing.push_back(n.dot(v0) < 0.0f);
     }
 
     return frontFacing;
