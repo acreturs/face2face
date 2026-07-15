@@ -86,6 +86,15 @@ public:
     // rotation solved as a local perturbation on SO(3).
     static bool photoGpuAnalytic;
 
+    // 0 = use every covered pixel (old behaviour). >0 = per outer iteration,
+    // randomly sample this many covered pixels instead. re-sampled each
+    // iteration so over the whole fit all pixels get used (--photo-samples K).
+    static int photoSamples;
+
+    // when set (--photo-csv path), fitPhotometric appends one row per outer
+    // iteration so the convergence can be plotted without scraping stdout.
+    static std::string photoCsvPath;
+
     // Stage 1: pose only. zMin/zMax bound the face depth (mm).
     static PoseParameters fitPose(
         const Eigen::MatrixX3f& shape,

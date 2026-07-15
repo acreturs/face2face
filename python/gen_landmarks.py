@@ -1,17 +1,17 @@
-"""Detect 2D face landmarks in an image and write the C++ solver input file
-(one line per landmark: `bfm_vertex_index u v`). Works for any RGB image, so the
-same tool feeds both the iPhone and the Biwi sparse fit.
+"""detect 2d face landmarks in an image and write the input file for the c++
+solver (one line per landmark: bfm_vertex_index u v)
+works on any rgb image so the same tool feeds both the iphone and biwi fits
 
-Two landmark sets, chosen per scenario:
-  --set small  (default) 9 reliable points — for the iPhone / sparse-only fit
-  --set dense            25 points          — for the Biwi / dense scenario
+two landmark sets to pick from
+  --set small  (default) 9 reliable points for the iphone sparse fit
+  --set dense  25 points for the biwi dense fit
 
-Add --contour to also emit the dlib jawline points as CONTOUR observations,
-written with vertex index -1 (the C++ solver assigns each to the nearest model
-silhouette vertex dynamically, since the BFM has no named jaw landmarks). These
-constrain the face width/outline, which the interior points cannot.
+--contour also writes the dlib jawline points as contour observations with
+vertex index -1, which the c++ solver matches to the nearest silhouette vertex
+since the bfm has no named jaw landmarks
+these pin down the face width and outline that the interior points cannot
 
-Usage (from project root):
+usage from the project root
   python3 python/gen_landmarks.py <image.png> <out_landmarks.txt> [debug.png]
   python3 python/gen_landmarks.py --set small --contour data/iphone/default/RGB/000000_RGB.png \
           data/iphone/default/landmarks_000000.txt
@@ -36,9 +36,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BFM_PATH = os.path.join(ROOT, "data", "bfm", "model2017-1_bfm_nomouth.h5")
 
 
-# dlib/LBF 68-pt jawline is indices 0..16 (0 = right ear side, 8 = chin,
-# 16 = left ear side). We emit the sides (skip the ear-adjacent endpoints and
-# the chin, which the named set already covers) as contour observations.
+# the dlib 68-pt jawline is indices 0..16 (0 right ear, 8 chin, 16 left ear)
+# we emit the side points as contour observations and skip the endpoints and
+# the chin that the named set already covers
 JAW_CONTOUR_LBF = [1, 3, 5, 7, 9, 11, 13, 15]
 
 
@@ -46,7 +46,7 @@ def main() -> None:
     args = sys.argv[1:]
     mapping = LBF68_TO_BFM_SMALL
     emit_contour = False
-    # additive flags in any order before the positional args
+    # flags in any order before the positional args
     while args and args[0].startswith("--"):
         if args[0] == "--set":
             mapping = {"small": LBF68_TO_BFM_SMALL,
@@ -86,7 +86,7 @@ def main() -> None:
         if emit_contour:
             for idx in JAW_CONTOUR_LBF:
                 u, v = landmarks[idx]
-                f.write(f"-1 {u:.6f} {v:.6f}\n")   # -1 = contour, matched in C++
+                f.write(f"-1 {u:.6f} {v:.6f}\n")   # -1 is a contour point matched in c++
                 n_contour += 1
     print(f"[landmarks] {len(pts2d)} fixed + {n_contour if emit_contour else 0} "
           f"contour points -> {out_path}")

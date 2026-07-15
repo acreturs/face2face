@@ -2,10 +2,10 @@
 #include <chrono>
 #include <cstdio>
 
-// Minimal RAII wall-clock timer for per-stage profiling (realtime plan,
-// Phase 0). Printing is gated on the global flag (set by --timers); when off,
-// a timer costs two clock reads. Optionally accumulates into *accumMs so a
-// loop can report totals (e.g. the live-mode FPS HUD).
+// tiny stopwatch for the per-stage timings. make one at the top of a block and
+// it prints how long the block took when it goes out of scope. printing only
+// happens when the global flag is on which --timers flips. you can also pass an
+// accumulator so a loop can add all its times together
 struct ScopedTimer {
     static inline bool enabled = false;
 

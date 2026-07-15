@@ -1,13 +1,9 @@
-// =============================================================================
-// CudaRenderer — host side of the CUDA rasteriser.
-//
-// Runs the same vertex stage as the CPU Renderer (so the projected pixels,
-// normals and shaded colours are bit-identical), flattens the results into
-// plain float arrays, and hands them to the CUDA launchers in cuda_raster.cu
-// through a C ABI. Deliberately includes NO CUDA headers — all device work is
-// behind the three extern "C" functions — so this file is compiled by g++ and
-// only linked against the nvcc-built object.
-// =============================================================================
+// host side of the cuda rasteriser
+// it runs the same vertex stage as the cpu Renderer so the pixels, normals
+// and colours match, then flattens everything into plain float arrays and
+// hands them to the launchers in cuda_raster.cu through a C ABI
+// on purpose there are no cuda headers here so g++ can compile this file and
+// it just links against the nvcc built object
 #include "CudaRenderer.h"
 #include "ProjectionUtils.h"
 #include "Lighting.h"
@@ -15,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-// ── launchers implemented in cuda_raster.cu (nvcc) ──────────────────────────
+// these launchers live in cuda_raster.cu, built by nvcc
 extern "C" {
 void* cudaRasterCreate(int H, int W, const int* tris, int numTris);
 void  cudaRasterRender(void* handle,
@@ -29,8 +25,8 @@ void  cudaRasterDestroy(void* handle);
 CudaRenderer::CudaRenderer(int height, int width, Eigen::MatrixX3i triangles)
     : H_(height), W_(width), triangles_(std::move(triangles))
 {
-    // Eigen matrices are column-major by default, so flatten the triangle list
-    // into a row-major (i0,i1,i2 per face) buffer the kernel indexes directly.
+    // eigen is column major by default so flatten the triangle list into a
+    // row major buffer of i0 i1 i2 per face that the kernel can index directly
     const int M = static_cast<int>(triangles_.rows());
     std::vector<int> tris(static_cast<size_t>(M) * 3);
     for (int f = 0; f < M; ++f) {
@@ -68,14 +64,14 @@ RenderOutput CudaRenderer::render(const RenderInput& in) const
 {
     const int N = static_cast<int>(in.shape.rows());
 
-    // ── vertex stage on the CPU (identical to Renderer::render Steps 2 & 5) ──
+    // vertex stage on the cpu, same as Renderer::render
     const Eigen::MatrixX3f V_cam  = proj::toCameraFrame(in.shape, in.R, in.t);
     const proj::Pixels     uv     = proj::project(V_cam, in.K);
     const Eigen::MatrixX3f Nrm    = Renderer::computeNormals(in.shape, triangles_);
     const Eigen::MatrixX3f N_cam  = proj::normalsToCameraFrame(Nrm, in.R);
     const Eigen::MatrixX3f shaded = light::shadeVertices(in.albedo, N_cam, in.sh);
 
-    // ── flatten to row-major host arrays for the kernel ─────────────────────
+    // flatten into row major host arrays for the kernel
     std::vector<float> hVcam(static_cast<size_t>(N) * 3);
     std::vector<float> hUv  (static_cast<size_t>(N) * 2);
     std::vector<float> hShad(static_cast<size_t>(N) * 3);
@@ -90,7 +86,7 @@ RenderOutput CudaRenderer::render(const RenderInput& in) const
         hShad[3 * i + 2] = shaded(i, 2);
     }
 
-    // ── outputs: cv::Mat storage is contiguous row-major → copy straight in ──
+    // cv::Mat storage is contiguous row major so the kernel can copy straight in
     RenderOutput out;
     out.image  = cv::Mat(H_, W_, CV_32FC3);
     out.depth  = cv::Mat(H_, W_, CV_32F);

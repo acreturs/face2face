@@ -12,6 +12,7 @@
 #include <Eigen/Geometry>
 
 #include <fstream>
+#include <random>
 #include <iostream>
 #include <stdexcept>
 
@@ -24,8 +25,10 @@
 #include <utility>
 
 // GPU photometric inner solve — off unless --photo-gpu (and a USE_CUDA build).
-bool CeresFitter::usePhotometricGpu = false;
-bool CeresFitter::photoGpuAnalytic  = false;
+bool        CeresFitter::usePhotometricGpu = false;
+bool        CeresFitter::photoGpuAnalytic  = false;
+int         CeresFitter::photoSamples      = 0;
+std::string CeresFitter::photoCsvPath;
 
 #ifdef USE_CUDA
 // Launchers implemented in src/render/cuda_photometric.cu (built by nvcc).
@@ -2027,6 +2030,9 @@ static Eigen::VectorXd estimateAlbedoCoeffs(
 }
 
 #ifdef USE_CUDA
+// small report from the GPU solve so the log can show before/after cost + iters
+struct GpuSolveStats { double costInitial = 0.0, costFinal = 0.0; int iters = 0; };
+
 // Host-side Levenberg–Marquardt driving the CUDA photometric kernels. Replaces
 // the per-pixel Ceres solve inside fitPhotometric when --photo-gpu is set. The
 // per-pixel residual/Jacobian (finite-difference) + normal-equation assembly run
@@ -2044,7 +2050,7 @@ static void solvePhotometricGpu(
     double sqrtWeight, double huberDelta, double shapeRegWeight,
     double tzMin, double tzMax, double shapeLo, double shapeHi,
     double* angleAxis, double* translation, double* shapeCoefficients,
-    bool analytic, int maxIters)
+    bool analytic, int maxIters, GpuSolveStats* stats = nullptr)
 {
     const int poseParams = optimizePose ? 6 : 0;
     const int nP = poseParams + (optimizeShape ? Kshape : 0);
@@ -2116,6 +2122,9 @@ static void solvePhotometricGpu(
                       analytic ? 1 : 0, sqrtWeight, huberDelta, JtJ.data(), Jtr.data(), &cost0);
     addShapePrior(JtJ, Jtr, cost0, shape);
 
+    const double costInitial = cost0;   // for the log / csv
+    int acceptedSteps = 0;
+
     double lambda = 1e-3;
     for (int iter = 0; iter < maxIters; ++iter) {
         Eigen::MatrixXd A(nP, nP);
@@ -2147,6 +2156,7 @@ static void solvePhotometricGpu(
                 cost0  = costT;
                 lambda = std::max(lambda * 0.3, 1e-7);
                 accepted = true;
+                ++acceptedSteps;
                 std::fill(JtJ.begin(), JtJ.end(), 0.0);
                 std::fill(Jtr.begin(), Jtr.end(), 0.0);
                 double c2 = 0.0;
@@ -2163,6 +2173,7 @@ static void solvePhotometricGpu(
 
     for (int i = 0; i < 3; ++i) { angleAxis[i] = aa[i]; translation[i] = t[i]; }
     for (int k = 0; k < Kshape; ++k) shapeCoefficients[k] = shape[k];
+    if (stats) { stats->costInitial = costInitial; stats->costFinal = cost0; stats->iters = acceptedSteps; }
     cudaPhotoDestroy(h);
 }
 #endif  // USE_CUDA
@@ -2379,17 +2390,38 @@ FitParameters CeresFitter::fitPhotometric(
         // GPU path: collect the fixed per-pixel correspondences and solve the
         // whole geometry step on the device (see solvePhotometricGpu). Only when
         // --photo-gpu is set AND geometry is actually solved.
-        const bool gpuSolve = CeresFitter::usePhotometricGpu && solveGeometry;
+        // The GPU inner solve does not (yet) include the joint E_lan landmark
+        // anchor. When the caller supplies that anchor (the personalise IDENTITY
+        // refinement, which relies on it to make a low shape reg safe), stay on
+        // the CPU/Ceres path so we never silently drop it. Pose-only / non-anchored
+        // photometric solves still use the GPU.
+        const bool gpuSolve = CeresFitter::usePhotometricGpu && solveGeometry &&
+                              !(landmarks && landmarkWeight > 0.0);
         std::vector<double> gBase, gBasis, gTarget;
 #endif
+        // Gather the covered pixels first (base grid = pixelStride). If
+        // photoSamples > 0, keep only a random uniform sample of them for this
+        // iteration; re-drawn every outer iteration so across the whole fit all
+        // pixels get used (the stochastic-subsampling speedup). photoSamples==0
+        // keeps every pixel, i.e. the old behaviour.
+        std::vector<cv::Point> pts;
+        for (int y = 0; y < H; y += pixelStride)
+            for (int x = 0; x < W; x += pixelStride)
+                if (out.mask.at<uchar>(y, x) && out.triIdx.at<int>(y, x) >= 0)
+                    pts.emplace_back(x, y);
+        if (CeresFitter::photoSamples > 0 &&
+            static_cast<int>(pts.size()) > CeresFitter::photoSamples) {
+            std::mt19937 rng(1234u + static_cast<unsigned>(it));   // varies per outer iter
+            std::shuffle(pts.begin(), pts.end(), rng);
+            pts.resize(static_cast<size_t>(CeresFitter::photoSamples));
+        }
+
         ceres::Problem problem;
         int used = 0;
         double sumSquared = 0.0;
-        for (int y = 0; y < H; y += pixelStride)
-            for (int x = 0; x < W; x += pixelStride) {
-                if (!out.mask.at<uchar>(y, x)) continue;
+        for (const cv::Point& pt : pts) {
+                const int x = pt.x, y = pt.y;
                 const int f = out.triIdx.at<int>(y, x);
-                if (f < 0) continue;
 
                 // target = rendered colour at this pixel (render() output).
                 const cv::Vec3f rc = out.image.at<cv::Vec3f>(y, x);
@@ -2476,20 +2508,27 @@ FitParameters CeresFitter::fitPhotometric(
 
         std::string solverReport;
         ceres::Solver::Summary summary;
+        double costInitial = 0.0, costFinal = 0.0;   // cost before/after this solve
         if (solveGeometry) {
 #ifdef USE_CUDA
             if (gpuSolve) {
                 const int P = static_cast<int>(gTarget.size() / 3);
+                GpuSolveStats st;
                 solvePhotometricGpu(
                     rgb, K, gBase, gBasis, gTarget, P, kShapeCoefficientCount,
                     optimizePose, optimizeShape, sqrtWeight, /*huberDelta=*/0.1,
                     shapeRegWeight, /*tzMin=*/100.0, /*tzMax=*/3000.0,
                     /*shapeLo=*/-3.0, /*shapeHi=*/3.0,
                     angleAxis, translation, shapeCoefficients,
-                    CeresFitter::photoGpuAnalytic, /*maxIters=*/25);
+                    CeresFitter::photoGpuAnalytic, /*maxIters=*/25, &st);
+                costInitial = st.costInitial;
+                costFinal   = st.costFinal;
                 solverReport = std::string("GPU-LM (")
                              + (CeresFitter::photoGpuAnalytic ? "analytic" : "finite-diff")
-                             + ")  pixels " + std::to_string(P);
+                             + ")  pixels " + std::to_string(P)
+                             + "  cost " + std::to_string(costInitial)
+                             + " -> " + std::to_string(costFinal)
+                             + "  iters " + std::to_string(st.iters);
             } else
 #endif
             {
@@ -2524,18 +2563,28 @@ FitParameters CeresFitter::fitPhotometric(
             options.max_num_iterations = 25;
             options.minimizer_progress_to_stdout = false;
             ceres::Solve(options, &problem, &summary);
+            costInitial  = summary.initial_cost;
+            costFinal    = summary.final_cost;
             solverReport = summary.BriefReport();
             }
         }
 
-        if (solverReport.empty()) solverReport = summary.BriefReport();
+        if (solverReport.empty())
+            solverReport = solveGeometry ? summary.BriefReport()
+                                         : "linear appearance estimate only";
 
         const double rmse = std::sqrt(sumSquared / used);   // render−photo RMSE, [0,1]
         std::cout << "  photo " << it << " | pixels " << used
-                  << " | render-photo RMSE(before solve) " << rmse;
-        if (solveGeometry) std::cout << " | " << summary.BriefReport();
-        else               std::cout << " | linear appearance estimate only";
-        std::cout << '\n';
+                  << " | render-photo RMSE(before solve) " << rmse
+                  << " | " << solverReport << '\n';
+
+        // optional csv for plotting convergence: one row per outer iteration
+        // columns: iter,pixels,rmse_before,cost_initial,cost_final
+        if (!CeresFitter::photoCsvPath.empty()) {
+            std::ofstream csv(CeresFitter::photoCsvPath, std::ios::app);
+            if (csv) csv << it << ',' << used << ',' << rmse << ','
+                         << costInitial << ',' << costFinal << '\n';
+        }
 
         if (onIteration) {
             FitParameters current;

@@ -1,20 +1,20 @@
-"""MediaPipe landmark COPROCESS for --mode live-cpu.
+"""mediapipe landmark coprocess for --mode live-cpu
 
-The C++ live loop cannot link MediaPipe (Bazel-built), and the offline
-pre-pass obviously cannot run on a camera stream — so this server bridges the
-gap: main.cpp spawns it once, then per frame
+the c++ live loop cannot link mediapipe (bazel-built) and the offline pre-pass
+cannot run on a camera stream, so this server bridges the gap: main.cpp spawns
+it once then per frame
 
-  C++  → stdin : 8-byte header (int32 LE width, int32 LE height) + raw BGR bytes
-  here → stdout: "N\n" then N lines "bfm_vertex_index u v"   (-1 = jaw contour)
+  c++  -> stdin : 8-byte header (int32 le width, int32 le height) + raw bgr bytes
+  here -> stdout: "N\n" then N lines "bfm_vertex_index u v"   (-1 = jaw contour)
 
-using the SAME landmark set as gen_landmarks_mediapipe.py (21 interior + 14
-jaw), so live gets the pose/identity conditioning the offline modes get.
+it uses the same landmark set as gen_landmarks_mediapipe.py (21 interior + 14
+jaw) so live gets the same pose and identity conditioning as the offline modes
 
-Prints "READY" once the (slow) mediapipe import + graph init is done; the C++
-side waits for that line before sending the first frame, and falls back to
-YuNet if it never comes.
+prints "READY" once the slow mediapipe import and graph init is done, the c++
+side waits for that line before sending the first frame and falls back to yunet
+if it never comes
 
-Run manually for debugging:  python3 python/mp_landmark_server.py < /dev/null
+run manually for debugging:  python3 python/mp_landmark_server.py < /dev/null
 """
 import struct
 import sys
@@ -23,7 +23,7 @@ import numpy as np
 
 import mediapipe as mp
 
-# Same mapping as the offline pre-pass — import, don't duplicate.
+# same mapping as the offline pre-pass, import instead of duplicating
 from gen_landmarks_mediapipe import MP_TO_BFM, MP_JAW
 
 
@@ -42,7 +42,7 @@ def main() -> None:
 
     while True:
         hdr = inp.read(8)
-        if len(hdr) < 8:                  # parent closed the pipe — exit
+        if len(hdr) < 8:                  # parent closed the pipe so exit
             return
         w, h = struct.unpack("<ii", hdr)
         need = w * h * 3
@@ -54,7 +54,7 @@ def main() -> None:
             buf += chunk
 
         bgr = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
-        res = mesh.process(np.ascontiguousarray(bgr[:, :, ::-1]))  # BGR→RGB
+        res = mesh.process(np.ascontiguousarray(bgr[:, :, ::-1]))  # bgr to rgb
 
         lines = []
         if res.multi_face_landmarks:

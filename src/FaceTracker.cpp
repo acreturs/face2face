@@ -1,3 +1,6 @@
+// tracks a face through video. personalise() is the expensive one-off, it works
+// out who the person is from the first frame(s). track() runs every frame after
+// with identity frozen
 #include "FaceTracker.h"
 
 #include "ProjectionUtils.h"
@@ -49,6 +52,7 @@ Eigen::MatrixX3f FaceTracker::currentAlbedo() const
     return bfm_.albedo(bf);
 }
 
+// mean landmark reprojection error in pixels for the interior points
 double FaceTracker::interiorRms(const std::vector<LandmarkObservation>& obs,
                                 const Eigen::MatrixX3f& shape,
                                 const PoseParameters& pose) const
@@ -68,6 +72,7 @@ double FaceTracker::interiorRms(const std::vector<LandmarkObservation>& obs,
     return n ? std::sqrt(s / n) : 1e9;
 }
 
+// fit the identity once from a single frame, then commit the tracking state
 bool FaceTracker::personalise(const cv::Mat& bgr,
                               const std::vector<LandmarkObservation>& observations,
                               double initZ,
@@ -109,6 +114,7 @@ bool FaceTracker::personalise(const cv::Mat& bgr,
     return true;
 }
 
+// rough yaw estimate from the nose offset relative to the eye midpoint
 double FaceTracker::yawProxy(const std::vector<LandmarkObservation>& obs)
 {
     Eigen::Vector2d nose(-1, -1), eyeR(-1, -1), eyeL(-1, -1);
@@ -124,6 +130,7 @@ double FaceTracker::yawProxy(const std::vector<LandmarkObservation>& obs)
     return (nose.x() - 0.5 * (eyeL.x() + eyeR.x())) / eyeDist;
 }
 
+// fit one shared identity jointly from several keyframes
 bool FaceTracker::personaliseBundle(
     const std::vector<cv::Mat>& bgrs,
     const std::vector<std::vector<LandmarkObservation>>& obs,
@@ -138,7 +145,7 @@ bool FaceTracker::personaliseBundle(
     const double initZ = initZs[anchor];
     const double zMin = 0.4 * initZ, zMax = 2.5 * initZ;
 
-    // Per-keyframe pose init: cheap landmark-only fit on the mean shape.
+    // per-keyframe pose init, cheap landmark-only fit on the mean shape
     std::vector<BundleFrame> bframes(F);
     for (int f = 0; f < F; ++f) {
         std::vector<LandmarkObservation> interior;
@@ -160,11 +167,11 @@ bool FaceTracker::personaliseBundle(
         cfg_.depthVertexStride);
     identity_ = b.identity;
 
-    // ── Increment 2: dense-photometric identity bundle ──
-    // Refine the shared identity with the per-pixel photometric term (E_col)
-    // from ALL keyframes jointly — the multi-view analysis-by-synthesis the
-    // paper relies on — with per-frame pose+expression fixed from the geometric
-    // bundle. Returns the shared albedo β + lighting γ too.
+    // dense photometric identity bundle: refine the shared identity with the
+    // per-pixel photometric term from all keyframes at once (the multi-view
+    // analysis-by-synthesis the paper leans on), pose and expression per frame
+    // stay fixed from the geometric bundle, also returns shared albedo β and
+    // lighting γ
     if (cfg_.personaliseOptimizeShape) {
         Eigen::VectorXd beta;
         light::SHCoeffs sh;
@@ -182,7 +189,7 @@ bool FaceTracker::personaliseBundle(
         prevSh_ = light::defaultWhite();
     }
 
-    // Commit the tracking state from the frontal anchor keyframe.
+    // commit the tracking state from the frontal anchor keyframe
     prevCentroid_ = centroid(obs[anchor]);
     haveCentroid_ = true;
     gateFails_    = 0;
@@ -196,15 +203,15 @@ bool FaceTracker::personaliseBundle(
     return true;
 }
 
-// Appearance (albedo β + SH lighting) + coarse-to-fine PHOTOMETRIC IDENTITY
-// refinement, then commit the tracking state. Shared by the single-frame and
-// bundle personalise paths. `pose`/`expr` are the reference geometry fit.
+// appearance (albedo β + SH lighting) plus a coarse-to-fine photometric
+// identity refine, then commit the tracking state. shared by the single-frame
+// and bundle personalise paths. pose and expr are the reference geometry fit
 //
-// The depth is too coarse (~3 mm Kinect noise) for the fine surface detail that
-// carries identity; the RGB SHADING carries it. We render the current model,
-// compare per-pixel to the photo, and move SHAPE (+ albedo + lighting) to match
-// (analysis-by-synthesis), coarse-to-fine, pose fixed, with a JOINT landmark
-// anchor (E_col + E_lan) so a low shape-reg cannot drift the geometry.
+// depth is too coarse (~3 mm kinect noise) for the fine surface detail that
+// carries identity, the rgb shading carries it. we render the current model,
+// compare per-pixel to the photo and move shape (+ albedo + lighting) to match
+// (analysis-by-synthesis), coarse-to-fine, pose fixed, with a joint landmark
+// anchor so a low shape-reg can't drift the geometry
 void FaceTracker::finalizeAppearance(const cv::Mat& bgr,
                                      const std::vector<LandmarkObservation>& observations,
                                      const PoseParameters& pose,
@@ -257,6 +264,7 @@ void FaceTracker::finalizeAppearance(const cv::Mat& bgr,
     personalised_ = true;
 }
 
+// run one tracking frame with identity fixed: gate, predict, fit, refine, smooth
 bool FaceTracker::track(const cv::Mat& bgr,
                         const std::vector<LandmarkObservation>& observations,
                         double initZ,
@@ -267,10 +275,10 @@ bool FaceTracker::track(const cv::Mat& bgr,
     if (!haveObs && !depthCloud) return false;   // nothing to fit against
     const double zMin = 0.4 * initZ, zMax = 2.5 * initZ;
 
-    // Detection gating (only meaningful when landmarks drive the frame): reject
-    // a detection whose centroid teleports; after maxGateFails consecutive
-    // rejects assume the head really moved (or tracking is lost) and reset the
-    // gate + motion history so the next detection re-anchors from scratch.
+    // detection gating, only matters when landmarks drive the frame: reject a
+    // detection whose centroid jumps too far. after maxGateFails rejects in a
+    // row assume the head really moved (or we lost track) and reset the gate
+    // and motion history so the next detection re-anchors from scratch
     if (haveObs) {
         const Eigen::Vector2d c = centroid(observations);
         const double gate = cfg_.gateFrac * bgr.cols;
@@ -294,7 +302,7 @@ bool FaceTracker::track(const cv::Mat& bgr,
     }
     ++frameIdx_;
 
-    // Constant-velocity prediction → warm-start where the head is heading.
+    // constant velocity prediction to warm-start where the head is heading
     PoseParameters  initPose = prevPose_;
     Eigen::VectorXd initExpr = prevExpr_;
     if (havePrev2_) {
@@ -321,9 +329,9 @@ bool FaceTracker::track(const cv::Mat& bgr,
     const Eigen::MatrixX3f fitted = bfm_.shape(
         identity_.cast<float>(), geo.exprCoefficients.cast<float>());
 
-    // Phase 4: pyramid photometric pose refinement (coarse → fine), accepted
-    // only if it does not worsen the landmark reprojection — the safeguard that
-    // keeps the (weaker) dense term from dragging the pose off the landmarks.
+    // pyramid photometric pose refine, coarse to fine, kept only if it doesn't
+    // worsen the landmark reprojection, which stops the weaker dense term from
+    // dragging the pose off the landmarks
     if (cfg_.photoRefine && haveObs) {
         ScopedTimer t("track/photoRefine");
         FitParameters ph;
@@ -351,7 +359,7 @@ bool FaceTracker::track(const cv::Mat& bgr,
                       << before << " → " << after << " px)\n";
     }
 
-    // Lighting refresh (linear estimate; every k-th frame).
+    // lighting refresh, linear estimate every k-th frame
     light::SHCoeffs newSh = prevSh_;
     if (cfg_.lightingEvery > 0 && frameIdx_ % cfg_.lightingEvery == 0) {
         ScopedTimer t("track/lighting");
@@ -370,14 +378,12 @@ bool FaceTracker::track(const cv::Mat& bgr,
         newSh = photo.sh;
     }
 
-    // Temporal smoothing (EMA) on pose + expression to damp jitter.
-    // ADAPTIVE: heavy smoothing at rest (damps solver noise), light smoothing
-    // under real motion — a fixed α visibly lagged the overlay behind fast
-    // head turns. Motion is measured raw-fit vs previous smoothed state;
-    // ~6°/frame of rotation, ~40 mm/frame of translation, or a fast
-    // expression change (a mouth opening is ‖Δδ‖ ≈ 1+/frame — without this
-    // term the EMA damped articulation onset just like pose lag) pushes α
-    // toward pass-through.
+    // temporal smoothing (EMA) on pose + expression to damp jitter
+    // adaptive, heavy smoothing at rest to kill solver noise, light smoothing
+    // under real motion since a fixed α lagged the overlay behind fast head
+    // turns. motion is raw-fit vs previous smoothed state, about 6°/frame of
+    // rotation, 40 mm/frame of translation or a fast expression change (a mouth
+    // opening is ‖Δδ‖ ≈ 1+/frame) pushes α toward pass-through
     const double exprDelta = (prevExpr_.size() == geo.exprCoefficients.size())
         ? (geo.exprCoefficients - prevExpr_).norm() : 0.0;
     const double motion =

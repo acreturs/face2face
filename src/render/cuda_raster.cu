@@ -1,30 +1,21 @@
-// =============================================================================
-// CUDA z-buffer rasteriser — the GPU counterpart of Renderer::rasterize +
-// Renderer::interpolateShading (src/render/Renderer.cpp).
+// gpu z-buffer rasteriser, the cuda version of the cpu renderer
+// no eigen or opencv in here, it only talks to the rest of the code
+// through the extern "C" functions at the bottom
 //
-// This translation unit is PURE CUDA: no Eigen, no OpenCV. It talks to the rest
-// of the program only through the three `extern "C"` launchers at the bottom,
-// which take raw pointers + sizes. The Eigen/OpenCV-facing host code lives in
-// CudaRenderer.cpp; nvcc compiles this file, g++ compiles that one.
+// three steps that match what the cpu renderer does:
+//   1. clearZ, set the whole buffer to empty (all ones)
+//   2. raster, one thread per triangle, walk its bbox and for each covered
+//      pixel atomicMin a packed key into the z-buffer
+//   3. resolve, one thread per pixel, decode the winning triangle and blend
+//      its vertex colours into the image
 //
-// Algorithm (matches the CPU renderer's semantics exactly):
-//   1. clearZ     — pack buffer set to "empty" (all-ones).
-//   2. raster     — one thread per triangle; walk its 2D bbox, edge-function
-//                   barycentrics, perspective-correct depth, then atomicMin a
-//                   packed  (depthBits<<32 | triangleId)  key into the z-buffer.
-//                   Packing means the SAME fragment wins as on the CPU: nearest
-//                   depth first, ties broken by the smaller triangle index (the
-//                   CPU keeps the first-written fragment on a strict-`<` test,
-//                   i.e. the smaller f — identical rule).
-//   3. resolve    — one thread per pixel; decode the winning triangle, recompute
-//                   its perspective-correct barycentric weights at the pixel
-//                   centre (same formulas as the CPU), blend the three shaded
-//                   vertex colours, and write the G-buffer + image.
+// the trick is packing depth and triangle id into one 64-bit key as
+// (depthBits << 32 | triangleId) so a single atomicMin picks the same
+// fragment the cpu would, nearest depth first and ties go to the smaller
+// triangle id
 //
-// Depth keys: camera-frame z is always > 0 here (we skip z<=1e-6), and for
-// positive IEEE-754 floats the raw bit pattern is monotonic, so __float_as_uint
-// gives a valid ordering for atomicMin.
-// =============================================================================
+// this works because camera z is always > 0 here (we skip z <= 1e-6) and for
+// positive floats the raw bits sort the same as the values
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
@@ -37,7 +28,7 @@
                          cudaGetErrorString(_e));                               \
     } while (0)
 
-// Persistent device state — allocated once per renderer, reused every frame.
+// device state we keep around, allocated once and reused every frame
 struct CudaRasterState {
     int H = 0, W = 0, numTris = 0, vertCap = 0;
 
@@ -57,14 +48,14 @@ struct CudaRasterState {
 
 static constexpr unsigned long long kEmpty = 0xFFFFFFFFFFFFFFFFULL;
 
-// ── kernel 1: clear the packed z-buffer ──────────────────────────────────────
+// kernel 1, clear the packed z-buffer
 __global__ void clearZKernel(unsigned long long* z, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) z[i] = kEmpty;
 }
 
-// ── kernel 2: rasterise (one thread per triangle) ────────────────────────────
+// kernel 2, rasterise one triangle per thread and write into the z-buffer
 __global__ void rasterKernel(const int* tris, const float* vcam, const float* uv,
                              int numTris, int H, int W, unsigned long long* zbuf)
 {
@@ -81,12 +72,11 @@ __global__ void rasterKernel(const int* tris, const float* vcam, const float* uv
     const float X1 = vcam[3 * i1], Y1 = vcam[3 * i1 + 1], z1 = vcam[3 * i1 + 2];
     const float X2 = vcam[3 * i2], Y2 = vcam[3 * i2 + 1], z2 = vcam[3 * i2 + 2];
 
-    // Back-face cull in the camera frame (matches Renderer::backfaceMask:
-    // front-facing when the camera-space normal's z is negative).
+    // drop back-facing triangles, front facing is when the normal z is negative
     const float n_z = (X1 - X0) * (Y2 - Y0) - (Y1 - Y0) * (X2 - X0);
     if (!(n_z < 0.0f)) return;
 
-    // Skip if any vertex is behind / on the camera plane (Renderer.cpp:106).
+    // skip if any vertex is behind or on the camera plane
     if (z0 <= 1e-6f || z1 <= 1e-6f || z2 <= 1e-6f) return;
 
     int xmin = (int)floorf(fminf(x0, fminf(x1, x2)));
@@ -115,7 +105,7 @@ __global__ void rasterKernel(const int* tris, const float* vcam, const float* uv
             const float inv_z   = w0 / z0 + w1 / z1 + w2 / z2;
             const float z_pixel = 1.0f / inv_z;
 
-            // Pack: nearest depth wins; ties → smaller triangle id (== CPU rule).
+            // pack it so nearest depth wins and ties go to the smaller triangle id
             const unsigned int      zb  = __float_as_uint(z_pixel);
             const unsigned long long key =
                 ((unsigned long long)zb << 32) | (unsigned int)f;
@@ -124,7 +114,7 @@ __global__ void rasterKernel(const int* tris, const float* vcam, const float* uv
     }
 }
 
-// ── kernel 3: resolve winner → G-buffer + shaded image (one thread per pixel) ─
+// kernel 3, one thread per pixel, pick the winning triangle and shade it
 __global__ void resolveKernel(const int* tris, const float* vcam, const float* uv,
                               const float* shaded, int H, int W,
                               const unsigned long long* zbuf,
@@ -137,7 +127,7 @@ __global__ void resolveKernel(const int* tris, const float* vcam, const float* u
     const unsigned long long key = zbuf[p];
     if (key == kEmpty) {                              // no triangle here
         image[3 * p + 0] = 0.0f; image[3 * p + 1] = 0.0f; image[3 * p + 2] = 0.0f;
-        depth[p]  = __int_as_float(0x7f800000);       // +inf (CPU empty value)
+        depth[p]  = __int_as_float(0x7f800000);       // +inf, same empty value as cpu
         mask[p]   = 0;
         triIdx[p] = -1;
         bary[3 * p + 0] = 0.0f; bary[3 * p + 1] = 0.0f; bary[3 * p + 2] = 0.0f;
@@ -170,13 +160,13 @@ __global__ void resolveKernel(const int* tris, const float* vcam, const float* u
     image[3 * p + 1] = b0 * shaded[3 * i0 + 1] + b1 * shaded[3 * i1 + 1] + b2 * shaded[3 * i2 + 1];
     image[3 * p + 2] = b0 * shaded[3 * i0 + 2] + b1 * shaded[3 * i1 + 2] + b2 * shaded[3 * i2 + 2];
 
-    depth[p]  = z_pixel;                              // == rasterise-time value
+    depth[p]  = z_pixel;                              // same value we packed at raster time
     mask[p]   = 255;
     triIdx[p] = f;
     bary[3 * p + 0] = b0; bary[3 * p + 1] = b1; bary[3 * p + 2] = b2;
 }
 
-// ── launchers (C ABI, called from CudaRenderer.cpp) ──────────────────────────
+// launchers with C linkage, called from CudaRenderer.cpp
 extern "C" {
 
 void* cudaRasterCreate(int H, int W, const int* tris, int numTris)
@@ -205,7 +195,7 @@ void cudaRasterRender(void* handle,
 {
     CudaRasterState* s = (CudaRasterState*)handle;
 
-    // (Re)allocate the per-vertex device buffers if the model grew.
+    // grow the per-vertex buffers if the model got bigger
     if (s->vertCap < numVerts) {
         if (s->d_vcam)   cudaFree(s->d_vcam);
         if (s->d_uv)     cudaFree(s->d_uv);

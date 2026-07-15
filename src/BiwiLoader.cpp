@@ -1,5 +1,5 @@
-// Implemented with Claude (Anthropic Claude Code) on 2026-07-02.
-// Just mirrors the biwi.py file.
+// loads biwi kinect frames (rgb + depth) and the camera calibration
+// just mirrors the biwi.py file
 #include "BiwiLoader.h"
 
 #include <opencv2/imgcodecs.hpp>
@@ -28,7 +28,7 @@ static std::string frameStem(int i)
     return s.str();
 }
 
-// Read all whitespace-separated numbers of a text file (cal/pose).
+// read all whitespace separated numbers from a text file (cal or pose)
 static std::vector<double> readNumbers(const std::string& path)
 {
     std::ifstream in(path);
@@ -40,7 +40,7 @@ static std::vector<double> readNumbers(const std::string& path)
     return values;
 }
 
-// .cal layout: 9 K, 4 distortion (all 0), 9 R, 3 t (mm), 2 width/height.
+// .cal layout is 9 K, 4 distortion (all 0), 9 R, 3 t in mm, 2 width/height
 static void parseCal(const std::string& path,
                      Eigen::Matrix3f&   K,
                      Eigen::Matrix3d&   R,
@@ -57,7 +57,7 @@ static void parseCal(const std::string& path,
     t = Eigen::Vector3d(v[22], v[23], v[24]);
 }
 
-// Decode the run-length-encoded depth .bin into a uint16 mm image.
+// decode the run length encoded depth .bin into a uint16 mm image
 cv::Mat BiwiLoader::readDepthBin(const std::string& path)
 {
     std::ifstream in(path, std::ios::binary);
@@ -94,7 +94,7 @@ cv::Mat BiwiLoader::readDepthBin(const std::string& path)
 
 std::vector<BiwiFrame> BiwiLoader::getFrames() const
 {
-    // Scan the directory (frames start at 3 and may have gaps).
+    // scan the directory, frames start at 3 and may have gaps
     std::vector<int> frameNumbers;
     const std::regex rgbName("frame_(\\d+)_rgb\\.png");
     for (const fs::directory_entry& entry : fs::directory_iterator(seqPath_)) {
@@ -142,7 +142,7 @@ BiwiCalibration BiwiLoader::getCalibration() const
 
 // ─── depth geometry helpers ──────────────────────────────────────────────────
 
-// Backproject a uint16 mm depth map into camera-frame points (mm), OpenCV axes.
+// backproject a uint16 mm depth map into camera frame points (mm), opencv axes
 std::vector<Eigen::Vector3d> backprojectDepth(const cv::Mat&         depth,
                                               const Eigen::Matrix3f& K,
                                               int                    stride)
@@ -171,7 +171,7 @@ std::vector<Eigen::Vector3d> backprojectDepth(const cv::Mat&         depth,
     return cloud;
 }
 
-// Keep points within `radius` of `center`, then only the front `frontSlab` mm.
+// keep the points within radius of the center then only the front frontSlab mm
 std::vector<Eigen::Vector3d> cropHead(const std::vector<Eigen::Vector3d>& cloud,
                                       const Eigen::Vector3d&               center,
                                       double                               radius,

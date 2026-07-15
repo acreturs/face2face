@@ -1,16 +1,16 @@
+// spherical harmonics lighting
+// builds the SH basis and shades each vertex with it
 #include "Lighting.h"
 
 #include <algorithm>
 
 namespace light {
 
-// ── order-2 real spherical-harmonics basis ───────────────────────────────────
-// These constants are the real SH basis functions Y_lm up to l=2, pre-baked.
-// Index → band:
-//   0          : l=0  (constant / ambient)
-//   1,2,3      : l=1  (linear in x,y,z — overall light direction)
-//   4,5,6,7,8  : l=2  (quadratic — softer directional variation)
-// n MUST be a unit vector.
+// order 2 real spherical harmonics basis
+// the numbers are the SH basis functions up to l=2 baked in
+// index 0 is the constant ambient band, 1..3 are the linear light direction
+// and 4..8 are the quadratic softer variation
+// n must be a unit vector
 Vector9f shBasis(const Eigen::Vector3f& n)
 {
     const float x = n.x(), y = n.y(), z = n.z();
@@ -30,13 +30,13 @@ Vector9f shBasis(const Eigen::Vector3f& n)
 SHCoeffs defaultWhite()
 {
     SHCoeffs sh = SHCoeffs::Zero();
-    // Constant band only → flat ambient light. The factor compensates for the
-    // small DC basis value (B0 ≈ 0.2821) so shading lands near ~1.0.
+    // only the constant band so the light is flat ambient
+    // the factor cancels the small DC basis value B0 so shading lands near 1.0
     sh.row(0).setConstant(1.0f / 0.282095f);
     return sh;
 }
 
-// ── per-vertex shading ───────────────────────────────────────────────────────
+// shade each vertex using the SH light
 Eigen::MatrixX3f shadeVertices(const Eigen::MatrixX3f& albedo,
                                const Eigen::MatrixX3f& normalsCam,
                                const SHCoeffs&         sh)
@@ -48,7 +48,7 @@ Eigen::MatrixX3f shadeVertices(const Eigen::MatrixX3f& albedo,
         const Eigen::Vector3f n = normalsCam.row(i);
         const Vector9f b = shBasis(n);
 
-        // bᵀ·sh = (1×9)·(9×3) = 1×3 row of per-channel shadings.
+        // b^T * sh gives a 1x3 row of shading per colour channel
         const Eigen::RowVector3f shading = b.transpose() * sh;
         out.row(i) = albedo.row(i)
                          .cwiseProduct(shading)
