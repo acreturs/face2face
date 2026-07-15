@@ -21,8 +21,13 @@ struct PoseParameters {
     Eigen::Matrix3f rotationMatrix() const;
 };
 
-constexpr int kShapeCoefficientCount = 30;
-constexpr int kAlbedoCoefficientCount = 30;       // BFM colour (albedo) PCA coeffs
+constexpr int kShapeCoefficientCount = 180;
+constexpr int kAlbedoCoefficientCount = 180;       // BFM colour (albedo) PCA coeffs
+// 30, not 80: only ~10 mouth/brow landmarks constrain expression, and BFM
+// expression modes 30–80 add just ~4% of variance (92%→99%) — 50 nearly-
+// unobservable DOF the solver fills with a high-norm, jittery, asymmetric
+// combination (‖δ‖≈5–7 for a near-closed mouth). Optimising the first 30 keeps
+// 92% of the expression range while removing the instability at its source.
 constexpr int kExpressionCoefficientCount = 30;   // BFM expression PCA coeffs
 
 struct FitParameters {
@@ -45,6 +50,22 @@ struct FitParameters {
 // Called after every outer ICP iteration of fitDense (e.g. to render progress).
 using DenseIterationCallback =
     std::function<void(int iteration, const FitParameters& current, double rmseMM)>;
+
+// ── Non-rigid model-based bundling (Face2Face §6) ────────────────────────────
+// One keyframe fed to fitIdentityBundle: its 2D observations, a per-frame pose
+// init, and (optionally, RGBD) its depth cloud in THIS keyframe's camera frame.
+struct BundleFrame {
+    std::vector<LandmarkObservation>          observations;
+    PoseParameters                            initialPose;
+    const std::vector<Eigen::Vector3d>*       depthCloud = nullptr;  // nullable
+};
+
+// Result of the bundle: ONE shared identity, per-frame pose + expression.
+struct BundleResult {
+    Eigen::VectorXd              identity;   // shared α
+    std::vector<PoseParameters>  poses;      // per keyframe
+    std::vector<Eigen::VectorXd> exprs;      // per keyframe
+};
 
 std::vector<LandmarkObservation> loadLandmarkObservations(
     const std::string& path
@@ -137,7 +158,12 @@ public:
         // prior anchors the metric face size, which is what disambiguates
         // focal from distance. Only sensible during personalisation.
         bool                                     optimizeFocal        = false,
-        double*                                  focalInOut           = nullptr
+        double*                                  focalInOut           = nullptr,
+        // ── temporal expression prior (tracking) ──  weight on
+        // ‖δ − initialExpr‖²: damps frame-to-frame expression jitter IN the
+        // solve without fighting a held articulation the way the zero-anchored
+        // prior does. 0 = off (personalise / single-frame fits).
+        double                                   exprTemporalWeight   = 0.0
     );
 
     // Dense fit: outer ICP loop (re-find nearest-vertex correspondences →
@@ -154,6 +180,34 @@ public:
         int                                  vertexStride         = 8,
         double                               pointToPlaneWeight   = 1.0,
         const DenseIterationCallback&        onIteration          = nullptr
+    );
+
+    // Non-rigid model-based bundling (Face2Face §6). Jointly solves ONE shared
+    // identity α with per-frame {pose, expression} over several keyframes at
+    // different viewing angles, in a single block-dense Ceres problem. Each
+    // keyframe contributes interior-landmark reprojection + jaw-contour (sliding
+    // silhouette, re-matched each outer iteration) + optional depth ICP, all
+    // pointing at the shared α. Multi-view parallax + shared-identity
+    // consistency is what resolves the depth ambiguity that a single view
+    // cannot, so the identity reg can be near-zero without over-fitting.
+    // Returns the shared α and each keyframe's pose/expr.
+    static BundleResult fitIdentityBundle(
+        const Eigen::MatrixX3f&          meanShape,
+        const Eigen::MatrixXf&           shapeBasis,
+        const Eigen::VectorXf&           shapeSigma,
+        const Eigen::MatrixXf&           exprBasis,
+        const Eigen::VectorXf&           exprSigma,
+        const Eigen::MatrixX3i&          triangles,
+        const std::vector<BundleFrame>&  frames,
+        const Eigen::Matrix3f&           intrinsics,
+        double                           regularizationWeight    = 3.0,
+        double                           exprRegWeight           = 30.0,
+        double                           zMin                    = 200.0,
+        double                           zMax                    = 2000.0,
+        int                              numOuterIterations      = 5,
+        double                           depthPointToPlaneWeight = 1.0,
+        double                           depthWeight             = 1.0,
+        int                              depthVertexStride       = 8
     );
 
     // Photometric (appearance) fit against a single RGB image — the analysis-by-
@@ -209,6 +263,51 @@ public:
         const DenseIterationCallback&     onIteration       = nullptr,
         // Working-resolution cap (image + intrinsics are downscaled together).
         // The realtime path calls this per pyramid level (e.g. 100 then 200).
-        int                               maxImageWidth     = 400
+        int                               maxImageWidth     = 400,
+        // ── JOINT E_col + E_lan (Face2Face Eq. 3) ──  When `landmarks` is
+        // non-null and `landmarkWeight` > 0, the interior landmark reprojection
+        // residuals are added to the per-pixel photometric SHAPE solve, on the
+        // same pose+shape blocks. The dense photometric alone is
+        // appearance-limited and shape-from-shading-ambiguous; the landmark
+        // term anchors the shape inside the solve (paper w_lan ≫ w_col), which
+        // is what makes a LOW shapeRegWeight safe — the coupling the paper
+        // relies on. Default (nullptr / 0) reproduces the old behaviour exactly,
+        // so existing callers (tracking lighting refresh) are unaffected.
+        const std::vector<LandmarkObservation>* landmarks   = nullptr,
+        double                            landmarkWeight    = 0.0
+    );
+
+    // Increment 2 — dense-photometric identity BUNDLE (Face2Face §6 + Eq. 4).
+    // Refines the SHARED identity α using the per-pixel photometric term E_col
+    // from ALL keyframes jointly (+ the E_lan landmark anchor), with per-frame
+    // pose+expression FIXED (from the geometric fitIdentityBundle) and shared
+    // albedo β + lighting γ (keyframes from one Biwi room share illumination).
+    // Because α is the only free block, the multi-view dense solve stays
+    // tractable on CPU. Per-frame vectors are parallel. Returns the refined α;
+    // writes the shared β and γ to the out-params (for rendering).
+    static Eigen::VectorXd fitIdentityPhotometricBundle(
+        const Eigen::MatrixX3f&          meanShape,
+        const Eigen::MatrixXf&           shapeBasis,
+        const Eigen::VectorXf&           shapeSigma,
+        const Eigen::MatrixXf&           exprBasis,
+        const Eigen::VectorXf&           exprSigma,
+        const Eigen::MatrixX3i&          triangles,
+        const Eigen::MatrixX3f&          meanAlbedo,
+        const Eigen::MatrixXf&           colorBasis,
+        const Eigen::VectorXf&           colorSigma,
+        const std::vector<cv::Mat>&      bgrs,
+        const std::vector<std::vector<LandmarkObservation>>& observations,
+        const std::vector<PoseParameters>&  poses,
+        const std::vector<Eigen::VectorXd>& exprs,
+        const Eigen::Matrix3f&           intrinsics,
+        const Eigen::VectorXd&           alphaInit,
+        Eigen::VectorXd&                 betaOut,
+        light::SHCoeffs&                 shOut,
+        double                           shapeReg       = 5.0,
+        double                           albedoReg      = 3.0,
+        double                           landmarkWeight = 20.0,
+        int                              numIterations  = 6,
+        int                              pixelStride    = 2,
+        int                              maxImageWidth  = 320
     );
 };

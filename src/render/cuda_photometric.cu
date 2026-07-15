@@ -38,8 +38,8 @@
                          cudaGetErrorString(_e));                               \
     } while (0)
 
-static constexpr int MAXK  = 30;   // kShapeCoefficientCount
-static constexpr int MAXNP = 36;   // 6 pose + 30 shape
+static constexpr int MAXK  = 180;  // must be >= kShapeCoefficientCount (CeresFitter.h)
+static constexpr int MAXNP = 186;  // 6 pose + MAXK shape
 
 // Central-difference steps per parameter type. Small enough to stay within a
 // texel of the bilinear image (so the gradient is local), large enough to avoid

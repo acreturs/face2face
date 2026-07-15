@@ -19,7 +19,11 @@
 #include <opencv2/highgui.hpp>   // imshow/waitKey for --mode live
 
 #include <algorithm>
+#include <numeric>
 #include <cmath>
+#include <csignal>
+#include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -30,6 +34,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <sys/wait.h>   // MediaPipe landmark coprocess (live mode)
+#include <unistd.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config — every path and tunable lives here, grouped by concern.
@@ -59,6 +66,15 @@ const std::string kYuNetPath    = modelPath("face_detection_yunet.onnx");
 //               offline; its 468-pt mesh adds vertical mouth points + a denser,
 //               more pose-robust jaw than LBF.
 std::string kDetector = "yunet";
+// Whether --detector was passed on the CLI. Live mode upgrades the DEFAULT to
+// the MediaPipe coprocess (best landmarks) but never overrides an explicit
+// choice.
+bool kDetectorExplicit = false;
+
+// Multi-keyframe identity bundling (Face2Face §6), offline video only. Opt-in
+// via --bundle; default is the single-frame personalise (for A/B comparison).
+bool kBundlePersonalise = false;
+int  kBundleKeyframes   = 7;   // target keyframe count (--bundle-keyframes)
 
 // ── output layout ──  each run writes into data/out/<tag>/ (biwi_video_rgb,
 // biwi_dense, debug, …) so modes never clobber each other.
@@ -75,28 +91,43 @@ std::string outDir(const std::string& tag) {
 constexpr float kFrontalRenderDepthMM = 350.0f;
 
 // ── sparse / contour landmark fit ──
-constexpr double kDefaultSparseReg  = 100.0;  // interior-only fit (--sparse-reg)
+// 30, not 100: the contour fit normalises its reprojection residuals by face
+// size (see reprojW), and its doc explicitly calls for a LOWER identity reg so
+// the silhouette can actually widen the face — 100 kept the identity pinned to
+// the mean. Override per run with --sparse-reg.
+constexpr double kDefaultSparseReg  = 30.0;   // identity reg (--sparse-reg)
 constexpr int    kContourOuterIters = 40;
-// Expression prior for the SINGLE-FRAME fit. Kept much stiffer than the identity
-// reg: only 5 interior landmarks (2 mouth corners) drive expression here, which
-// cannot reliably determine 30 coeffs — so a neutral face must stay neutral
-// instead of over-articulating (jaw-open) to absorb landmark noise. Video
-// tracking uses a lower value (identity frozen → expression must move).
-constexpr double kExprRegWeight = 500.0;
-// Expression prior for video TRACKING (identity frozen, so expression must stay
-// mobile to follow the mouth) — looser than the single-frame value above, but
-// far stiffer than the identity reg so a neutral frame stays neutral.
-constexpr double kTrackExprRegWeight = 120.0;
+// Expression prior for the PERSONALISE fit. Stiffer than the identity reg so
+// that identity, not expression, explains the face — but no longer 500: that
+// value dated from the 5-point YuNet era (2 mouth corners = almost no
+// expression signal). With the 21-interior + 14-jaw MediaPipe set the data
+// genuinely observes expression, and an over-stiff prior forces any non-
+// neutral personalise mouth into the IDENTITY (permanently wrong chin).
+constexpr double kExprRegWeight = 200.0;
+// ZERO-anchored expression prior for TRACKING (identity frozen → expression
+// must carry all articulation). Weak (10, was 120): a fully open mouth needs
+// ‖δ‖ ≈ 4.5 (measured on the BFM basis), and any zero prior strong enough to
+// damp landmark noise also pulls a HELD articulation shut every frame — at
+// 120 the mouth never opened past a few mm, at 30 it stopped halfway. Jitter
+// damping is instead done by the TEMPORAL prior (FaceTracker::Config
+// exprTemporalReg, ‖δ − δ_prev‖²), which costs nothing for a held expression.
+constexpr double kTrackExprRegWeight = 5.0;
 
 // ── photometric (appearance) fit ──
-constexpr double kAlbedoRegWeight  = 50.0;
+// 3, not 50: the albedo LS AtA-diagonal is ~47 (measured on this BFM), so λ=50
+// halved even the strongest colour mode and forced the rest to ~0 — ‖β‖≈0.3,
+// i.e. every reconstruction wore the androgynous MEAN skin/lips/brows (why
+// female subjects failed to read as themselves). λ=3 gives ~0.94 fit factor so
+// the person's actual colouring comes through; still enough to resist baking
+// lighting/beard/background into the skin.
+constexpr double kAlbedoRegWeight  = 3.0;
 constexpr int    kPhotoIterations  = 20;
 constexpr int    kPhotoPixelStride = 1;
 
 // ── video temporal smoothing ──  EMA on the per-frame pose + expression to
 // damp jitter: new = α·fit + (1−α)·previous. 1 = no smoothing, lower = smoother
 // (but laggier). Paired with velocity prediction so it stays responsive.
-constexpr double kSmoothAlpha = 0.6;
+constexpr double kSmoothAlpha = 0.95;   // NOTE: LOW = heavy smoothing (laggy); raise toward 0.9 for responsive
 
 // ── depth term (Biwi "full" fit) ──
 constexpr int    kDepthBackprojStride     = 2;    // subsample the depth map
@@ -661,17 +692,17 @@ struct LiveOptions {
     double      initZ         = 500.0;  // webcam ≈ arm's length (mm)
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Realtime reconstruction loop, generic over the DISPLAY renderer type.
-// ─────────────────────────────────────────────────────────────────────────────
-// RendererT is the renderer used for the on-screen overlay; both Renderer (CPU)
-// and CudaRenderer (GPU) satisfy the same construction + render() contract, so
-// the camera/HUD/personalise/track loop below is shared verbatim between
-// live-cpu and live-gpu. NOTE: the tracker's *internal* photometric renders
-// still run on the CPU renderer — only the display render is swapped here (see
-// GPU_RENDERER.md for the roadmap to a fully GPU photometric solve).
-template <class RendererT>
-static void runLiveImpl(const BFMLoader& bfm, double sparseReg, const LiveOptions& lo)
+// Open the driving input — a --live-source image/video, or a live camera — and
+// return the first usable frame in `firstFrame`. Shared by live-cpu and the
+// transfer driver. For a live device this warms the stream up and falls back
+// over device indices, handling the macOS/AVFoundation quirks:
+//  - a stream opened before the camera-permission dialog is answered delivers
+//    BLACK frames until re-opened;
+//  - device 0 is often an inactive iPhone Continuity Camera (black forever);
+//  - forcing FRAME_WIDTH/HEIGHT can blank the stream, so we take native size.
+// `who` tags the diagnostics ("live" / "transfer"). Returns false on failure.
+static bool openLiveCapture(cv::VideoCapture& cap, const LiveOptions& lo,
+                            cv::Mat& firstFrame, const char* who)
 {
     cv::VideoCapture cap;
     cv::Mat raw;
@@ -773,7 +804,7 @@ static void runLiveImpl(const BFMLoader& bfm, double sparseReg, const LiveOption
     tc.optimizeFocal          = lo.optimizeFocal;
     FaceTracker tracker(bfm, K0, tc);
 
-    const RendererT renderer(H, W, bfm.faces());
+    const Renderer renderer(H, W, bfm.faces());
     const std::string liveDir = outDir("live");
     double fpsEma = 0.0;
     long processed = 0, written = 0;
@@ -850,126 +881,18 @@ static void runLiveImpl(const BFMLoader& bfm, double sparseReg, const LiveOption
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ENTRY POINTS: live-cpu / live-gpu — thin wrappers over runLiveImpl<>.
+// ENTRY POINT: live-gpu — realtime reconstruction on the GPU (colleagues' WIP)
 // ─────────────────────────────────────────────────────────────────────────────
-static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions& lo)
-{
-    runLiveImpl<Renderer>(bfm, sparseReg, lo);
-}
-
-#ifdef USE_CUDA
-// Same realtime loop as live-cpu, but the display overlay is rendered by the
-// CUDA rasteriser. Tracking/photometric still run on the CPU (next milestone).
-static void runLiveGpu(const BFMLoader& bfm, double sparseReg, const LiveOptions& lo)
-{
-    std::cout << "live-gpu: CUDA display renderer active "
-                 "(tracking + photometric still on CPU)\n";
-    runLiveImpl<CudaRenderer>(bfm, sparseReg, lo);
-}
-#else
+// Stub. The intended design (see PLAN_REALTIME.md §4): a GPU rasteriser + an
+// analytic-Jacobian photometric solve, driven by the SAME FaceTracker
+// personalise/track split as runLiveCpu(). Wire the GPU renderer + solver in
+// here and reuse the camera/HUD loop from runLiveCpu().
 static void runLiveGpu(const BFMLoader& bfm, double sparseReg, const LiveOptions& lo)
 {
     (void)bfm; (void)sparseReg; (void)lo;
-    std::cerr << "live-gpu: this binary was built without CUDA support.\n"
-                 "  Rebuild on an NVIDIA machine with:  make USE_CUDA=1\n"
-                 "  (optionally CUDA_ARCH=sm_XX for your GPU)\n"
-                 "  Use --mode live-cpu for the CPU tracker.\n";
+    std::cerr << "live-gpu: not implemented yet — under development by the GPU "
+                 "team. Use --mode live-cpu for the CPU tracker.\n";
 }
-#endif
-
-#ifdef USE_CUDA
-// ─────────────────────────────────────────────────────────────────────────────
-// ENTRY POINT: verify-gpu — CPU vs CUDA renderer parity + speed, on the mean
-// face (deterministic; needs only the BFM, no Biwi). This is the correctness
-// gate for the GPU rasteriser: it must reproduce the CPU G-buffer, not just a
-// visually similar image.
-// ─────────────────────────────────────────────────────────────────────────────
-static void runGpuCheck(const BFMLoader&        bfm,
-                        const Eigen::MatrixX3f& shape,
-                        const Eigen::MatrixX3f& albedo)
-{
-    constexpr int RH = 480, RW = 640;
-    const RenderInput in{
-        .shape  = shape,
-        .albedo = albedo,
-        .R      = Eigen::Matrix3f::Identity(),
-        .t      = Eigen::Vector3f(0.0f, 0.0f, kFrontalRenderDepthMM),
-        .K      = proj::defaultIntrinsics(RW, RH),
-        .sh     = light::defaultWhite(),
-    };
-
-    const Renderer     cpu(RH, RW, bfm.faces());
-    const CudaRenderer gpu(RH, RW, bfm.faces());
-    const RenderOutput rc = cpu.render(in);
-    const RenderOutput rg = gpu.render(in);
-
-    // ── parity: compare the visible result AND the differentiable G-buffer ──
-    double  imgMax = 0.0, imgSum = 0.0;
-    double  baryMax = 0.0, depthMax = 0.0;
-    long    maskMismatch = 0, triMismatch = 0, covered = 0, both = 0;
-    for (int y = 0; y < RH; ++y) {
-        for (int x = 0; x < RW; ++x) {
-            const cv::Vec3f a = rc.image.at<cv::Vec3f>(y, x);
-            const cv::Vec3f b = rg.image.at<cv::Vec3f>(y, x);
-            for (int c = 0; c < 3; ++c) {
-                const double d = std::abs(a[c] - b[c]);
-                imgMax = std::max(imgMax, d);
-                imgSum += d;
-            }
-            const bool mc = rc.mask.at<uchar>(y, x) != 0;
-            const bool mg = rg.mask.at<uchar>(y, x) != 0;
-            if (mc) ++covered;
-            if (mc != mg) ++maskMismatch;
-
-            const int tc = rc.triIdx.at<int>(y, x);
-            const int tg = rg.triIdx.at<int>(y, x);
-            if (mc && mg) {
-                ++both;
-                if (tc != tg) ++triMismatch;
-                if (tc == tg) {                       // bary only meaningful if same tri
-                    const cv::Vec3f ba = rc.bary.at<cv::Vec3f>(y, x);
-                    const cv::Vec3f bb = rg.bary.at<cv::Vec3f>(y, x);
-                    for (int c = 0; c < 3; ++c)
-                        baryMax = std::max(baryMax, (double)std::abs(ba[c] - bb[c]));
-                    depthMax = std::max(depthMax,
-                        (double)std::abs(rc.depth.at<float>(y, x) - rg.depth.at<float>(y, x)));
-                }
-            }
-        }
-    }
-
-    std::cout << "\n== verify-gpu: CPU vs CUDA on the mean face (" << RW << "x" << RH << ") ==\n"
-              << "  CPU covered pixels     : " << covered << "\n"
-              << "  mask mismatches        : " << maskMismatch
-              << " (" << (100.0 * maskMismatch / (RW * RH)) << "% of frame)\n"
-              << "  triIdx mismatches      : " << triMismatch
-              << " (" << (both ? 100.0 * triMismatch / both : 0.0) << "% of shared coverage)\n"
-              << "  image  max|Δ|          : " << imgMax << "\n"
-              << "  image  mean|Δ|         : " << (imgSum / (RW * RH * 3)) << "\n"
-              << "  bary   max|Δ| (same tri): " << baryMax << "\n"
-              << "  depth  max|Δ| mm        : " << depthMax << "\n"
-              << "  (small edge/ULP diffs are expected — CPU is the reference)\n";
-
-    // ── speed: warm up, then time N renders each ────────────────────────────
-    constexpr int WARMUP = 3, N = 50;
-    for (int i = 0; i < WARMUP; ++i) { cpu.render(in); gpu.render(in); }
-    const auto tc0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < N; ++i) cpu.render(in);
-    const auto tc1 = std::chrono::steady_clock::now();
-    for (int i = 0; i < N; ++i) gpu.render(in);
-    const auto tg1 = std::chrono::steady_clock::now();
-    const double cpuMs = std::chrono::duration<double, std::milli>(tc1 - tc0).count() / N;
-    const double gpuMs = std::chrono::duration<double, std::milli>(tg1 - tc1).count() / N;
-    std::cout << "\n  render time  CPU " << std::fixed << std::setprecision(2) << cpuMs
-              << " ms   GPU " << gpuMs << " ms   speedup "
-              << std::setprecision(1) << (gpuMs > 0 ? cpuMs / gpuMs : 0.0) << "x\n"
-              << "  (GPU includes the CPU vertex stage + host<->device copies)\n\n";
-
-    const std::string dbg = outDir("debug");
-    writeColourImage(rc, dbg + "/gpu_check_cpu.png");
-    writeColourImage(rg, dbg + "/gpu_check_gpu.png");
-}
-#endif
 
 // Render the mean face into a synthetic camera and dump depth + colour PNGs.
 // Verifies the full forward pipeline (project → cull → rasterize → shade).
@@ -1350,10 +1273,9 @@ static void printUsage()
       "  rgb        landmarks + jaw contour + photometric      (no depth term)\n"
       "  rgbd       + the metric Kinect depth ICP term\n"
       "Realtime (Mac camera, HOST only — Docker has no camera):\n"
-      "  live-cpu   the CPU tracker\n"
-      "  live-gpu   CPU tracker + CUDA display renderer (needs make USE_CUDA=1)\n"
-      "GPU renderer checks (needs make USE_CUDA=1):\n"
-      "  verify-gpu CPU vs CUDA renderer parity + speed on the mean face\n"
+      "  live-cpu   the CPU tracker (this build)\n"
+      "  transfer   live expression transfer onto a target avatar\n"
+      "  live-gpu   GPU tracker — stub, under development\n"
       "Single-frame geometry (kept for reports):\n"
       "  dense      depth-only ICP\n"
       "  full       sparse landmark fit → dense ICP\n\n"
@@ -1367,6 +1289,9 @@ static void printUsage()
       "  --live-frames <n> --live-nodisplay   headless live test\n"
       "  --photo-refine     pyramid photometric pose refinement (live)\n"
       "  --optimize-focal   solve fx=fy during personalise (experimental)\n"
+      "  --transfer-target <biwi-dir>   avatar to drive in --mode transfer\n"
+      "  --bundle           multi-keyframe identity bundle (rgb/rgbd, Face2Face \u00a76)\n"
+      "  --bundle-keyframes <k>   keyframes for --bundle (default 7)\n"
       "  --photo-gpu        run the photometric geometry solve on the GPU "
       "(finite-diff; needs make USE_CUDA=1)\n"
       "  --photo-gpu-analytic  GPU photometric solve with analytic Jacobian\n"
@@ -1402,6 +1327,8 @@ int main(int argc, char** argv)
         else if (arg == "--live-nodisplay") live.display = false;
         else if (arg == "--photo-refine") live.photoRefine = true;
         else if (arg == "--optimize-focal") live.optimizeFocal = true;
+        else if (arg == "--bundle") kBundlePersonalise = true;
+        else if (arg == "--bundle-keyframes" && i + 1 < argc) kBundleKeyframes = std::stoi(argv[++i]);
         else if (arg == "--photo-gpu") {
 #ifdef USE_CUDA
             CeresFitter::usePhotometricGpu = true;
@@ -1447,14 +1374,6 @@ int main(int argc, char** argv)
         runLiveCpu(bfm, sparseReg, live);
     } else if (mode == "live-gpu") {
         runLiveGpu(bfm, sparseReg, live);
-    } else if (mode == "verify-gpu") {
-#ifdef USE_CUDA
-        runGpuCheck(bfm, meanShape, albedo);
-        return 0;                                    // no mean-face debug render needed
-#else
-        std::cerr << "verify-gpu: built without CUDA. Rebuild with: make USE_CUDA=1\n";
-        return 1;
-#endif
     } else if (mode == "dense") {
         fitDenseOnBiwi(bfm, meanShape, albedo, /*sparseInit=*/nullptr, icpIters);
     } else if (mode == "full") {

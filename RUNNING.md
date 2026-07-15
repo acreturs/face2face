@@ -13,6 +13,16 @@ first, so nothing to download on a normal container run.
 
 ---
 
+TLDR: THese are the main two run modes currently on the BIWI dataset:
+
+```bash
+./build/face_recon --mode rgb --biwi-dir data/BK-1/01 --frames 200 --sparse-reg 30
+````
+
+```bash
+./build/face_recon --mode rgbd --biwi-dir data/BK-1/01 --frames 200 --sparse-reg 30
+````
+
 ## 1. Every mode at a glance
 
 The only dataset is **Biwi** (Kinect RGB-D). Everything is selected with
@@ -45,11 +55,13 @@ Three landmark backends, selected with **`--detector yunet|lbf|mediapipe`**
 |---|---|---|---|
 | `yunet` (default) | in-process C++ | 5 pose-robust interior (YuNet CNN) + 8 LBF jaw contour | best pose robustness, no pre-pass |
 | `lbf` | in-process C++ | 9 interior + 8 jaw, all from Haar+LBF | the legacy detector; frontal-biased |
-| `mediapipe` | **offline pre-pass files** | 8 interior (incl. upper/lower lip + chin) + 8 jaw contour | densest; MediaPipe is Bazel-built so it runs as a Python pre-pass, not in the binary |
+| `mediapipe` | **offline pre-pass files** | 21 interior (eyes, brows, nose, mouth, chin) + 14 jaw contour | densest; MediaPipe is Bazel-built so it runs as a Python pre-pass, not in the binary |
 
 For `mediapipe`, run the pre-pass once per sequence/image (writes
 `landmarks_mp_XXXXX.txt` next to the frames; mediapipe is preinstalled in the
-devcontainer image):
+devcontainer image). **Re-run it after pulling changes to
+`gen_landmarks_mediapipe.py`** — stale files with the old 8+8 point set still
+load, but the solver then misses the extra pose/identity constraints:
 
 ```bash
 python3 python/gen_landmarks_mediapipe.py --biwi-dir data/BK-1/01 [--max N]
@@ -69,12 +81,6 @@ sparse fit). For those, generate the file once with the in-repo Python tool
 python3 python/gen_landmarks.py --set small --contour \
     data/BK-1/01/frame_00003_rgb.png \
     data/BK-1/01/landmarks_00003.txt
-```
-
-To find which frame numbers exist in a Biwi subject folder:
-
-```bash
-ls data/BK-1/01/*_rgb.png | sed -E 's/.*frame_([0-9]+)_rgb.*/\1/' | sort -n
 ```
 
 ---
@@ -128,10 +134,30 @@ outputs go to `data/out/biwi_video_rgb/`.
 
 ## 4b. Realtime camera mode (`--mode live-cpu`) — HOST ONLY
 
-Live tracking from the MacBook camera: personalises on the first detected face
-(identity + albedo + lighting), then tracks pose + expression per frame with a
-live overlay. **Must run on the host** (Docker has no camera). From the repo
-root in a normal terminal:
+Live tracking from the MacBook camera. Personalisation uses the
+**multi-keyframe identity bundle** (all modes, `--no-bundle` reverts to the
+old single-frame fit): the tracker collects up to 5 yaw-separated keyframes —
+**turn your head slowly left/right when the HUD says so** — and solves ONE
+shared identity jointly across them (per-frame pose/expression). A single
+view leaves most identity dimensions unobserved, which is why single-frame
+RGB faces all converged near the androgynous BFM mean; multi-view parallax
+makes them observable (measured: ‖identity‖ roughly doubles on both female
+and male Biwi subjects). If you hold still it commits from what it has after
+a few seconds. Identity + albedo are then fixed and tracking starts.
+**Must run on the host** (Docker has no camera).
+
+Landmarks come from the **MediaPipe coprocess** by default: main spawns
+`python/mp_landmark_server.py` and streams frames to it, getting the same
+dense 21-interior + 14-jaw set as the offline modes (chin/brows/eye corners
+are what make pitch and identity observable — YuNet's 5 points are nearly
+coplanar). It needs *some* `python3`/`python3.12`/`python3.11` with mediapipe:
+
+```bash
+python3.12 -m pip install mediapipe==0.10.18   # one-off, host
+```
+
+If no suitable python is found, live falls back to YuNet + LBF automatically
+(and `--detector yunet` forces that). From the repo root in a normal terminal:
 
 ```bash
 # build for the host (Homebrew paths), then run
@@ -153,7 +179,20 @@ CPATH=/opt/homebrew/include LIBRARY_PATH=/opt/homebrew/lib make
 `make USE_CUDA=1` and verify with `--mode verify-gpu` first; see
 [GPU_RENDERER.md](GPU_RENDERER.md).)
 
-- Keys: `q` quit · `p` re-personalise · `s` snapshot → `data/out/live/`.
+Three windows open: the **overlay** (render blended over the camera), the
+**mask** (reconstruction alone on black, annotated with translation [mm],
+rotation [deg], |id|/|expr| norms, albedo mode and focal), and the
+**keypoints** view (green = detected landmarks, red cross = the corresponding
+projected model vertex, yellow line = the reprojection error, cyan = jaw
+contour points). With `--photo-texture` the personalise frame is projected
+onto the fitted mesh once and both the overlay and the mask render with that
+texture (flat lighting — the photo's shading is baked in); any later tracking
+drift then shows as the painted features sliding off the real ones.
+The headless dump (`--live-frames N --live-nodisplay`) writes all three views
+per frame (`live_XXXX.png`, `_mask.png`, `_kp.png`).
+
+- Keys: `q` quit · `p` re-personalise (also recaptures the photo texture) ·
+  `s` snapshot → `data/out/live/snapshot{,_mask,_kp}.png`.
 - HUD shows fps and the current focal. Intrinsics start from a 60°-HFOV guess;
   `--optimize-focal` additionally solves the focal during personalisation
   (experimental — single-frame estimation is biased long, see PLAN_REALTIME.md).
@@ -181,7 +220,7 @@ Measured on an M2 (640 px): detect ~9 ms, track ~15 ms, render ~14 ms →
 | Flag | Meaning | Default |
 |---|---|---|
 | `--mode <rgb\|rgbd\|live-cpu\|live-gpu\|dense\|full>` | Which pipeline to run | `rgb` |
-| `--sparse-reg <λ>` | Identity/expression regulariser weight | `100.0` |
+| `--sparse-reg <λ>` | Identity regulariser weight | `30.0` |
 | `--biwi-seq <NN>` | Shortcut for `data/biwi/NN` | — |
 | `--biwi-dir <path>` | Biwi subject folder (e.g. `data/BK-1/01`) | `data/biwi/01` |
 | `--frames <n>` | Number of frames for `rgb`/`rgbd` | `30` |
@@ -190,6 +229,8 @@ Measured on an M2 (640 px): detect ~9 ms, track ~15 ms, render ~14 ms →
 | `--camera <idx>` / `--live-source <path>` | Live input: device index, or a video file / image sequence | `0` |
 | `--live-width <px>` / `--live-frames <n>` / `--live-nodisplay` | Live processing width; headless test run | `640` / `0` / off |
 | `--photo-refine` | Live: pyramid photometric pose refinement (safeguarded) | off |
+| `--photo-texture` | Live: project the personalise frame onto the mesh, render with it | off |
+| `--no-bundle` | Single-frame personalise instead of the multi-keyframe identity bundle | bundle on |
 | `--optimize-focal` | Solve fx=fy during personalisation (experimental, see §4b) | off |
 | `--timers` | Print per-stage timings | off |
 
