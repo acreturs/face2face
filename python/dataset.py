@@ -1,3 +1,5 @@
+# loader and helpers for the Pandora dataset
+# reads a frame's rgb, depth and joint annotations and turns depth into a face point cloud
 import json
 import os
 
@@ -6,7 +8,7 @@ import numpy as np
 
 
 class PandoraFrame:
-    """One Pandora frame containing RGB, depth, and annotations."""
+    """one Pandora frame with its rgb, depth and annotations"""
 
     def __init__(self, root: str, index: int) -> None:
         stem = f"{index:06d}"
@@ -44,10 +46,10 @@ class PandoraFrame:
 
 
 def rgb_at_depth_resolution(frame: PandoraFrame) -> np.ndarray:
-    """Resize RGB to the depth-map resolution.
+    """resize rgb down to the depth-map size
 
-    This is a diagnostic approximation. Proper RGB-depth registration should
-    eventually use the camera calibration supplied by the dataset.
+    this is just a rough approximation for looking at things, proper
+    rgb-depth alignment should use the dataset's camera calibration later on
     """
     height, width = frame.depth_mm.shape[:2]
     return cv2.resize(
@@ -58,7 +60,7 @@ def rgb_at_depth_resolution(frame: PandoraFrame) -> np.ndarray:
 
 
 def backproject(depth_mm: np.ndarray, K: dict) -> np.ndarray:
-    """Back-project a depth image into camera-frame 3D points in metres."""
+    """back-project a depth image into camera-frame 3D points in metres"""
     required = ("fx", "fy", "cx", "cy")
     if not all(name in K for name in required):
         raise ValueError(f"K must contain {required}")
@@ -76,7 +78,7 @@ def crop_head(
     head_center: np.ndarray,
     radius: float = 0.13,
 ) -> np.ndarray:
-    """Keep points within a radius of the estimated head centre."""
+    """keep points within a radius of the estimated head centre"""
     distances = np.linalg.norm(points - head_center.reshape(1, 3), axis=1)
     cropped = points[distances < radius]
     if cropped.size == 0:
@@ -85,7 +87,7 @@ def crop_head(
 
 
 def keep_front(points: np.ndarray, slab: float = 0.10) -> np.ndarray:
-    """Keep the front-most depth slab of the cropped head point cloud."""
+    """keep the front-most slab of the cropped head cloud (drops the back of the head)"""
     if len(points) == 0:
         raise ValueError("Cannot keep front surface of an empty point cloud")
 
@@ -97,7 +99,7 @@ def keep_front(points: np.ndarray, slab: float = 0.10) -> np.ndarray:
 
 
 def head_center(frame: PandoraFrame) -> np.ndarray:
-    """Estimate the head centre from the two highest 3D skeleton joints."""
+    """guess the head centre from the two highest 3D skeleton joints"""
     joints = frame.joints3d
     if joints.ndim != 2 or joints.shape[1] != 3 or len(joints) < 2:
         raise ValueError(f"Unexpected joints3D shape: {joints.shape}")

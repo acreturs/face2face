@@ -1,3 +1,5 @@
+# quick test for the landmark detector on the default iphone image
+# writes the c++ input file and a couple of debug overlays to data/out
 import os
 
 import cv2

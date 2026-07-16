@@ -1,3 +1,5 @@
+// finds a face and its landmarks in an image
+// YuNet or Haar gives the box, LBF gives the 68 points
 #include "LandmarkDetector.h"
 
 #include <opencv2/imgproc.hpp>
@@ -9,9 +11,9 @@
 
 namespace {
 
-// dlib/LBF 68-point index → BFM vertex index, the "small" interior set
-// (mirrors LBF68_TO_BFM_SMALL resolved through the BFM landmark table). 62 and
-// 66 both resolve to 8190 because the nomouth BFM has no inner-mouth vertices.
+// dlib/lbf 68-point index -> bfm vertex, the small interior set (mirrors
+// LBF68_TO_BFM_SMALL through the bfm landmark table). 62 and 66 both map to
+// 8190 because the nomouth bfm has no inner-mouth vertices
 struct LbfToBfm { int lbf; int vertex; };
 const std::array<LbfToBfm, 9> kInterior = {{
     {30,  8156},  // center.nose.tip
@@ -25,9 +27,9 @@ const std::array<LbfToBfm, 9> kInterior = {{
     {66,  8190},  // center.lips.lower.inner
 }};
 
-// YuNet 5-landmark index → BFM vertex. These CNN landmarks stay accurate under
-// head rotation (unlike LBF's frontal-biased regression), so they drive the
-// pose. Order matches YuNet: right eye, left eye, nose, right/left mouth corner.
+// yunet 5-landmark index -> bfm vertex. these cnn landmarks stay accurate under
+// head rotation (unlike lbf's frontal-biased regression) so they drive the
+// pose. order matches yunet: right eye, left eye, nose, right/left mouth corner
 struct YuToBfm { int yu; int vertex; };
 const std::array<YuToBfm, 5> kYuNet = {{
     {0,  4540},  // right.eye.pupil.center
@@ -37,7 +39,7 @@ const std::array<YuToBfm, 5> kYuNet = {{
     {4, 10598},  // left.lips.corner
 }};
 
-// Jawline points emitted as contour observations (vertexIndex -1). Sides only.
+// jawline points emitted as contour observations (vertexIndex -1), sides only
 const std::array<int, 8> kJawContour = {{1, 3, 5, 7, 9, 11, 13, 15}};
 
 const char* kCascadeCandidates[] = {
@@ -55,11 +57,11 @@ LandmarkDetector::LandmarkDetector(const std::string& lbfModelPath,
                                    const std::string& yunetPath,
                                    const std::string& cascadePath)
 {
-    // Preferred: YuNet CNN detector (robust to head pose). Its ONNX model needs
-    // OpenCV's >= 4.8 DNN backend — on older builds create() succeeds but the
-    // first detect() throws "Layer id=-1 not found". Guard up front so we fall
-    // back to Haar with an ACTIONABLE message instead of a scary per-frame DNN
-    // error each run.
+    // prefer the yunet cnn detector, it's robust to head pose. its onnx model
+    // needs opencv's >= 4.8 dnn backend, on older builds create() works but the
+    // first detect() throws "Layer id=-1 not found", so check the version up
+    // front and fall back to haar with a clear message instead of a per-frame
+    // dnn error each run
     const int ocv = cv::getVersionMajor() * 100 + cv::getVersionMinor();
     if (!yunetPath.empty() && std::filesystem::exists(yunetPath)) {
         if (ocv < 408) {
@@ -81,9 +83,8 @@ LandmarkDetector::LandmarkDetector(const std::string& lbfModelPath,
         }
     }
 
-    // Always keep a Haar cascade as a fallback — YuNet can also fail at inference
-    // time on older OpenCV (the model needs a newer DNN backend), in which case
-    // faceBox() switches to Haar at runtime.
+    // always keep a haar cascade as a fallback, yunet can also fail at inference
+    // time on older opencv, in which case faceBox() switches to haar at runtime
     {
         bool loaded = !cascadePath.empty() && cascade_.load(cascadePath);
         for (const char* p : kCascadeCandidates) {
@@ -109,15 +110,16 @@ LandmarkDetector::LandmarkDetector(const std::string& lbfModelPath,
               << " face detector + LBF 68-point landmarks\n";
 }
 
+// find the face box (and 5 yunet points if we have them), yunet first then haar
 bool LandmarkDetector::faceBox(const cv::Mat& bgr, cv::Rect& box,
                                std::vector<cv::Point2f>* pts)
 {
     if (pts) pts->clear();
     if (yunet_) {
         try {
-            // YuNet is tuned for small inputs; running it on a multi-megapixel
-            // frame (e.g. a 2316-wide iPhone selfie) misses the face. Downscale
-            // to ~640 px wide for detection, then map results back to full res.
+            // yunet is tuned for small inputs, on a multi-megapixel frame (a
+            // 2316-wide iphone selfie) it misses the face. downscale to ~640 px
+            // wide for detection then map the results back to full res
             constexpr int kDetWidth = 640;
             double s = std::min(1.0, static_cast<double>(kDetWidth) / bgr.cols);
             cv::Mat small = bgr;
@@ -146,7 +148,7 @@ bool LandmarkDetector::faceBox(const cv::Mat& bgr, cv::Rect& box,
         } catch (const cv::Exception& e) {
             std::cerr << "LandmarkDetector: YuNet inference failed (" << e.what()
                       << ") — switching to Haar for the rest of the run\n";
-            yunet_.release();      // fall through to Haar below (and stay there)
+            yunet_.release();      // fall through to haar below and stay there
         }
     }
     if (cascade_.empty()) return false;
@@ -163,6 +165,7 @@ bool LandmarkDetector::faceBox(const cv::Mat& bgr, cv::Rect& box,
     return true;
 }
 
+// run detection and return interior + jaw-contour observations for one image
 std::vector<LandmarkObservation> LandmarkDetector::detect(const cv::Mat& bgr)
 {
     std::vector<LandmarkObservation> obs;
@@ -172,11 +175,11 @@ std::vector<LandmarkObservation> LandmarkDetector::detect(const cv::Mat& bgr)
     std::vector<cv::Point2f> yuPts;
     if (!faceBox(bgr, box, &yuPts)) return obs;
 
-    // LBF 68-point fit on the box (used for the jaw contour, and for the interior
-    // when YuNet is not available). LBF was trained on Haar-style boxes; YuNet's
-    // tighter rectangle systematically shifts its regression. A centred square
-    // at 1.1× the larger side scored closest to the Haar convention (measured
-    // against MediaPipe landmarks on Biwi frames).
+    // lbf 68-point fit on the box (used for the jaw contour, and for the
+    // interior when yunet isn't there). lbf was trained on haar-style boxes and
+    // yunet's tighter rectangle shifts its regression, a centred square at 1.1x
+    // the larger side matched the haar convention best (checked against
+    // mediapipe on biwi frames)
     cv::Rect lbfBox = box;
     if (!yuPts.empty()) {
         const int side = static_cast<int>(1.1f * std::max(box.width, box.height));
@@ -190,8 +193,8 @@ std::vector<LandmarkObservation> LandmarkDetector::detect(const cv::Mat& bgr)
     const bool haveLbf = facemark_->fit(bgr, one, landmarks) &&
                          !landmarks.empty() && landmarks[0].size() >= 68;
 
-    // Interior (pose-critical) points: prefer YuNet's pose-robust landmarks;
-    // fall back to LBF's (frontal-biased) ones when YuNet is unavailable.
+    // interior (pose-critical) points, prefer yunet's pose-robust landmarks and
+    // fall back to lbf's frontal-biased ones when yunet isn't available
     if (yuPts.size() >= 5) {
         for (const YuToBfm& m : kYuNet)
             obs.push_back({m.vertex, Eigen::Vector2d(yuPts[m.yu].x, yuPts[m.yu].y)});
@@ -201,7 +204,7 @@ std::vector<LandmarkObservation> LandmarkDetector::detect(const cv::Mat& bgr)
                            Eigen::Vector2d(landmarks[0][m.lbf].x, landmarks[0][m.lbf].y)});
     }
 
-    // Jaw contour (width/silhouette) always comes from LBF, if we have it.
+    // jaw contour (width/silhouette) always comes from lbf, if we have it
     if (haveLbf)
         for (int idx : kJawContour)
             obs.push_back({-1, Eigen::Vector2d(landmarks[0][idx].x, landmarks[0][idx].y)});

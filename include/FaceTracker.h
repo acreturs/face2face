@@ -7,132 +7,119 @@
 #include "CeresFitter.h"
 #include "Lighting.h"
 
-// Personalise-then-track state machine, shared by the offline video modes and
-// the realtime camera path (--mode live).
+// personalise-then-track state machine shared by the offline video modes and
+// the live camera path.
 //
-//   personalise(frame) — the expensive one-off: identity α + expression from
-//     landmarks/contour (+ depth if given), then albedo β + lighting via the
-//     photometric fit. Optionally also solves the camera FOCAL length (webcam
-//     with unknown intrinsics); the identity prior anchors the metric face
-//     size, which is what makes focal observable from a single view.
-//   track(frame) — per frame: constant-velocity warm start → contour fit with
-//     identity frozen (pose + expression) → optional pyramid photometric pose
-//     refinement (accepted only if it does not worsen the landmark
-//     reprojection) → lighting refresh → EMA smoothing. Detection gating with
-//     automatic recovery after repeated rejects.
+// personalise() is the expensive one-off, it works out who the person is
+// (identity, expression, albedo, lighting) from the first frame. track() then
+// runs every frame after that with identity frozen, so it only has to solve
+// pose and expression plus a light refresh, which is what makes it fast
 class FaceTracker {
 public:
     struct Config {
-        // priors / fit weights
+        // priors and fit weights
         double sparseReg          = 30.0;
-        double exprRegPersonalise = 200.0;   // see cfg::kExprRegWeight in main
-        double exprRegTrack       = 5.0;    // see cfg::kTrackExprRegWeight in main
-        // Temporal expression prior for track(): damps per-frame jitter in the
-        // solve; holding an articulation costs nothing (unlike exprRegTrack).
+        double exprRegPersonalise = 200.0;
+        double exprRegTrack       = 5.0;
+        // temporal expression prior for track(), damps per-frame jitter while
+        // still letting you hold an expression for free
         double exprTemporalReg    = 50.0;
-        double albedoRegWeight    = 3.0;     // see cfg::kAlbedoRegWeight in main
-        double smoothAlpha        = 0.1;     // EMA: new = a·fit + (1−a)·prev  (low=laggy)
+        double albedoRegWeight    = 3.0;
+        double smoothAlpha        = 0.1;     // EMA blend, lower is smoother but laggier
+
         // personalise stage
         int  contourItersPersonalise = 40;
         int  photoIterations         = 20;
         int  photoPixelStride        = 1;
-        bool personaliseOptimizeShape = true;   // matches the offline video path
-        bool optimizeFocal            = false;  // solve fx=fy during personalise
-        // Coarse-to-fine working widths for the photometric IDENTITY refinement
-        // at personalise. Each level warm-starts the next; the last should be
-        // near the native frame width for maximum surface detail. This is the
-        // fine-geometry (e.g. femininity) driver the depth is too coarse for.
+        bool personaliseOptimizeShape = true;
+        bool optimizeFocal            = false;  // solve fx=fy for an unknown webcam
+        // coarse-to-fine widths for the photometric identity refinement, each
+        // level warm-starts the next and the last is near full frame width
         std::vector<int> personalisePhotoPyramid = {256, 512};
-        // Photometric-shape solve reg (Face2Face keeps identity reg near-zero;
-        // the JOINT landmark anchor below makes a low value safe) and the joint
-        // landmark-anchor weight (paper w_lan ≫ w_col). Decoupled from the
-        // geometric sparseReg so the dense photometric can actually move shape.
+        // the dense photometric shape solve keeps identity reg low, the joint
+        // landmark anchor below is what keeps that safe
         double photoShapeReg       = 5.0;
         double photoLandmarkWeight = 20.0;
+
         // track stage
         int  contourItersTrack     = 10;
-        int  trackPhotoIterations  = 2;     // lighting-refresh photometric call
-        // false: the refresh's pose result was ALWAYS discarded, but solving it
-        // (a) burned a full per-pixel Ceres solve per frame and (b) left the SH
-        // estimate taken at a pose ≠ the tracked one. Pure linear estimate at
-        // the tracked pose is faster and consistent.
+        int  trackPhotoIterations  = 2;
+        // keep the lighting refresh a pure linear estimate at the tracked pose,
+        // solving pose here again just burned time and moved the light off pose
         bool trackPhotoOptimizePose = false;
-        int  lightingEvery         = 1;     // refresh lighting every k frames
+        int  lightingEvery         = 1;      // refresh lighting every k frames
+
         // depth term
         double depthPointToPlaneWeight = 1.0;
         double depthWeight             = 1.0;
         int    depthVertexStride       = 8;
-        // detection gating
-        double gateFrac    = 0.12;   // reject centroid jumps > frac·imageWidth
-        int    maxGateFails = 10;    // then reset the gate (tracking recovery)
-        // Phase 4: pyramid photometric pose refinement during track()
+
+        // detection gating, reject big centroid jumps then recover after a while
+        double gateFrac    = 0.12;
+        int    maxGateFails = 10;
+
+        // optional pyramid photometric pose refinement during track()
         bool             photoRefine   = false;
-        std::vector<int> pyramidWidths = {100, 200};   // coarse → fine
+        std::vector<int> pyramidWidths = {100, 200};
     };
 
     FaceTracker(const BFMLoader& bfm, const Eigen::Matrix3f& K, const Config& cfg);
 
     bool personalised() const { return personalised_; }
 
-    // Forget the person + tracking history (live mode 'p' key). K is restored
-    // to `K0` so a fresh personalisation re-estimates the focal from the guess.
+    // forget the person and history (the live 'p' key), K goes back to K0 so a
+    // fresh personalise re-guesses the focal
     void reset(const Eigen::Matrix3f& K0);
 
-    // Returns false if the frame could not be personalised (no landmarks).
-    // initZ = initial face depth in mm (Biwi: GT head centre; webcam: ~500).
+    // one-off fit on the first good frame, false if there were no landmarks.
+    // initZ is the starting face depth in mm
     bool personalise(const cv::Mat& bgr,
                      const std::vector<LandmarkObservation>& observations,
                      double initZ,
                      const std::vector<Eigen::Vector3d>* depthCloud = nullptr);
 
-    // Multi-keyframe identity BUNDLE (Face2Face §6, offline). Jointly solves one
-    // shared identity over several yaw-diverse keyframes, then estimates
-    // appearance + a photometric identity refinement on the frontal `anchor`.
-    // Per-keyframe vectors are parallel; depthClouds[i] may be null (RGB).
+    // multi-keyframe version, solves one shared identity across several
+    // yaw-varied frames which pins down way more of the face than one view can
     bool personaliseBundle(const std::vector<cv::Mat>& bgrs,
                            const std::vector<std::vector<LandmarkObservation>>& obs,
                            const std::vector<double>& initZs,
                            const std::vector<const std::vector<Eigen::Vector3d>*>& depthClouds,
                            int anchor);
 
-    // Interior-landmark reprojection RMS of the CURRENT (tracked) state against
-    // `obs` — the identity-quality metric for the bundle vs single-frame study.
+    // landmark reprojection error of the current fit, the identity-quality
+    // number for the bundle vs single-frame comparison
     double currentInteriorRms(const std::vector<LandmarkObservation>& obs) const {
         return interiorRms(obs, currentShape(), prevPose_);
     }
 
-    // Signed yaw proxy: (nose.x − eye-midpoint.x)/eye-dist. 0=frontal. NaN if the
-    // three anchor points (nose 8156, pupils 4540/11681) are missing.
+    // rough yaw estimate from nose vs eye midpoint, 0 is frontal, NaN if the
+    // anchor points are missing
     static double yawProxy(const std::vector<LandmarkObservation>& obs);
 
-    // Returns false if the frame was skipped (no landmarks / gated detection).
-    // observations may be empty when a depth cloud drives the fit.
+    // per-frame update, false if the frame was skipped
     bool track(const cv::Mat& bgr,
                const std::vector<LandmarkObservation>& observations,
                double initZ,
                const std::vector<Eigen::Vector3d>* depthCloud = nullptr);
 
-    // ── current (smoothed) state, for rendering ──
+    // current smoothed state for rendering
     const PoseParameters&  pose()     const { return prevPose_; }
     const Eigen::VectorXd& expr()     const { return prevExpr_; }
     const Eigen::VectorXd& identity() const { return identity_; }
     const Eigen::VectorXd& beta()     const { return beta_; }
     const light::SHCoeffs& sh()       const { return prevSh_; }
     const Eigen::Matrix3f& K()        const { return K_; }
-    Eigen::MatrixX3f currentShape()  const;   // identity + smoothed expression
-    Eigen::MatrixX3f currentAlbedo() const;   // mean + colour basis · β
+    Eigen::MatrixX3f currentShape()  const;
+    Eigen::MatrixX3f currentAlbedo() const;
 
 private:
-    // Mean 2D position of the interior (fixed-vertex) observations.
     static Eigen::Vector2d centroid(const std::vector<LandmarkObservation>& obs);
-    // Appearance (albedo+lighting) + photometric identity refinement, then
-    // commit the tracking state. Shared by personalise() and personaliseBundle().
+    // fit albedo + lighting + a photometric identity refinement then commit the
+    // tracking state, shared by personalise() and personaliseBundle()
     void finalizeAppearance(const cv::Mat& bgr,
                             const std::vector<LandmarkObservation>& obs,
                             const PoseParameters& pose,
                             const Eigen::VectorXd& expr);
-    // Interior-landmark reprojection RMS of `shape` under `pose` — the
-    // safeguard for the photometric pose refinement.
     double interiorRms(const std::vector<LandmarkObservation>& obs,
                        const Eigen::MatrixX3f& shape,
                        const PoseParameters& pose) const;

@@ -1,35 +1,23 @@
 #pragma once
 #include <Eigen/Dense>
 
-// Spherical-harmonics (order-2) lighting — Step 5 of the renderer.
-//
-// Under the Lambertian + distant-smooth-light assumptions, the shading at a
-// surface point depends only on its normal n and can be written as a linear
-// combination of 9 spherical-harmonics basis functions evaluated at n:
-//
-//     shading(n) = Σ_{i=0..8}  γ_i · B_i(n)             (per colour channel)
-//     pixel_colour = albedo ⊙ shading                  (⊙ = element-wise)
-//
-// γ is a 9×3 matrix (9 coeffs per RGB channel). It is one of the parameters we
-// optimise; because shading is *linear* in γ, fitting it is a linear problem.
+// simple lighting for the renderer. it assumes a smooth far-away light so the
+// brightness at a point only depends on which way that point faces. we keep the
+// light as 9 spherical-harmonics numbers per colour channel and the final pixel
+// is just albedo times this shading. it is linear in those 9 numbers which is
+// why we can recover the light with plain least squares
 namespace light {
 
 using Vector9f = Eigen::Matrix<float, 9, 1>;
-using SHCoeffs = Eigen::Matrix<float, 9, 3>;   // 9 basis × RGB
+using SHCoeffs = Eigen::Matrix<float, 9, 3>;   // 9 coeffs per RGB channel
 
-// Evaluate the 9 order-2 real SH basis functions at a unit normal n.
-// Returns [B0(n) … B8(n)]ᵀ.
+// the 9 basis values for a given surface normal
 Vector9f shBasis(const Eigen::Vector3f& n);
 
-// A neutral white light (ambient-dominant) — useful as a default so the first
-// render isn't black. Sets the constant (DC) band on all three channels.
+// a neutral white light so the very first render is not black
 SHCoeffs defaultWhite();
 
-// Per-vertex shaded colours = albedo ⊙ (B(nᵢ)·γ), clamped to [0,1].
-//   albedo     : (N,3) per-vertex RGB in [0,1]
-//   normalsCam : (N,3) unit normals in the CAMERA frame
-//   sh         : (9,3) SH coefficients
-// Returns (N,3) shaded colours.
+// shade every vertex, gives back albedo times the light clamped to [0,1]
 Eigen::MatrixX3f shadeVertices(const Eigen::MatrixX3f& albedo,
                                const Eigen::MatrixX3f& normalsCam,
                                const SHCoeffs&         sh);

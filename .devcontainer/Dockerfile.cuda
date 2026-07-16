@@ -1,0 +1,47 @@
+# =============================================================================
+# CUDA build environment for the GPU renderer / GPU photometric solve.
+# Same libraries as the CPU Dockerfile, but on an NVIDIA CUDA *devel* base so
+# `nvcc` is available and `make USE_CUDA=1` works. Kept SEPARATE from the plain
+# Dockerfile so CPU-only teammates are unaffected.
+#
+# Base: CUDA 12.8 is the first toolkit with Blackwell (RTX 50xx, sm_120) support.
+# Your RTX 5070 is sm_120; your driver (CUDA 13.1) supports a 12.8 toolkit fine.
+# If this exact tag is missing, pick another 12.8+/13.x *-devel-ubuntu24.04* tag
+# from https://hub.docker.com/r/nvidia/cuda/tags .
+#
+#   docker build -t facerecon-cuda -f .devcontainer/Dockerfile.cuda .
+#   docker run --rm -it --gpus all -v "${PWD}:/workspace" -w /workspace facerecon-cuda bash
+#   # then inside:
+#   nvidia-smi                                  # should now list the RTX 5070
+#   make USE_CUDA=1 CUDA_ARCH=sm_120
+#   ./build/face_recon --mode verify-gpu
+# =============================================================================
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Same C++/Python stack as the CPU image (apt versions identical to ubuntu:24.04).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        git \
+        ca-certificates \
+        pkg-config \
+        libeigen3-dev \
+        libopencv-dev \
+        libhdf5-dev \
+        libceres-dev \
+        libdlib-dev \
+        libyaml-cpp-dev \
+        python3 \
+        python3-pip \
+        python3-numpy \
+        python3-scipy \
+        python3-h5py \
+        python3-opencv \
+        python3-matplotlib \
+        python3-yaml \
+    && rm -rf /var/lib/apt/lists/*
+
+# The CUDA devel image installs the toolkit at /usr/local/cuda → matches the
+# Makefile's default CUDA_HOME, so `make USE_CUDA=1 CUDA_ARCH=sm_120` just works.
+WORKDIR /workspace

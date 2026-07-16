@@ -1,3 +1,5 @@
+# detects 2D face landmarks with OpenCV and maps them to BFM vertices
+# also has small drawing helpers to check the detections
 import json
 import os
 import urllib.request
@@ -5,8 +7,7 @@ import urllib.request
 import cv2
 import numpy as np
 
-# OpenCV LBF landmark model URL (public GitHub raw file).
-# This is the standard pretrained model used by OpenCV's facemark LBF.
+# url for the pretrained OpenCV LBF landmark model (raw file on GitHub)
 LBF_MODEL_URL = "https://raw.githubusercontent.com/kurnianggoro/GSOC2017/master/data/lbfmodel.yaml"
 DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "lbfmodel.yaml")
 
@@ -28,22 +29,22 @@ DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "lb
 # }
 
 
-# dlib/LBF 68-point index -> BFM named landmark. subject-anatomical left/right
-# (dlib 36 = image-left eye = the subject's RIGHT eye), matching the BFM names.
+# maps dlib/LBF 68-point indices to BFM landmark names
+# left/right is from the subject's point of view, so dlib 36 (image-left eye)
+# is the subject's right eye, which matches the BFM names
 #
-# TWO sets, chosen per scenario (gen_landmarks.py --set small|dense):
+# there are two sets, picked per scenario (gen_landmarks.py --set small|dense):
 #
-# LBF68_TO_BFM_SMALL — the DEFAULT (9 reliable points: nose tip, 4 eye corners,
-#   2 lip corners, 2 lip-centre). Use for the iPhone / sparse-only fit. On a
-#   high-resolution photo (iPhone, ~2300 px face) more landmarks push the
-#   identity into DEPTH-overfitting (2D landmarks carry no depth; displacement
-#   0.9 mm -> ~12 mm), so keep it small there — the pose is what 2D landmarks
-#   pin, not the identity.
+# LBF68_TO_BFM_SMALL is the default, 9 solid points (nose tip, 4 eye corners,
+#   2 lip corners, 2 lip centres). use it for the iphone / sparse-only fit. on
+#   a high-res photo (face ~2300 px) more landmarks make the identity overfit
+#   the depth (2D points carry no depth, a 0.9 mm shift becomes ~12 mm), so
+#   keep it small, the 2D landmarks pin the pose not the identity
 #
-# LBF68_TO_BFM_DENSE — 25 points, for the Biwi / dense scenario. There the
-#   dense depth term supplies the identity, so the extra landmarks only help
-#   the Stage-1 pose and the overfitting risk is gone.
-#   (Jawline 0-16 stays unmapped in both: contour points have no fixed vertex.)
+# LBF68_TO_BFM_DENSE has 25 points, for the Biwi / dense case. there the depth
+#   term gives the identity, so the extra landmarks only help the stage-1 pose
+#   and the overfitting is no longer a problem
+#   the jawline 0-16 stays unmapped in both, contour points have no fixed vertex
 LBF68_TO_BFM_SMALL = {
     30: "center.nose.tip",
 
@@ -60,7 +61,7 @@ LBF68_TO_BFM_SMALL = {
 }
 
 LBF68_TO_BFM_DENSE = {
-    8:  "center.chin.tip",     # chin tip is stable when the face is ~frontal
+    8:  "center.chin.tip",     # chin tip is steady when the face is roughly frontal
 
     30: "center.nose.tip",
     31: "right.nose.wing.outer",
@@ -91,7 +92,7 @@ LBF68_TO_BFM_DENSE = {
     66: "center.lips.lower.inner",
 }
 
-# Default mapping (backwards-compatible name).
+# default mapping, kept under the old name
 LBF68_TO_BFM = LBF68_TO_BFM_SMALL
 
 
@@ -160,17 +161,10 @@ def _face_cascade():
 
 
 def detect_landmarks(image, facemark, face_cascade=None, rgb=True, min_size=(50, 50)):
-    """Detect 2D facial landmarks in an image.
+    """find 2D face landmarks in an image
 
-    Args:
-        image: RGB or BGR image.
-        facemark: cv2.face facemark detector.
-        face_cascade: optional OpenCV CascadeClassifier.
-        rgb: whether input image is RGB (True) or BGR (False).
-        min_size: minimum face size for detection.
-
-    Returns:
-        List of num_faces arrays of shape (N, 2), or [] if none found.
+    first runs the haar cascade to find faces, then the facemark model on each
+    returns one (N, 2) array per face, or [] if no face was found
     """
     if face_cascade is None:
         face_cascade = _face_cascade()
@@ -244,6 +238,7 @@ def draw_landmark_labels(image, landmarks, correspondences, rgb=True,
     return img
 
 
+# turns the index->name mapping into index->(name, bfm vertex) using the loaded model
 def bfm_correspondences(bfm, mapping=LBF68_TO_BFM):
     out = {}
 
@@ -286,10 +281,10 @@ def save_correspondence_text(correspondences, path):
 
 
 def landmark_correspondence_pairs(detected_landmarks, correspondence):
-    """Return matched 2D landmark points and BFM vertex indices.
+    """pair up detected 2D points with their BFM vertex indices
 
-    detected_landmarks should be an (N, 2) array of OpenCV 68-point detections.
-    correspondence is a dict produced by bfm_correspondences(bfm).
+    detected_landmarks is an (N, 2) array of OpenCV 68-point detections
+    correspondence is the dict from bfm_correspondences(bfm)
     """
     detected_landmarks = np.asarray(detected_landmarks, dtype=np.float64).reshape(-1, 2)
     pts2d = []

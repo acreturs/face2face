@@ -8,34 +8,33 @@
 
 #include "CeresFitter.h"   // LandmarkObservation
 
-// In-process 68-point facial-landmark detection — the C++ twin of
-// python/landmarks.py, so RGB video can be tracked without a per-frame Python
-// round-trip.
+// finds 68 facial landmarks in an image without leaving C++ so RGB video can
+// be tracked without calling out to python every frame. this is the twin of
+// python/landmarks.py
 //
-// Face box: prefers YuNet (a CNN detector robust to head pose); falls back to a
-// Haar frontal cascade if the YuNet model is unavailable. Landmarks: OpenCV LBF
-// facemark on the detected box.
-//
-// detect() returns solver observations directly: interior points mapped to their
-// BFM vertex indices + the jawline as CONTOUR points (vertexIndex -1). Empty ⇒
-// no face found.
+// for the face box it prefers YuNet (a CNN that copes with head pose) and
+// falls back to a Haar frontal cascade if the YuNet model is missing. the
+// landmarks themselves come from OpenCV's LBF facemark on that box
 class LandmarkDetector {
 public:
-    // lbfModelPath: pretrained lbfmodel.yaml (downloaded by the Python tool).
-    // yunetPath: YuNet ONNX model; empty/missing ⇒ use the Haar fallback.
-    // cascadePath: optional explicit Haar path (else standard locations tried).
+    // lbfModelPath points at the pretrained lbfmodel.yaml
+    // yunetPath is the YuNet ONNX model, leave empty to force the Haar fallback
+    // cascadePath is an optional explicit Haar path
     LandmarkDetector(const std::string& lbfModelPath,
                      const std::string& yunetPath   = "",
                      const std::string& cascadePath = "");
 
+    // gives back solver-ready observations, interior points carry their BFM
+    // vertex index and the jawline comes back as contour points (index -1).
+    // empty means no face was found
     std::vector<LandmarkObservation> detect(const cv::Mat& bgr);
 
     bool ok() const { return ok_; }
     bool usingYuNet() const { return static_cast<bool>(yunet_); }
 
 private:
-    // Detects the face box. When YuNet is active, also returns its 5 pose-robust
-    // landmarks (right eye, left eye, nose, right mouth, left mouth) in `pts`.
+    // finds the face box. with YuNet active it also fills `pts` with its 5
+    // pose-robust points (eyes, nose, mouth corners)
     bool faceBox(const cv::Mat& bgr, cv::Rect& box, std::vector<cv::Point2f>* pts);
 
     cv::Ptr<cv::face::Facemark> facemark_;

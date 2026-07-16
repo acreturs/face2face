@@ -7,6 +7,9 @@
 #include "LandmarkDetector.h"
 #include "FaceTracker.h"
 #include "ScopedTimer.h"
+#ifdef USE_CUDA
+#include "CudaRenderer.h"   // GPU rasteriser (built with `make USE_CUDA=1`)
+#endif
 
 #include <Eigen/Dense>
 #include <opencv2/core.hpp>
@@ -936,6 +939,7 @@ struct LiveOptions {
     // --optimize-focal; robust recovery needs multi-keyframe bundling (plan §3).
     bool        optimizeFocal = false;
     double      initZ         = 500.0;  // webcam ≈ arm's length (mm)
+    bool        gpuRender     = false;  // --gpu-render: CUDA display renderer (transfer)
     // --transfer-target <biwi-dir>: expression-transfer mode. The named subject
     // is personalised once as the TARGET avatar; the live camera drives it with
     // YOUR expressions (neutral-relative δ). Empty ⇒ normal live tracking.
@@ -1075,9 +1079,15 @@ static cv::Mat drawKeypointsDebug(const cv::Mat&                          frame,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ENTRY POINT: live-cpu — realtime reconstruction from the Mac camera (CPU)
+// ENTRY POINT: live-cpu / live-gpu — realtime reconstruction from the camera.
 // ─────────────────────────────────────────────────────────────────────────────
-static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions& lo)
+// Generic over the DISPLAY renderer: Renderer (CPU) or CudaRenderer (GPU); both
+// share the same ctor + render() contract, so the camera/track loop is one body.
+// Tracking + photometric still run on the CPU renderer inside FaceTracker; only
+// the overlay render is swapped here. (--photo-gpu additionally moves the
+// photometric SOLVE to the GPU, for any renderer choice.)
+template <class RendererT>
+static void runLiveImpl(const BFMLoader& bfm, double sparseReg, const LiveOptions& lo)
 {
     cv::VideoCapture cap;
     cv::Mat raw;
@@ -1114,7 +1124,7 @@ static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions
 
     FaceTracker tracker(bfm, K0, liveConfig(sparseReg, lo));
 
-    const Renderer renderer(H, W, bfm.faces());
+    const RendererT renderer(H, W, bfm.faces());
     const std::string liveDir = outDir("live");
     double fpsEma = 0.0;
     long processed = 0, written = 0;
@@ -1254,6 +1264,11 @@ static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions
 //   δ_target = δ_target_neutral + (δ_you − δ_you_neutral)
 // so each face keeps its own resting shape and only the CHANGE is transferred.
 // Expression-only: the target stays frontal; only the face articulates.
+// Generic over the DISPLAY renderer (Renderer=CPU, CudaRenderer=GPU) so the
+// avatar panels can render on the GPU for the video/live transfer — selected by
+// --gpu-render (requires a USE_CUDA build). Fitting stays as in the CPU path;
+// --photo-gpu additionally moves the one-off personalise photometric to the GPU.
+template <class RendererT>
 static void runTransferLive(const BFMLoader& bfm, double sparseReg,
                             const LiveOptions& lo)
 {
@@ -1313,9 +1328,9 @@ static void runTransferLive(const BFMLoader& bfm, double sparseReg,
 
     const int TH = H, TW = H;                       // square target panel
     const Eigen::Matrix3f tgtK = proj::defaultIntrinsics(TW, TH);
-    const Renderer tgtRenderer(TH, TW, bfm.faces());
+    const RendererT tgtRenderer(TH, TW, bfm.faces());
     // Renderer for the driven avatar over the target's OWN photo (its pose).
-    const Renderer tgtOverlayRenderer(tgtImg.rows, tgtImg.cols, bfm.faces());
+    const RendererT tgtOverlayRenderer(tgtImg.rows, tgtImg.cols, bfm.faces());
     PoseParameters frontal; frontal.translation = Eigen::Vector3d(0, 0, kFrontalRenderDepthMM);
 
     Eigen::VectorXd userNeutral; bool haveUserNeutral = false;
@@ -1418,18 +1433,111 @@ static void runTransferLive(const BFMLoader& bfm, double sparseReg,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ENTRY POINT: live-gpu — realtime reconstruction on the GPU (colleagues' WIP)
+// ENTRY POINTS: live-cpu / live-gpu — thin wrappers over runLiveImpl<>.
 // ─────────────────────────────────────────────────────────────────────────────
-// Stub. The intended design (see PLAN_REALTIME.md §4): a GPU rasteriser + an
-// analytic-Jacobian photometric solve, driven by the SAME FaceTracker
-// personalise/track split as runLiveCpu(). Wire the GPU renderer + solver in
-// here and reuse the camera/HUD loop from runLiveCpu().
+static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions& lo)
+{
+    runLiveImpl<Renderer>(bfm, sparseReg, lo);
+}
+
+#ifdef USE_CUDA
+// Same realtime loop as live-cpu, but the overlay is rendered by the CUDA
+// rasteriser. Tracking stays on the CPU; add --photo-gpu to also move the
+// photometric solve to the GPU.
+static void runLiveGpu(const BFMLoader& bfm, double sparseReg, const LiveOptions& lo)
+{
+    std::cout << "live-gpu: CUDA display renderer active "
+                 "(tracking on CPU; add --photo-gpu for the GPU photometric solve)\n";
+    runLiveImpl<CudaRenderer>(bfm, sparseReg, lo);
+}
+#else
 static void runLiveGpu(const BFMLoader& bfm, double sparseReg, const LiveOptions& lo)
 {
     (void)bfm; (void)sparseReg; (void)lo;
-    std::cerr << "live-gpu: not implemented yet — under development by the GPU "
-                 "team. Use --mode live-cpu for the CPU tracker.\n";
+    std::cerr << "live-gpu: this binary was built without CUDA support.\n"
+                 "  Rebuild on an NVIDIA machine with:  make USE_CUDA=1\n"
+                 "  (optionally CUDA_ARCH=sm_XX). Use --mode live-cpu meanwhile.\n";
 }
+#endif
+
+#ifdef USE_CUDA
+// ENTRY POINT: verify-gpu — CPU vs CUDA renderer parity + speed on the mean face
+// (deterministic; needs only the BFM). The correctness gate for the GPU
+// rasteriser: it must reproduce the CPU G-buffer, not just a similar image.
+static void runGpuCheck(const BFMLoader&        bfm,
+                        const Eigen::MatrixX3f& shape,
+                        const Eigen::MatrixX3f& albedo)
+{
+    constexpr int RH = 480, RW = 640;
+    const RenderInput in{
+        .shape  = shape,
+        .albedo = albedo,
+        .R      = Eigen::Matrix3f::Identity(),
+        .t      = Eigen::Vector3f(0.0f, 0.0f, kFrontalRenderDepthMM),
+        .K      = proj::defaultIntrinsics(RW, RH),
+        .sh     = light::defaultWhite(),
+    };
+    const Renderer     cpu(RH, RW, bfm.faces());
+    const CudaRenderer gpu(RH, RW, bfm.faces());
+    const RenderOutput rc = cpu.render(in);
+    const RenderOutput rg = gpu.render(in);
+
+    double imgMax = 0.0, imgSum = 0.0, baryMax = 0.0, depthMax = 0.0;
+    long   maskMismatch = 0, triMismatch = 0, covered = 0, both = 0;
+    for (int y = 0; y < RH; ++y)
+        for (int x = 0; x < RW; ++x) {
+            const cv::Vec3f a = rc.image.at<cv::Vec3f>(y, x);
+            const cv::Vec3f b = rg.image.at<cv::Vec3f>(y, x);
+            for (int c = 0; c < 3; ++c) {
+                const double d = std::abs(a[c] - b[c]);
+                imgMax = std::max(imgMax, d); imgSum += d;
+            }
+            const bool mc = rc.mask.at<uchar>(y, x) != 0;
+            const bool mg = rg.mask.at<uchar>(y, x) != 0;
+            if (mc) ++covered;
+            if (mc != mg) ++maskMismatch;
+            const int tc = rc.triIdx.at<int>(y, x), tg = rg.triIdx.at<int>(y, x);
+            if (mc && mg) {
+                ++both;
+                if (tc != tg) ++triMismatch;
+                else {
+                    const cv::Vec3f ba = rc.bary.at<cv::Vec3f>(y, x);
+                    const cv::Vec3f bb = rg.bary.at<cv::Vec3f>(y, x);
+                    for (int c = 0; c < 3; ++c)
+                        baryMax = std::max(baryMax, (double)std::abs(ba[c] - bb[c]));
+                    depthMax = std::max(depthMax,
+                        (double)std::abs(rc.depth.at<float>(y, x) - rg.depth.at<float>(y, x)));
+                }
+            }
+        }
+
+    std::cout << "\n== verify-gpu: CPU vs CUDA on the mean face (" << RW << "x" << RH << ") ==\n"
+              << "  CPU covered pixels      : " << covered << "\n"
+              << "  mask mismatches         : " << maskMismatch << "\n"
+              << "  triIdx mismatches       : " << triMismatch
+              << " (of " << both << " shared)\n"
+              << "  image  max|Δ| / mean|Δ| : " << imgMax << " / " << (imgSum / (RW * RH * 3)) << "\n"
+              << "  bary   max|Δ| (same tri): " << baryMax << "\n"
+              << "  depth  max|Δ| mm        : " << depthMax << "\n";
+
+    constexpr int WARMUP = 3, N = 50;
+    for (int i = 0; i < WARMUP; ++i) { cpu.render(in); gpu.render(in); }
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < N; ++i) cpu.render(in);
+    const auto t1 = std::chrono::steady_clock::now();
+    for (int i = 0; i < N; ++i) gpu.render(in);
+    const auto t2 = std::chrono::steady_clock::now();
+    const double cpuMs = std::chrono::duration<double, std::milli>(t1 - t0).count() / N;
+    const double gpuMs = std::chrono::duration<double, std::milli>(t2 - t1).count() / N;
+    std::cout << "  render time  CPU " << std::fixed << std::setprecision(2) << cpuMs
+              << " ms   GPU " << gpuMs << " ms   speedup "
+              << std::setprecision(1) << (gpuMs > 0 ? cpuMs / gpuMs : 0.0) << "x\n\n";
+
+    const std::string dbg = outDir("debug");
+    writeColourImage(rc, dbg + "/gpu_check_cpu.png");
+    writeColourImage(rg, dbg + "/gpu_check_gpu.png");
+}
+#endif
 
 // Render the mean face into a synthetic camera and dump depth + colour PNGs.
 // Verifies the full forward pipeline (project → cull → rasterize → shade).
@@ -1747,7 +1855,9 @@ static void printUsage()
       "Realtime (Mac camera, HOST only — Docker has no camera):\n"
       "  live-cpu   the CPU tracker (this build)\n"
       "  transfer   live expression transfer onto a target avatar\n"
-      "  live-gpu   GPU tracker — stub, under development\n"
+      "  live-gpu   CPU tracker + CUDA display renderer (needs make USE_CUDA=1)\n"
+      "GPU renderer checks (needs make USE_CUDA=1):\n"
+      "  verify-gpu CPU vs CUDA renderer parity + speed on the mean face\n"
       "Single-frame geometry (kept for reports):\n"
       "  dense      depth-only ICP\n"
       "  full       sparse landmark fit → dense ICP\n\n"
@@ -1766,6 +1876,13 @@ static void printUsage()
       "  --transfer-target <biwi-dir>   avatar to drive in --mode transfer\n"
       "  --bundle           multi-keyframe identity bundle (rgb/rgbd, Face2Face \u00a76)\n"
       "  --bundle-keyframes <k>   keyframes for --bundle (default 7)\n"
+      "  --photo-gpu        photometric geometry solve on the GPU "
+      "(finite-diff; needs make USE_CUDA=1)\n"
+      "  --photo-gpu-analytic  GPU photometric solve with analytic Jacobian\n"
+      "  --gpu-render       render on the GPU in --mode transfer (needs make USE_CUDA=1)\n"
+      "  --photo-samples <K>  randomly use K covered pixels per photometric "
+      "iteration (0 = all)\n"
+      "  --photo-csv <path>   append per-iteration photometric convergence rows\n"
       "  --timers           print per-stage timings\n";
 }
 
@@ -1804,6 +1921,34 @@ int main(int argc, char** argv)
         else if (arg == "--optimize-focal") live.optimizeFocal = true;
         else if (arg == "--bundle") kBundlePersonalise = true;
         else if (arg == "--bundle-keyframes" && i + 1 < argc) kBundleKeyframes = std::stoi(argv[++i]);
+        else if (arg == "--photo-gpu") {
+#ifdef USE_CUDA
+            CeresFitter::usePhotometricGpu = true;
+            std::cout << "photometric geometry solve: GPU (CUDA finite-diff LM)\n";
+#else
+            std::cerr << "--photo-gpu ignored: built without CUDA (rebuild: make USE_CUDA=1)\n";
+#endif
+        }
+        else if (arg == "--photo-gpu-analytic") {
+#ifdef USE_CUDA
+            CeresFitter::usePhotometricGpu = true;
+            CeresFitter::photoGpuAnalytic  = true;
+            std::cout << "photometric geometry solve: GPU (CUDA analytic-Jacobian LM)\n";
+#else
+            std::cerr << "--photo-gpu-analytic ignored: built without CUDA (rebuild: make USE_CUDA=1)\n";
+#endif
+        }
+        else if (arg == "--gpu-render") {
+#ifdef USE_CUDA
+            live.gpuRender = true;
+#else
+            std::cerr << "--gpu-render ignored: built without CUDA (rebuild: make USE_CUDA=1)\n";
+#endif
+        }
+        else if (arg == "--photo-samples" && i + 1 < argc)
+            CeresFitter::photoSamples = std::stoi(argv[++i]);
+        else if (arg == "--photo-csv" && i + 1 < argc)
+            CeresFitter::photoCsvPath = argv[++i];
         else if (arg == "--timers") ScopedTimer::enabled = true;
         else { std::cerr << "unknown argument: " << arg << "\n\n"; printUsage(); return 1; }
     }
@@ -1834,9 +1979,22 @@ int main(int argc, char** argv)
                          "to drive), e.g. --transfer-target data/BK-1/05\n";
             return 1;
         }
-        runTransferLive(bfm, sparseReg, live);
+#ifdef USE_CUDA
+        if (live.gpuRender) runTransferLive<CudaRenderer>(bfm, sparseReg, live);
+        else                runTransferLive<Renderer>(bfm, sparseReg, live);
+#else
+        runTransferLive<Renderer>(bfm, sparseReg, live);
+#endif
     } else if (mode == "live-gpu") {
         runLiveGpu(bfm, sparseReg, live);
+    } else if (mode == "verify-gpu") {
+#ifdef USE_CUDA
+        runGpuCheck(bfm, meanShape, albedo);
+        return 0;
+#else
+        std::cerr << "verify-gpu: built without CUDA. Rebuild with: make USE_CUDA=1\n";
+        return 1;
+#endif
     } else if (mode == "dense") {
         fitDenseOnBiwi(bfm, meanShape, albedo, /*sparseInit=*/nullptr, icpIters);
     } else if (mode == "full") {

@@ -1,0 +1,15 @@
+# Keep the Docker build context small: none of this is needed to build the
+# image (the Dockerfiles only apt-install libraries — they COPY nothing), and
+# shipping the licensed data/ + build artefacts to the daemon wastes disk/time.
+data/
+build/
+.git/
+.idea/
+third_party/
+**/__pycache__/
+*.o
+*.png
+*.mp4
+*.obj
+*.pptx.pdf
+test_logs*/

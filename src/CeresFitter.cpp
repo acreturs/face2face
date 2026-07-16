@@ -12,6 +12,7 @@
 #include <Eigen/Geometry>
 
 #include <fstream>
+#include <random>
 #include <iostream>
 #include <stdexcept>
 
@@ -22,6 +23,30 @@
 #include <vector>
 #include <memory>
 #include <utility>
+
+// GPU photometric inner solve — off unless --photo-gpu (and a USE_CUDA build).
+bool        CeresFitter::usePhotometricGpu = false;
+bool        CeresFitter::photoGpuAnalytic  = false;
+int         CeresFitter::photoSamples      = 0;
+std::string CeresFitter::photoCsvPath;
+
+#ifdef USE_CUDA
+// Launchers implemented in src/render/cuda_photometric.cu (built by nvcc).
+extern "C" {
+void*  cudaPhotoPrepare(const float* image, int H, int W,
+                        float fx, float fy, float cx, float cy,
+                        int P, const double* basePoint, const double* bBasis,
+                        const double* target, int K, int optimizeShape);
+void   cudaPhotoNormalEq(void* h, const double* aa, const double* t, const double* shape,
+                         int optimizePose, int optimizeShape, int analytic,
+                         double sqrtWeight, double huberDelta,
+                         double* JtJ, double* Jtr, double* cost);
+double cudaPhotoCost(void* h, const double* aa, const double* t, const double* shape,
+                     int optimizePose, int optimizeShape,
+                     double sqrtWeight, double huberDelta);
+void   cudaPhotoDestroy(void* h);
+}
+#endif
 
 namespace {
 
@@ -2004,6 +2029,155 @@ static Eigen::VectorXd estimateAlbedoCoeffs(
     return beta.cwiseMax(-3.0).cwiseMin(3.0);
 }
 
+#ifdef USE_CUDA
+// small report from the GPU solve so the log can show before/after cost + iters
+struct GpuSolveStats { double costInitial = 0.0, costFinal = 0.0; int iters = 0; };
+
+// Host-side Levenberg–Marquardt driving the CUDA photometric kernels. Replaces
+// the per-pixel Ceres solve inside fitPhotometric when --photo-gpu is set. The
+// per-pixel residual/Jacobian (finite-difference) + normal-equation assembly run
+// on the GPU; the tiny nParams×nParams system is solved here with Eigen. Params
+// (angleAxis, translation, shapeCoefficients) are updated in place. Correspondence
+// buffers are laid out per pixel: gBase = 3·P; gBasis = K·3·P (only when
+// optimizeShape); gTarget = 3·P. See GPU_RENDERER.md.
+static void solvePhotometricGpu(
+    const cv::Mat&              rgbImage,   // CV_32FC3 RGB [0,1], H×W row-major
+    const Eigen::Matrix3f&      K,
+    const std::vector<double>&  gBase,
+    const std::vector<double>&  gBasis,
+    const std::vector<double>&  gTarget,
+    int P, int Kshape, bool optimizePose, bool optimizeShape,
+    double sqrtWeight, double huberDelta, double shapeRegWeight,
+    double tzMin, double tzMax, double shapeLo, double shapeHi,
+    double* angleAxis, double* translation, double* shapeCoefficients,
+    bool analytic, int maxIters, GpuSolveStats* stats = nullptr)
+{
+    const int poseParams = optimizePose ? 6 : 0;
+    const int nP = poseParams + (optimizeShape ? Kshape : 0);
+    if (nP == 0 || P == 0) return;
+
+    void* h = cudaPhotoPrepare(
+        reinterpret_cast<const float*>(rgbImage.data), rgbImage.rows, rgbImage.cols,
+        K(0, 0), K(1, 1), K(0, 2), K(1, 2), P, gBase.data(),
+        optimizeShape ? gBasis.data() : nullptr, gTarget.data(),
+        Kshape, optimizeShape ? 1 : 0);
+
+    double aa[3] = { angleAxis[0], angleAxis[1], angleAxis[2] };
+    double t[3]  = { translation[0], translation[1], translation[2] };
+    std::vector<double> shape(Kshape);
+    for (int k = 0; k < Kshape; ++k) shape[k] = shapeCoefficients[k];
+
+    // δ (active-param order: pose 0..5, then shape) → trial (aa,t,shape) + bounds.
+    const auto applyDelta = [&](const Eigen::VectorXd& d,
+                                double* aaT, double* tT, std::vector<double>& shT) {
+        for (int i = 0; i < 3; ++i) { aaT[i] = aa[i]; tT[i] = t[i]; }
+        for (int k = 0; k < Kshape; ++k) shT[k] = shape[k];
+        int a = 0;
+        if (optimizePose) {
+            const Eigen::Vector3d drot(d(a), d(a + 1), d(a + 2)); a += 3;
+            const Eigen::Vector3d dt  (d(a), d(a + 1), d(a + 2)); a += 3;
+            if (analytic) {
+                // δrot is a LOCAL SO(3) update: R_new = R(δrot)·R_cur.
+                const Eigen::Vector3d aaCur(aa[0], aa[1], aa[2]);
+                const double angCur = aaCur.norm();
+                const Eigen::Matrix3d Rcur = angCur > 1e-12
+                    ? Eigen::Matrix3d(Eigen::AngleAxisd(angCur, aaCur / angCur))
+                    : Eigen::Matrix3d::Identity();
+                const double angD = drot.norm();
+                const Eigen::Matrix3d Rd = angD > 1e-12
+                    ? Eigen::Matrix3d(Eigen::AngleAxisd(angD, drot / angD))
+                    : Eigen::Matrix3d::Identity();
+                const Eigen::AngleAxisd aaNew(Rd * Rcur);
+                const Eigen::Vector3d v = aaNew.angle() * aaNew.axis();
+                aaT[0] = v(0); aaT[1] = v(1); aaT[2] = v(2);
+            } else {                                   // FD: global angle-axis update
+                aaT[0] = aa[0] + drot(0); aaT[1] = aa[1] + drot(1); aaT[2] = aa[2] + drot(2);
+            }
+            tT[0] = t[0] + dt(0); tT[1] = t[1] + dt(1); tT[2] = t[2] + dt(2);
+            if (tT[2] < tzMin) tT[2] = tzMin;
+            if (tT[2] > tzMax) tT[2] = tzMax;
+        }
+        if (optimizeShape)
+            for (int k = 0; k < Kshape; ++k) {
+                shT[k] = shape[k] + d(a++);
+                if (shT[k] < shapeLo) shT[k] = shapeLo;
+                if (shT[k] > shapeHi) shT[k] = shapeHi;
+            }
+    };
+
+    const auto addShapePrior = [&](std::vector<double>& JtJ, std::vector<double>& Jtr,
+                                   double& cost, const std::vector<double>& sh) {
+        if (!optimizeShape) return;
+        for (int k = 0; k < Kshape; ++k) {
+            const int idx = poseParams + k;
+            JtJ[idx * nP + idx] += shapeRegWeight;
+            Jtr[idx]            += shapeRegWeight * sh[k];
+            cost                += shapeRegWeight * sh[k] * sh[k];
+        }
+    };
+
+    std::vector<double> JtJ(nP * nP, 0.0), Jtr(nP, 0.0);
+    double cost0 = 0.0;
+    cudaPhotoNormalEq(h, aa, t, shape.data(), optimizePose ? 1 : 0, optimizeShape ? 1 : 0,
+                      analytic ? 1 : 0, sqrtWeight, huberDelta, JtJ.data(), Jtr.data(), &cost0);
+    addShapePrior(JtJ, Jtr, cost0, shape);
+
+    const double costInitial = cost0;   // for the log / csv
+    int acceptedSteps = 0;
+
+    double lambda = 1e-3;
+    for (int iter = 0; iter < maxIters; ++iter) {
+        Eigen::MatrixXd A(nP, nP);
+        Eigen::VectorXd g(nP);
+        for (int i = 0; i < nP; ++i) {
+            g(i) = Jtr[i];
+            for (int j = 0; j < nP; ++j) A(i, j) = JtJ[i * nP + j];
+        }
+
+        bool accepted = false;
+        for (int tryk = 0; tryk < 8 && !accepted; ++tryk) {
+            Eigen::MatrixXd Ad = A;
+            for (int i = 0; i < nP; ++i) Ad(i, i) += lambda * std::max(A(i, i), 1e-12);
+            const Eigen::VectorXd delta = Ad.ldlt().solve(-g);
+
+            double aaT[3], tT[3];
+            std::vector<double> shT(Kshape);
+            applyDelta(delta, aaT, tT, shT);
+
+            double costT = cudaPhotoCost(h, aaT, tT, shT.data(),
+                                         optimizePose ? 1 : 0, optimizeShape ? 1 : 0,
+                                         sqrtWeight, huberDelta);
+            if (optimizeShape)
+                for (int k = 0; k < Kshape; ++k) costT += shapeRegWeight * shT[k] * shT[k];
+
+            if (costT < cost0) {                       // accept → recompute at new point
+                for (int i = 0; i < 3; ++i) { aa[i] = aaT[i]; t[i] = tT[i]; }
+                for (int k = 0; k < Kshape; ++k) shape[k] = shT[k];
+                cost0  = costT;
+                lambda = std::max(lambda * 0.3, 1e-7);
+                accepted = true;
+                ++acceptedSteps;
+                std::fill(JtJ.begin(), JtJ.end(), 0.0);
+                std::fill(Jtr.begin(), Jtr.end(), 0.0);
+                double c2 = 0.0;
+                cudaPhotoNormalEq(h, aa, t, shape.data(), optimizePose ? 1 : 0,
+                                  optimizeShape ? 1 : 0, analytic ? 1 : 0, sqrtWeight, huberDelta,
+                                  JtJ.data(), Jtr.data(), &c2);
+                addShapePrior(JtJ, Jtr, c2, shape);
+            } else {
+                lambda *= 10.0;
+                if (lambda > 1e12) { accepted = true; iter = maxIters; }  // give up
+            }
+        }
+    }
+
+    for (int i = 0; i < 3; ++i) { angleAxis[i] = aa[i]; translation[i] = t[i]; }
+    for (int k = 0; k < Kshape; ++k) shapeCoefficients[k] = shape[k];
+    if (stats) { stats->costInitial = costInitial; stats->costFinal = cost0; stats->iters = acceptedSteps; }
+    cudaPhotoDestroy(h);
+}
+#endif  // USE_CUDA
+
 FitParameters CeresFitter::fitPhotometric(
     const Eigen::MatrixX3f&           meanShape,
     const Eigen::MatrixXf&            shapeBasis,
@@ -2212,14 +2386,42 @@ FitParameters CeresFitter::fitPhotometric(
         // (d) one residual per covered pixel: its surface point (barycentric
         //     blend of the triangle's 3 vertices) reprojected into the input
         //     image vs the rendered colour at that pixel.
+#ifdef USE_CUDA
+        // GPU path: collect the fixed per-pixel correspondences and solve the
+        // whole geometry step on the device (see solvePhotometricGpu). Only when
+        // --photo-gpu is set AND geometry is actually solved.
+        // The GPU inner solve does not (yet) include the joint E_lan landmark
+        // anchor. When the caller supplies that anchor (the personalise IDENTITY
+        // refinement, which relies on it to make a low shape reg safe), stay on
+        // the CPU/Ceres path so we never silently drop it. Pose-only / non-anchored
+        // photometric solves still use the GPU.
+        const bool gpuSolve = CeresFitter::usePhotometricGpu && solveGeometry &&
+                              !(landmarks && landmarkWeight > 0.0);
+        std::vector<double> gBase, gBasis, gTarget;
+#endif
+        // Gather the covered pixels first (base grid = pixelStride). If
+        // photoSamples > 0, keep only a random uniform sample of them for this
+        // iteration; re-drawn every outer iteration so across the whole fit all
+        // pixels get used (the stochastic-subsampling speedup). photoSamples==0
+        // keeps every pixel, i.e. the old behaviour.
+        std::vector<cv::Point> pts;
+        for (int y = 0; y < H; y += pixelStride)
+            for (int x = 0; x < W; x += pixelStride)
+                if (out.mask.at<uchar>(y, x) && out.triIdx.at<int>(y, x) >= 0)
+                    pts.emplace_back(x, y);
+        if (CeresFitter::photoSamples > 0 &&
+            static_cast<int>(pts.size()) > CeresFitter::photoSamples) {
+            std::mt19937 rng(1234u + static_cast<unsigned>(it));   // varies per outer iter
+            std::shuffle(pts.begin(), pts.end(), rng);
+            pts.resize(static_cast<size_t>(CeresFitter::photoSamples));
+        }
+
         ceres::Problem problem;
         int used = 0;
         double sumSquared = 0.0;
-        for (int y = 0; y < H; y += pixelStride)
-            for (int x = 0; x < W; x += pixelStride) {
-                if (!out.mask.at<uchar>(y, x)) continue;
+        for (const cv::Point& pt : pts) {
+                const int x = pt.x, y = pt.y;
                 const int f = out.triIdx.at<int>(y, x);
-                if (f < 0) continue;
 
                 // target = rendered colour at this pixel (render() output).
                 const cv::Vec3f rc = out.image.at<cv::Vec3f>(y, x);
@@ -2247,6 +2449,25 @@ FitParameters CeresFitter::fitPhotometric(
                                 bw[1] * vBasis[i1][k] +
                                 bw[2] * vBasis[i2][k];
 
+#ifdef USE_CUDA
+                if (gpuSolve) {
+                    if (optimizeShape) {                       // surface = base + basis·shape
+                        gBase.push_back(bMean.x()); gBase.push_back(bMean.y()); gBase.push_back(bMean.z());
+                        for (int k = 0; k < kShapeCoefficientCount; ++k) {
+                            gBasis.push_back(bBasis[k].x());
+                            gBasis.push_back(bBasis[k].y());
+                            gBasis.push_back(bBasis[k].z());
+                        }
+                    } else {                                   // pose-only: fold frozen shape in
+                        Eigen::Vector3d sp = bMean;
+                        for (int k = 0; k < kShapeCoefficientCount; ++k)
+                            sp += bBasis[k] * shapeCoefficients[k];
+                        gBase.push_back(sp.x()); gBase.push_back(sp.y()); gBase.push_back(sp.z());
+                    }
+                    gTarget.push_back(target.x()); gTarget.push_back(target.y()); gTarget.push_back(target.z());
+                    continue;
+                }
+#endif
                 ceres::CostFunction* cost =
                     new ceres::AutoDiffCostFunction<PhotometricPixelResidual, 3,
                                                     3, 3, kShapeCoefficientCount>(
@@ -2285,8 +2506,32 @@ FitParameters CeresFitter::fitPhotometric(
             break;
         }
 
+        std::string solverReport;
         ceres::Solver::Summary summary;
+        double costInitial = 0.0, costFinal = 0.0;   // cost before/after this solve
         if (solveGeometry) {
+#ifdef USE_CUDA
+            if (gpuSolve) {
+                const int P = static_cast<int>(gTarget.size() / 3);
+                GpuSolveStats st;
+                solvePhotometricGpu(
+                    rgb, K, gBase, gBasis, gTarget, P, kShapeCoefficientCount,
+                    optimizePose, optimizeShape, sqrtWeight, /*huberDelta=*/0.1,
+                    shapeRegWeight, /*tzMin=*/100.0, /*tzMax=*/3000.0,
+                    /*shapeLo=*/-3.0, /*shapeHi=*/3.0,
+                    angleAxis, translation, shapeCoefficients,
+                    CeresFitter::photoGpuAnalytic, /*maxIters=*/25, &st);
+                costInitial = st.costInitial;
+                costFinal   = st.costFinal;
+                solverReport = std::string("GPU-LM (")
+                             + (CeresFitter::photoGpuAnalytic ? "analytic" : "finite-diff")
+                             + ")  pixels " + std::to_string(P)
+                             + "  cost " + std::to_string(costInitial)
+                             + " -> " + std::to_string(costFinal)
+                             + "  iters " + std::to_string(st.iters);
+            } else
+#endif
+            {
             if (optimizeShape) {
                 problem.AddResidualBlock(
                     new ceres::AutoDiffCostFunction<ShapeRegularizationResidual,
@@ -2318,14 +2563,28 @@ FitParameters CeresFitter::fitPhotometric(
             options.max_num_iterations = 25;
             options.minimizer_progress_to_stdout = false;
             ceres::Solve(options, &problem, &summary);
+            costInitial  = summary.initial_cost;
+            costFinal    = summary.final_cost;
+            solverReport = summary.BriefReport();
+            }
         }
+
+        if (solverReport.empty())
+            solverReport = solveGeometry ? summary.BriefReport()
+                                         : "linear appearance estimate only";
 
         const double rmse = std::sqrt(sumSquared / used);   // render−photo RMSE, [0,1]
         std::cout << "  photo " << it << " | pixels " << used
-                  << " | render-photo RMSE(before solve) " << rmse;
-        if (solveGeometry) std::cout << " | " << summary.BriefReport();
-        else               std::cout << " | linear appearance estimate only";
-        std::cout << '\n';
+                  << " | render-photo RMSE(before solve) " << rmse
+                  << " | " << solverReport << '\n';
+
+        // optional csv for plotting convergence: one row per outer iteration
+        // columns: iter,pixels,rmse_before,cost_initial,cost_final
+        if (!CeresFitter::photoCsvPath.empty()) {
+            std::ofstream csv(CeresFitter::photoCsvPath, std::ios::app);
+            if (csv) csv << it << ',' << used << ',' << rmse << ','
+                         << costInitial << ',' << costFinal << '\n';
+        }
 
         if (onIteration) {
             FitParameters current;

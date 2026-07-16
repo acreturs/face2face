@@ -1,3 +1,5 @@
+// loads the basel face model (bfm 2017) from its hdf5 file
+// pca shape, expression and color, plus topology and named landmarks
 #include "BFMLoader.h"
 #include <highfive/H5File.hpp>
 #include <highfive/H5DataSet.hpp>
@@ -8,11 +10,11 @@
 #include <sstream>
 #include <vector>
 
-//aktuell ist albedo noch ignoriert und immer gleich. Ist ein todo!ja bitte
+// todo albedo is still ignored and always the same
 
 using RowMat3f = Eigen::Matrix<float, Eigen::Dynamic, 3, Eigen::RowMajor>;
 
-// ── Small helpers to read the three PCA blocks (shape/expression/color) ────
+// small helpers to read the three pca blocks (shape, expression, color)
 
 static Eigen::VectorXf readVec(const HighFive::File& f, const std::string& path)
 {
@@ -37,18 +39,18 @@ static Eigen::MatrixXf readBasis(const HighFive::File& f, const std::string& pat
     return M;
 }
 
-// Landmarks live in `metadata/landmarks/json` as a UTF-8 JSON string mapping
-// landmark name → 3D coordinate. We pair each name with the nearest vertex
-// in the mean shape (which is how the Python loader did it).
+// landmarks live in metadata/landmarks/json as a json string mapping
+// name -> 3d point, we pair each name with the nearest mean-shape vertex
+// (same as the python loader did)
 static std::vector<BFMLandmark> readLandmarks(const HighFive::File& f,
                                               const Eigen::VectorXf& shape_mean)
 {
     std::vector<BFMLandmark> out;
 
     auto tryParse = [&](const std::string& blob) {
-        // Minimal parser for the BFM landmark JSON. The file is a single JSON
-        // object {"name": [x, y, z], ...}. We extract names and 3-vectors with
-        // a tiny hand-rolled scanner so we don't pull in a JSON dependency.
+        // minimal parser for the bfm landmark json, the file is one object
+        // {"name": [x, y, z], ...}, we scan out names and 3-vectors by hand
+        // so we don't pull in a json dependency
         const int N = static_cast<int>(shape_mean.size() / 3);
         size_t i = 0;
         while (i < blob.size()) {
@@ -74,7 +76,7 @@ static std::vector<BFMLandmark> readLandmarks(const HighFive::File& f,
                 }
                 p = q;
             }
-            // Nearest vertex in the mean mesh
+            // nearest vertex in the mean mesh
             int best = -1;
             float best_d = std::numeric_limits<float>::infinity();
             for (int v = 0; v < N; ++v) {
@@ -90,8 +92,8 @@ static std::vector<BFMLandmark> readLandmarks(const HighFive::File& f,
         }
     };
 
-    // BFM-2017 ships the landmarks under metadata/landmarks/json (a string).
-    // Wrap in try/catch — older / nomouth variants occasionally use /text.
+    // bfm-2017 ships landmarks under metadata/landmarks/json (a string),
+    // wrap in try/catch since older nomouth variants sometimes use /text
     try {
         std::string blob;
         f.getDataSet("metadata/landmarks/json").read(blob);
@@ -102,7 +104,7 @@ static std::vector<BFMLandmark> readLandmarks(const HighFive::File& f,
             f.getDataSet("metadata/landmarks/text").read(blob);
             tryParse(blob);
         } catch (const HighFive::Exception&) {
-            // Truly absent — caller will see landmarks().empty().
+            // truly absent, caller will see landmarks().empty()
         }
     }
     return out;
@@ -112,55 +114,55 @@ BFMLoader::BFMLoader(const std::string& path)
 {
     HighFive::File file(path, HighFive::File::ReadOnly);
 
-    // ── identity (shape) PCA ────────────────────────────────────────────────
+    // identity (shape) pca
     shape_mean  = readVec  (file, "shape/model/mean");
     shape_basis = readBasis(file, "shape/model/pcaBasis");
     shape_std   = readSigma(file, "shape/model/pcaVariance");
 
-    // ── expression PCA (additive, identity-independent) ─────────────────────
+    // expression pca, additive and identity independent
     expr_mean  = readVec  (file, "expression/model/mean");
     expr_basis = readBasis(file, "expression/model/pcaBasis");
     expr_std   = readSigma(file, "expression/model/pcaVariance");
 
-    // ── color / albedo PCA ──────────────────────────────────────────────────
+    // color / albedo pca
     color_mean  = readVec  (file, "color/model/mean");
     color_basis = readBasis(file, "color/model/pcaBasis");
     color_std   = readSigma(file, "color/model/pcaVariance");
 
-    // ── topology ────────────────────────────────────────────────────────────
+    // topology
     std::vector<std::vector<int>> cells;
     file.getDataSet("shape/representer/cells").read(cells);
     triangles.resize(cells.front().size(), 3);
     for (int c = 0; c < triangles.rows(); ++c)
         triangles.row(c) << cells[0][c], cells[1][c], cells[2][c];
 
-    // ── named landmarks (BFM↔dlib correspondence source) ────────────────────
+    // named landmarks, source of the bfm to dlib correspondence
     landmarks_ = readLandmarks(file, shape_mean);
 }
 
 Eigen::MatrixX3f BFMLoader::mean_shape() const
 {
-    //shape _mean ist ein flacher Vektor (alles untereinander), aber man braucht ihn als nx3 vektor um dann vertices zu rendern
+    // shape_mean is one flat vector, reshape to nx3 so we can render vertices
     return Eigen::Map<const RowMat3f>(shape_mean.data(), shape_mean.size() / 3, 3);
 }
 
 Eigen::MatrixX3f BFMLoader::shape(const Eigen::VectorXf& alpha) const
 {
-    const int k = alpha.size(); //benutzt nur die ersten k modes
+    const int k = alpha.size(); // use only the first k modes
     Eigen::VectorXf v = shape_mean
-        + shape_basis.leftCols(k) * (alpha.array() * shape_std.head(k).array()).matrix();//nur die ersten K von sigma (shape_std)
-    return Eigen::Map<RowMat3f>(v.data(), v.size() / 3, 3); //left col ist ersten k spalten, die restlichen modes fallen weg
+        + shape_basis.leftCols(k) * (alpha.array() * shape_std.head(k).array()).matrix();// only the first k of sigma (shape_std)
+    return Eigen::Map<RowMat3f>(v.data(), v.size() / 3, 3); // leftCols is the first k columns, the rest of the modes drop out
 }
 
 // identity + additive expression: V = mean_s + B_s·(α⊙σ_id) + B_e·(δ⊙σ_exp)
 //
-// NOTE: expr_mean is deliberately OMITTED. The Ceres fitter builds its model
-// points as mean_s + B_s·α + B_e·δ (no expr_mean), and mean_shape()/shape(α)
-// omit it too — so δ=0 must equal the closed-mouth neutral (shape_mean). The
-// BFM's expr_mean is the *average* expression over its database (~1.4 mm mean,
-// ~4 mm at the lower lip = a slightly parted mouth); adding it here opened the
-// rendered mouth by a displacement the optimiser never saw, which no
-// expression-prior tuning could close. Omitting it keeps render == fit.
+// note: expr_mean is left out on purpose. the ceres fitter builds its model as
+// mean_s + B_s·α + B_e·δ with no expr_mean, and mean_shape()/shape(α) leave it
+// out too, so δ=0 has to match the closed-mouth neutral (shape_mean). the bfm
+// expr_mean is the average expression over its database (a slightly parted
+// mouth), adding it here opened the rendered mouth by an offset the optimiser
+// never saw and no expression prior could close it, leaving it out keeps
+// render == fit
 Eigen::MatrixX3f BFMLoader::shape(const Eigen::VectorXf& alpha,
                                   const Eigen::VectorXf& delta) const
 {
@@ -172,15 +174,14 @@ Eigen::MatrixX3f BFMLoader::shape(const Eigen::VectorXf& alpha,
     return Eigen::Map<RowMat3f>(v.data(), v.size() / 3, 3);
 }
 
-//generated!
 Eigen::MatrixX3f BFMLoader::albedo() const
 {
     Eigen::MatrixX3f c = Eigen::Map<const RowMat3f>(color_mean.data(), color_mean.size() / 3, 3);
     if (c.maxCoeff() > 1.5f) c /= 255.0f;          // some models store 0..255
-    return c.cwiseMax(0.0f).cwiseMin(1.0f);        // clamp to [0,1] einfach normalisierung
+    return c.cwiseMax(0.0f).cwiseMin(1.0f);        // clamp to [0,1], simple normalisation
 }
 
-// per-vertex albedo with PCA coefficients applied: C = mean_c + B_c·(β⊙σ_alb)
+// per-vertex albedo with pca coefficients applied: C = mean_c + B_c·(β⊙σ_alb)
 Eigen::MatrixX3f BFMLoader::albedo(const Eigen::VectorXf& beta) const
 {
     const int k = beta.size();
@@ -198,10 +199,9 @@ int BFMLoader::landmark_index(const std::string& name) const
     return -1;
 }
 
-// ── BFM h5 introspection ────────────────────────────────────────────────────
-// Walks the entire HDF5 tree and prints every dataset (path, shape, dtype)
-// plus every group's attributes. At the end, prints a quick summary of what
-// this BFMLoader instance currently parses into its Eigen members.
+// bfm h5 introspection
+// walk the whole hdf5 tree and print every dataset (path, shape, dtype) plus
+// each group's attributes, then a summary of what this loader parsed
 
 static std::string shapeToStr(const std::vector<size_t>& dims)
 {
@@ -217,13 +217,13 @@ static std::string shapeToStr(const std::vector<size_t>& dims)
 
 static std::string dtypeToStr(const HighFive::DataType& dt)
 {
-    // HighFive doesn't expose a friendly name — fall back to class + size in bytes.
+    // highfive has no friendly name so fall back to class plus size in bytes
     return dt.string();
 }
 
-// Safely list attributes — some HDF5 object handles (notably the root file
-// handle in HighFive 2.x) raise H5Aget_num_attrs errors instead of returning
-// an empty list. Swallow the exception and pretend there were none.
+// safely list attributes, some hdf5 handles (notably the root file handle in
+// highfive 2.x) throw H5Aget_num_attrs errors instead of returning an empty
+// list, so swallow the exception and pretend there were none
 template <typename Obj>
 static std::vector<std::string> safeAttrs(const Obj& o)
 {
@@ -265,7 +265,7 @@ void BFMLoader::summariseBFM(const std::string& path) const
 
     HighFive::File file(path, HighFive::File::ReadOnly);
 
-    // Root attributes (skipped if HDF5 reports the file handle as non-attr-bearing)
+    // root attributes, skipped if hdf5 reports the file handle as non-attr-bearing
     for (const auto& a : safeAttrs(file))
         std::cout << "  @" << a << "  (root attribute)\n";
 
