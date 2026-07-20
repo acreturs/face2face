@@ -203,15 +203,12 @@ bool FaceTracker::personaliseBundle(
     return true;
 }
 
-// appearance (albedo β + SH lighting) plus a coarse-to-fine photometric
-// identity refine, then commit the tracking state. shared by the single-frame
-// and bundle personalise paths. pose and expr are the reference geometry fit
-//
-// depth is too coarse (~3 mm kinect noise) for the fine surface detail that
-// carries identity, the rgb shading carries it. we render the current model,
-// compare per-pixel to the photo and move shape (+ albedo + lighting) to match
-// (analysis-by-synthesis), coarse-to-fine, pose fixed, with a joint landmark
-// anchor so a low shape-reg can't drift the geometry
+// appearance (albedo β + SH lighting) plus a coarse-to-fine photometric identity
+// refine, then commit the tracking state. shared by the single-frame and bundle
+// personalise paths. depth is too coarse (~3 mm kinect noise) for the fine
+// surface detail that carries identity; the rgb shading carries it, so we render
+// the model, compare per-pixel to the photo and move shape (+albedo+lighting) to
+// match, coarse-to-fine, with a joint landmark anchor so a low shape-reg can't drift.
 void FaceTracker::finalizeAppearance(const cv::Mat& bgr,
                                      const std::vector<LandmarkObservation>& observations,
                                      const PoseParameters& pose,

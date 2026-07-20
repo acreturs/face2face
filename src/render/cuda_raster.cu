@@ -1,21 +1,14 @@
-// gpu z-buffer rasteriser, the cuda version of the cpu renderer
-// no eigen or opencv in here, it only talks to the rest of the code
-// through the extern "C" functions at the bottom
-//
-// three steps that match what the cpu renderer does:
-//   1. clearZ, set the whole buffer to empty (all ones)
-//   2. raster, one thread per triangle, walk its bbox and for each covered
-//      pixel atomicMin a packed key into the z-buffer
-//   3. resolve, one thread per pixel, decode the winning triangle and blend
-//      its vertex colours into the image
-//
-// the trick is packing depth and triangle id into one 64-bit key as
-// (depthBits << 32 | triangleId) so a single atomicMin picks the same
-// fragment the cpu would, nearest depth first and ties go to the smaller
-// triangle id
-//
-// this works because camera z is always > 0 here (we skip z <= 1e-6) and for
-// positive floats the raw bits sort the same as the values
+// gpu z-buffer rasteriser: the cuda version of the cpu renderer, talking to the
+// rest of the code only through the extern "C" functions at the bottom. three
+// steps matching the cpu renderer:
+//   1. clearZ   — set the buffer to empty
+//   2. raster   — one thread per triangle; for each covered pixel atomicMin a
+//                 packed (depthBits << 32 | triangleId) key into the z-buffer
+//   3. resolve  — one thread per pixel; decode the winning triangle and blend
+//                 its vertex colours into the image
+// packing depth+id into one 64-bit key lets a single atomicMin pick the same
+// fragment the cpu would (nearest depth, ties to the smaller id). works because
+// camera z > 0 here, so the raw float bits sort like the values.
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>

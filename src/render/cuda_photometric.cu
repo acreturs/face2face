@@ -1,29 +1,14 @@
-// gpu photometric inner solver, the cuda version of the per-pixel ceres solve
-// in CeresFitter::fitPhotometric which is where most of the time goes
-//
-// the set of pixels we look at is fixed during the inner solve, so every pixel
-// is independent and we can do them all in parallel. for each pixel the
-// residual is
-//
-//   r = sqrtWeight * ( targetColour - inputImage( project(R*S + t) ) )   (rgb)
-//
-//   S = basePoint + sum_k bBasis[k]*shape[k]
-//
-// the shape term is only there when shape is being optimised, otherwise the
-// frozen shape is already baked into basePoint on the host
-//
-// we build the gauss-newton normal equations (JtJ, Jtr) on the gpu. by default
-// the jacobian comes from central finite differences, which is easy to get
-// right because the residual is the only thing we need to compute. the small
-// nParams x nParams system is then solved on the host with eigen inside an LM
-// loop that calls cudaPhotoNormalEq and cudaPhotoCost here
-//
-// two things differ from the cpu ceres path
-//   - we sample the image bilinear, ceres uses bicubic, so tiny sub-pixel diffs
-//   - the jacobian is finite-difference instead of autodiff
-// both are fine for tracking, the cpu path stays the reference
-//
-// pure cuda, no eigen or opencv, talks to CeresFitter.cpp through extern "C"
+// gpu photometric inner solver: the cuda version of the per-pixel ceres solve in
+// CeresFitter::fitPhotometric (where most of the time goes). the pixel set is
+// fixed during the inner solve, so every pixel is independent and runs in
+// parallel; per pixel the residual is
+//   r = sqrtWeight * ( targetColour - inputImage(project(R*S + t)) )
+//   S = basePoint + sum_k bBasis[k]*shape[k]   (shape term only when optimising it)
+// we build the gauss-newton normal equations (JtJ, Jtr) on the gpu (jacobian by
+// central finite differences); the small nParams x nParams system is solved on
+// the host with eigen inside an LM loop. differs from the cpu path only in
+// bilinear (not bicubic) sampling and finite-difference (not autodiff) jacobians
+// — both fine for tracking. pure cuda, talks to CeresFitter.cpp via extern "C".
 #include <cuda_runtime.h>
 #include <cstdio>
 

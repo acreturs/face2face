@@ -154,15 +154,11 @@ Eigen::MatrixX3f BFMLoader::shape(const Eigen::VectorXf& alpha) const
     return Eigen::Map<RowMat3f>(v.data(), v.size() / 3, 3); // leftCols is the first k columns, the rest of the modes drop out
 }
 
-// identity + additive expression: V = mean_s + B_s·(α⊙σ_id) + B_e·(δ⊙σ_exp)
-//
-// note: expr_mean is left out on purpose. the ceres fitter builds its model as
-// mean_s + B_s·α + B_e·δ with no expr_mean, and mean_shape()/shape(α) leave it
-// out too, so δ=0 has to match the closed-mouth neutral (shape_mean). the bfm
-// expr_mean is the average expression over its database (a slightly parted
-// mouth), adding it here opened the rendered mouth by an offset the optimiser
-// never saw and no expression prior could close it, leaving it out keeps
-// render == fit
+// identity + additive expression: V = mean_s + B_s·(α⊙σ_id) + B_e·(δ⊙σ_exp).
+// expr_mean is left out on purpose: the fitter builds mean_s + B_s·α + B_e·δ with
+// no expr_mean, so δ=0 must match the closed-mouth neutral. the bfm expr_mean is
+// a slightly parted mouth; adding it opened the rendered mouth by an offset the
+// optimiser never saw, so leaving it out keeps render == fit.
 Eigen::MatrixX3f BFMLoader::shape(const Eigen::VectorXf& alpha,
                                   const Eigen::VectorXf& delta) const
 {
@@ -260,7 +256,7 @@ static void walk(const HighFive::Group& g, const std::string& prefix)
 
 void BFMLoader::summariseBFM(const std::string& path) const
 {
-    std::cout << "\n──────── BFM h5 summary ────────\n";
+    std::cout << "\n== BFM h5 summary ==\n";
     std::cout << "file: " << path << "\n\n";
 
     HighFive::File file(path, HighFive::File::ReadOnly);
@@ -271,7 +267,7 @@ void BFMLoader::summariseBFM(const std::string& path) const
 
     walk(file.getGroup("/"), "");
 
-    std::cout << "\n──────── Parsed by BFMLoader ────────\n";
+    std::cout << "\n== Parsed by BFMLoader ==\n";
     std::cout << "  shape_mean   : " << shape_mean.size()
               << "  (= " << shape_mean.size() / 3 << " vertices × 3)\n";
     std::cout << "  shape_basis  : " << shape_basis.rows() << " × " << shape_basis.cols()
@@ -291,6 +287,6 @@ void BFMLoader::summariseBFM(const std::string& path) const
         std::cout << "    e.g. " << landmarks_.front().name
                   << " -> vertex " << landmarks_.front().vertex_idx << "\n";
     }
-    std::cout << "────────────────────────────────────\n\n";
+    std::cout << "\n";
 }
 

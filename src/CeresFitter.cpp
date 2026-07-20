@@ -282,12 +282,10 @@ private:
     double sqrtWeight_;
 };
 
-// Dense geometry residual (Eq. 2): point-to-point AND point-to-plane.
-// Like LandmarkShapeReprojectionResidual, but the residual is the full 3D
-// difference (R·v + t) − targetPoint (3 components, point-to-point) PLUS its
-// component along the surface normal (1 component, point-to-plane).
-// No projection, no intrinsics needed (we are already in the camera frame).
-// targetNormal is constant (estimated outside), like targetPoint.
+// Dense geometry residual (Eq. 2): point-to-point plus point-to-plane. The
+// residual is the full 3D difference (R·v + t) − targetPoint (3 components) plus
+// its component along the surface normal (1 component). Already in the camera
+// frame, so no projection; targetNormal is constant, like targetPoint.
 struct DepthPointResidual {
     DepthPointResidual(
         const Eigen::Vector3f& meanPoint,
@@ -297,11 +295,10 @@ struct DepthPointResidual {
         const Eigen::Vector3d& targetPoint,
         const Eigen::Vector3d& targetNormal,
         double pointToPlaneWeight,
-        // Current expression displacement of this vertex (camera-aligned, mm),
-        // held CONSTANT within the solve. Without it the residual models the
-        // NEUTRAL vertex while the correspondence was found against the
-        // expressed shape — the mismatch biases pose (and identity) by the
-        // expression displacement. Refreshed each outer/ICP iteration.
+        // Current expression displacement of this vertex (camera-aligned mm),
+        // held constant within the solve: otherwise the residual models the
+        // neutral vertex while the correspondence was found against the expressed
+        // shape, biasing pose/identity. Refreshed each ICP iteration.
         const Eigen::Vector3d& exprOffsetAligned = Eigen::Vector3d::Zero()
     )
         : targetX_(targetPoint.x()),
@@ -394,31 +391,20 @@ private:
 using PhotoGrid   = ceres::Grid2D<double, 3>;
 using PhotoInterp = ceres::BiCubicInterpolator<PhotoGrid>;
 
-// PER-PIXEL photometric residual, driven by the differentiable renderer's
-// G-buffer. For one covered pixel of the rendered image:
-//
-//   surface point  S = b0·v0 + b1·v1 + b2·v2     (barycentric blend of the
-//                                                  covering triangle's vertices)
-//   residual = w · ( renderedColour(pixel) − inputImage( project(R·S + t) ) )
-//
-// The barycentric weights (b0,b1,b2) and the target renderedColour both come
-// straight from render(): the weights are the perspective-correct `bary`
-// G-buffer, the target is `out.image` at that pixel. Correspondence (which
-// triangle covers the pixel) is FIXED per outer iteration — the analysis-by-
-// synthesis linearisation, exactly like ICP fixes nearest-neighbour pairs.
-//
-// Because Σ b = 1 and (R,t) is affine, R·(Σ b_j v_j)+t = Σ b_j (R·v_j+t), so we
-// pre-blend the vertices' aligned mean + shape basis into ONE effective point.
-// The functor is then a single projected point sampled into the input image; as
-// pose/shape move, its projection moves and the sampled colour changes, giving a
-// gradient w.r.t. pose+shape. At the linearisation point S projects back to its
-// own pixel, so the residual there equals renderedColour − inputColour — the
-// true photometric error.
+// Per-pixel photometric residual, driven by the renderer's G-buffer. For one
+// covered pixel:
+//   S = b0·v0 + b1·v1 + b2·v2                       (barycentric surface point)
+//   residual = w · ( renderedColour(pixel) − inputImage(project(R·S + t)) )
+// The barycentric weights and the target colour come straight from render();
+// correspondence (which triangle covers the pixel) is fixed per outer iteration,
+// like ICP. Since Σb = 1 and (R,t) is affine, the three vertices pre-blend into
+// one effective point, so the functor is a single projected sample whose colour
+// moves with pose + shape — that is the photometric gradient.
 struct PhotometricPixelResidual {
     PhotometricPixelResidual(
         const Eigen::Vector3d&                                      blendedMeanAligned,
         const std::array<Eigen::Vector3d, kShapeCoefficientCount>&  blendedBasisAligned,
-        const Eigen::Vector3d&  targetColor,       // rendered RGB [0,1], constant
+        const Eigen::Vector3d&  targetColor,       
         const Eigen::Matrix3f&  intrinsics,
         const PhotoInterp&      image,
         double                  sqrtWeight
@@ -467,7 +453,7 @@ struct PhotometricPixelResidual {
         const T v = T(fy_) * cameraY / cameraZ + T(cy_);
 
         // Differentiable input-image lookup. Grid is (row=v, col=u); out-of-range
-        // samples are clamped to the border by Grid2D, so this never faults.
+        // samples are clamped to the border by Grid2D
         T observed[3];
         image_.Evaluate(v, u, observed);
 
@@ -488,23 +474,15 @@ private:
     std::array<double, kShapeCoefficientCount> basisZ_;
 };
 
-// Landmark reprojection with BOTH identity AND expression coefficients. Four
-// parameter blocks: angleAxis(3), translation(3), identity(kShape), expr(kExpr).
-//   modelPoint = mean + Σ idBasis·alpha + Σ exprBasis·delta   (then pose+project)
-// This is how the contour fit gets an expression gradient: mouth/brow landmarks
-// move when delta changes.
-// Focal-aware variants used by the contour fit: fx = fy = focal[0] is a
-// PARAMETER BLOCK (principal point stays fixed), so the camera focal can be
-// solved during personalisation on an uncalibrated webcam. When the focal
-// block is held constant these are numerically identical to fixed-intrinsics
-// reprojection. `WithExpr` selects whether the expression basis contributes
-// (contour→identity routing uses the identity-only variant).
-// WithId selects whether the IDENTITY basis is a parameter block. During
-// TRACKING identity is frozen, but a constant parameter block still costs its
-// full autodiff-jet width per residual evaluation — with 180 identity coeffs
-// that is ~3× the whole functor. WithId=false instead expects the identity
-// displacement PRE-BAKED into `meanPoint` and drops the block entirely
-// (blocks: angleAxis, translation, expr, focal).
+// Landmark reprojection with identity + expression coefficients. Parameter
+// blocks: angleAxis(3), translation(3), identity, expr:
+//   modelPoint = mean + idBasis·alpha + exprBasis·delta   (then pose + project)
+// This is what gives the contour fit an expression gradient. The focal-aware
+// variants make fx=fy a parameter block so an uncalibrated webcam's focal can be
+// solved (identical to fixed intrinsics when the block is held constant).
+// WithExpr toggles the expression basis; WithId=false expects the identity
+// displacement pre-baked into meanPoint and drops the block — during tracking
+// (identity frozen) that avoids ~3× the autodiff cost of a constant 180-coeff block.
 template <bool WithExpr, bool WithId = true>
 struct LandmarkFocalReprojectionResidual {
     LandmarkFocalReprojectionResidual(
@@ -572,7 +550,6 @@ struct LandmarkFocalReprojectionResidual {
                     const T* const focal, T* residuals) const {
         return project(angleAxis, translation, idCoeff, exprCoeff, focal, residuals);
     }
-    // 4 blocks — <false,true>: aa, t, id, focal;  <true,false>: aa, t, expr, focal.
     template <typename T>
     bool operator()(const T* const angleAxis, const T* const translation,
                     const T* const coeff, const T* const focal,
@@ -594,11 +571,10 @@ private:
     double observedU_, observedV_, cx_, cy_;
 };
 
-// Weak prior anchoring the focal estimate at its initial guess (relative
-// deviation). The focal↔distance ambiguity is nearly flat and slightly tilted
-// toward long focal (weak perspective fits noisy landmarks better), so an
-// unanchored focal rails at its bound; this keeps it in the guess's basin
-// while the perspective signal (face depth variation) applies its correction.
+// Weak prior anchoring the focal estimate at its initial guess. The focal↔
+// distance ambiguity is nearly flat, so an unanchored focal rails at its bound;
+// this keeps it in the guess's basin while the perspective signal (face depth
+// variation) applies the real correction.
 struct FocalPriorResidual {
     FocalPriorResidual(double f0, double weight) : f0_(f0), w_(weight) {}
     template <typename T>
@@ -622,11 +598,10 @@ struct CoeffPriorResidual {
     double sqrtWeight_;
 };
 
-// L2 prior anchored at a TARGET vector: √w · (coeff − target). Used as the
-// TEMPORAL expression prior during tracking — a zero-anchored prior strong
-// enough to damp landmark noise also fights any sustained articulation (it
-// pulls an open mouth shut every frame), while this one only resists CHANGE:
-// holding an expression costs nothing, jitter is damped in-solve.
+// L2 prior anchored at a target vector: √w·(coeff − target). Used as the temporal
+// expression prior during tracking — a zero-anchored prior strong enough to damp
+// jitter also pulls a held expression shut every frame, whereas this one only
+// resists change, so holding an articulation costs nothing.
 template <int Count>
 struct CoeffAnchorResidual {
     CoeffAnchorResidual(double weight, const Eigen::VectorXd& target)
@@ -1085,12 +1060,12 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
                                                      : intrinsics(0, 0);
     const double focalInit = focal;   // anchor for the focal prior
 
-    // Face-size normalisation for the reprojection residuals. Their pixel
-    // magnitude scales with resolution / face size, but the L2 priors do not —
-    // so without this the fit over-articulates on a high-res (iPhone) frame and
-    // under-fits a low-res (Biwi) one. Weighting each reprojection residual by
-    // (refSize / faceSize)² makes the data-vs-prior balance resolution-free.
-    // (Depth residuals are metric mm — already scale-free — so left un-weighted.)
+    // Face-size normalisation for the reprojection residuals: their pixel
+    // magnitude scales with resolution / face size but the L2 priors do not, so
+    // without this the fit over-articulates on a high-res frame and under-fits a
+    // low-res one. Weighting each residual by (refSize/faceSize)² makes the
+    // data-vs-prior balance resolution-free. (Depth residuals are metric mm, left
+    // un-weighted.)
     double uMin = 1e30, uMax = -1e30, vMin = 1e30, vMax = -1e30;
     for (const LandmarkObservation& o : observations) {
         uMin = std::min(uMin, o.imagePoint.x()); uMax = std::max(uMax, o.imagePoint.x());
@@ -1153,18 +1128,12 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
 
         ceres::Problem problem;
 
-        // (b) interior landmarks → fixed reprojection residuals (pose+id+expr).
-        // Huber: detectors regress OCCLUDED points under yaw/pitch (MediaPipe
-        // hallucinates the far side of the face) — without a robust loss one
-        // bad landmark quadratically drags the whole pose.
-        // The delta must scale with FACE size, not image size: a fully open
-        // mouth displaces the lip/chin landmarks by ~10 % of the face (25 mm ≈
-        // 26 px on a webcam face) — with a fixed ~1 %-of-image delta those
-        // legitimate residuals sat deep in Huber's linear region, so their
-        // pull was clamped to a constant the expression prior easily beat,
-        // and the mouth never opened. 5 % of face size keeps true detector
-        // garbage (> half the mouth region) suppressed while letting
-        // expression-scale residuals act quadratically.
+        // (b) interior landmarks → reprojection residuals (pose+id+expr), Huber-
+        // robust: detectors hallucinate the occluded far side under yaw, and one
+        // bad landmark would otherwise drag the whole pose. The Huber delta scales
+        // with face size, not image size: an open mouth moves lip/chin landmarks
+        // ~5% of the face (which must stay quadratic) while true detector garbage
+        // (>half the mouth) is suppressed.
         const double interiorHuber = std::max(0.01 * imgW, 0.05 * faceSize);
         // Same reasoning for the jaw contour (it drops ~as far as the chin
         // when the mouth opens), slightly wider since its correspondences are
@@ -1225,11 +1194,10 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
             }
             if (best < 0 || std::sqrt(bestD2) > 0.12 * imgW) continue;  // gate outliers
             ++matched;
-            // The jaw silhouette is an IDENTITY signal (face width/length), not
-            // an expression one. When identity is free it drives identity only —
-            // otherwise the optimiser reaches a low jawline via the jaw-OPEN
-            // expression mode, wrongly opening the mouth. When identity is frozen
-            // (video tracking) the contour must drive expression instead.
+            // The jaw silhouette is an identity signal (face width/length), not
+            // expression: with identity free it drives identity; otherwise the
+            // solver would reach a low jawline via the jaw-open mode and wrongly
+            // open the mouth. With identity frozen (tracking) it drives expression.
             if (optimizeIdentity) {
                 problem.AddResidualBlock(
                     new ceres::AutoDiffCostFunction<LandmarkFocalReprojectionResidual<false>,
@@ -1257,16 +1225,12 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
             }
         }
 
-        // (c2) DEPTH term (full fit only): nearest model vertex per cloud point,
-        //      re-matched each outer iteration (ICP). Robust + weighted + trimmed.
-        //
-        // Depth is a geometry signal for pose + IDENTITY only — never expression
-        // (letting a dense scan drive the 30 expression coeffs lets it absorb
-        // hair/neck/head-band noise via the jaw-open mode, wrongly opening the
-        // mouth). With identity free it drives pose+identity; with identity
-        // frozen (tracking) the constant shape block means it drives pose only,
-        // and expression is left to the landmarks + jaw contour — matching the
-        // RGB-only path so both modes stay consistent.
+        // (c2) depth term (full fit only): nearest model vertex per cloud point,
+        //      re-matched each outer iteration (ICP), robust + weighted + trimmed.
+        // Depth drives pose + identity only, never expression — letting a dense
+        // scan move the expression coeffs makes it absorb hair/neck noise via the
+        // jaw-open mode. With identity frozen (tracking) it drives pose only,
+        // matching the RGB-only path.
         int depthMatched = 0;
         if (useDepth) {
             // First pass: nearest model vertex + distance per cloud point.
@@ -1310,13 +1274,6 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
                             shapeBasis, shapeSigma,
                             c.target, c.normal, depthPointToPlaneWeight,
                             exprOffset)),
-                    // 22 mm, not 10: a distinctive nose/cheekbone/jaw is often
-                    // 10–30 mm from the BFM mean — exactly the deviations a
-                    // 10 mm Huber treated as half-outliers, capping the depth's
-                    // pull toward the true (e.g. softer, feminine) face where it
-                    // matters most. The 20% trim already rejects gross outliers
-                    // (hair/neck are >50 mm off), so 22 mm lets real identity
-                    // through while still robustifying.
                     new ceres::ScaledLoss(new ceres::HuberLoss(22.0),
                                           sqrtDepthWeight * sqrtDepthWeight,
                                           ceres::TAKE_OWNERSHIP),
@@ -1343,15 +1300,13 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
                 problem.SetParameterUpperBound(shapeCoefficients, k,  3.0);
             }
         } else if (problem.HasParameterBlock(shapeCoefficients)) {
-            problem.SetParameterBlockConstant(shapeCoefficients);   // tracking: id fixed
+            problem.SetParameterBlockConstant(shapeCoefficients);   
         }
         problem.AddResidualBlock(
             new ceres::AutoDiffCostFunction<CoeffPriorResidual<kExpressionCoefficientCount>,
                 kExpressionCoefficientCount, kExpressionCoefficientCount>(
                 new CoeffPriorResidual<kExpressionCoefficientCount>(exprRegWeight)),
             nullptr, exprCoefficients);
-        // Temporal prior (tracking only): resist expression CHANGE, not
-        // expression itself — see CoeffAnchorResidual.
         if (exprTemporalWeight > 0.0 && initialExpr.size() > 0)
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<CoeffAnchorResidual<kExpressionCoefficientCount>,
@@ -1369,11 +1324,10 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
                 problem.SetParameterLowerBound(angleAxis, a, -1.5);
                 problem.SetParameterUpperBound(angleAxis, a,  1.5);
             }
-        // Focal: constant unless explicitly optimised (personalisation on an
-        // uncalibrated camera). When free: plausible-FOV bounds, a weak
-        // anchor prior at the initial guess, and TIGHT distance bounds around
-        // the caller's initZ — the subject-distance prior (arm's length for a
-        // webcam) is what disambiguates focal from distance on a single view.
+        // Focal: constant unless --optimize-focal (uncalibrated camera). When
+        // free: plausible-FOV bounds, a weak anchor at the initial guess, and
+        // tight distance bounds around initZ — the subject-distance prior is what
+        // disambiguates focal from distance on a single view.
         if (problem.HasParameterBlock(&focal)) {
             if (optimizeFocal) {
                 problem.SetParameterLowerBound(&focal, 0, 0.4 * imgW);
@@ -1383,11 +1337,9 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
                         new FocalPriorResidual(focalInit, /*weight=*/2.0)),
                     nullptr, &focal);
                 if (problem.HasParameterBlock(translation)) {
-                    // The caller's distance prior. NOT initialPose.z — Stage 1
-                    // ran under the focal GUESS, so its distance is biased the
-                    // same way as the focal; the geometric mean of the caller's
-                    // z-bounds recovers the prior itself (bounds are 0.4/2.5 ×
-                    // initZ — exact reciprocals).
+                    // The caller's distance prior — not initialPose.z, which was
+                    // biased by the focal guess. The geometric mean of the z-bounds
+                    // (0.4/2.5 × initZ, exact reciprocals) recovers the prior.
                     const double z0 = std::sqrt(zMin * zMax);
                     problem.SetParameterLowerBound(
                         translation, 2, std::max(zMin, 0.75 * z0));
@@ -1398,10 +1350,7 @@ FitParameters CeresFitter::fitPoseAndShapeContour(
                 problem.SetParameterBlockConstant(&focal);
             }
         }
-        // ±3.5, not ±3: a fully open mouth needs ‖δ‖ ≈ 4.5 spread over the
-        // first few modes (≈ ±2.7 each; measured on the BFM-2017 basis), and
-        // wider articulation pushes single modes past 3 — the box was clipping
-        // legitimate expressions. The L2 prior still discourages the extremes.
+       
         for (int j = 0; j < kExpressionCoefficientCount; ++j) {
             problem.SetParameterLowerBound(exprCoefficients, j, -3.5);
             problem.SetParameterUpperBound(exprCoefficients, j,  3.5);
@@ -1765,7 +1714,7 @@ FitParameters CeresFitter::fitDense(
 
     const double kPi = 3.14159265358979323846;
 
-    // ── parameter blocks (Ceres mutates them in place) ──
+    // parameter blocks (Ceres mutates them in place)
     double angleAxis[3] = {
         initialPose.angleAxis.x(),
         initialPose.angleAxis.y(),
@@ -1778,7 +1727,7 @@ FitParameters CeresFitter::fitDense(
     };
     double shapeCoefficients[kShapeCoefficientCount] = {0.0, 0.0, 0.0, 0.0, 0.0};
 
-    // ── precompute the model-vertex subsample + BFM_TO_CAM once ──
+    // precompute the model-vertex subsample + BFM_TO_CAM once
     // (pose/shape change each iteration; the axis alignment does not.)
     const Eigen::Matrix3d M = proj::BFM_TO_CAM.cast<double>();
 
@@ -1804,7 +1753,7 @@ FitParameters CeresFitter::fitDense(
               << " target points vs " << S << " model vertices (stride "
               << vertexStride << ")\n";
 
-    // ── outer ICP loop ──
+    // outer ICP loop
     for (int icp = 0; icp < numIcpIterations; ++icp) {
 
         // (a) current pose/shape → camera-frame positions of the subsample vertices
@@ -1925,7 +1874,7 @@ FitParameters CeresFitter::fitDense(
         }
     }
 
-    // ── Ergebnis packen ──
+    // Ergebnis packen
     FitParameters result;
     result.pose.angleAxis = Eigen::Vector3d(angleAxis[0], angleAxis[1], angleAxis[2]);
     result.pose.translation = Eigen::Vector3d(translation[0], translation[1], translation[2]);
@@ -1938,7 +1887,7 @@ FitParameters CeresFitter::fitDense(
     return result;
 }
 
-// ── appearance estimation helpers (linear, used by fitPhotometric) ───────────
+// appearance estimation helpers (linear, used by fitPhotometric)
 
 // Reconstruct per-vertex albedo from BFM colour coeffs β, clamped to [0,1].
 //   albedo(v) = meanAlbedo(v) + Σ_k colorBasis(3v+·, k)·colorSigma(k)·β_k
@@ -1995,11 +1944,9 @@ static light::SHCoeffs estimateSHLighting(
     return sh;
 }
 
-// Estimate BFM albedo coeffs β by regularised linear least-squares. With
-// lighting fixed, predicted_c(v) = shading_c(v)·(meanAlbedo_c(v) +
-// Σ_k colorBasis(3v+c,k)·σ_k·β_k) is linear in β. Regularisation pulls β→0
-// (toward the mean albedo) so it does not bake lighting/beard/background into
-// the skin colour.
+// Estimate BFM albedo coeffs β by regularised linear least-squares: with lighting
+// fixed the predicted colour is linear in β. Regularisation pulls β→0 (toward the
+// mean albedo) so it doesn't bake lighting/beard/background into the skin colour.
 static Eigen::VectorXd estimateAlbedoCoeffs(
     const std::vector<AppearanceSample>& samples,
     const Eigen::MatrixX3f&              normalsCam,
@@ -2033,13 +1980,11 @@ static Eigen::VectorXd estimateAlbedoCoeffs(
 // small report from the GPU solve so the log can show before/after cost + iters
 struct GpuSolveStats { double costInitial = 0.0, costFinal = 0.0; int iters = 0; };
 
-// Host-side Levenberg–Marquardt driving the CUDA photometric kernels. Replaces
-// the per-pixel Ceres solve inside fitPhotometric when --photo-gpu is set. The
-// per-pixel residual/Jacobian (finite-difference) + normal-equation assembly run
-// on the GPU; the tiny nParams×nParams system is solved here with Eigen. Params
-// (angleAxis, translation, shapeCoefficients) are updated in place. Correspondence
-// buffers are laid out per pixel: gBase = 3·P; gBasis = K·3·P (only when
-// optimizeShape); gTarget = 3·P. See GPU_RENDERER.md.
+// Host-side Levenberg–Marquardt driving the CUDA photometric kernels; replaces
+// the per-pixel Ceres solve in fitPhotometric when --photo-gpu is set. The
+// residual/Jacobian (finite-difference) + normal-equation assembly run on the
+// GPU; the tiny nParams×nParams system is solved here with Eigen. Params
+// (angleAxis, translation, shapeCoefficients) are updated in place.
 static void solvePhotometricGpu(
     const cv::Mat&              rgbImage,   // CV_32FC3 RGB [0,1], H×W row-major
     const Eigen::Matrix3f&      K,
@@ -2220,11 +2165,10 @@ FitParameters CeresFitter::fitPhotometric(
     // fast path.
     const bool solveGeometry = optimizePose || optimizeShape;
 
-    // ── working resolution ──
-    // Render + solve at a capped width: a full-res selfie has millions of
-    // covered pixels → far too many residuals. Downscale the image AND the
-    // intrinsics together so the projection stays consistent. The realtime path
-    // calls this per Gaussian-pyramid level (maxImageWidth = 100, 200, …).
+    // Render + solve at a capped width: a full-res selfie has millions of covered
+    // pixels (far too many residuals). Downscale the image and the intrinsics
+    // together so the projection stays consistent; the realtime path calls this
+    // per pyramid level.
     const double scale =
         std::min(1.0, static_cast<double>(maxImageWidth) / imageBgr.cols);
     cv::Mat imgScaled;
@@ -2237,7 +2181,7 @@ FitParameters CeresFitter::fitPhotometric(
     const int H = imgScaled.rows;
     const int W = imgScaled.cols;
 
-    // ── differentiable input image ONCE (BGR → RGB float [0,1], interleaved) ──
+    // differentiable input image once (BGR → RGB float [0,1], interleaved)
     cv::Mat rgb;
     cv::cvtColor(imgScaled, rgb, cv::COLOR_BGR2RGB);
     rgb.convertTo(rgb, CV_32FC3, imageBgr.depth() == CV_8U ? 1.0 / 255.0 : 1.0);
@@ -2254,7 +2198,7 @@ FitParameters CeresFitter::fitPhotometric(
     const PhotoGrid   grid(imageData.data(), 0, H, 0, W);
     const PhotoInterp image(grid);
 
-    // ── parameter blocks (Ceres mutates in place) ──
+    // parameter blocks (Ceres mutates in place)
     double angleAxis[3] = {
         initialFit.pose.angleAxis.x(),
         initialFit.pose.angleAxis.y(),
@@ -2270,7 +2214,7 @@ FitParameters CeresFitter::fitPhotometric(
                     k < initialFit.shapeCoefficients.size(); ++k)
         shapeCoefficients[k] = initialFit.shapeCoefficients(k);
 
-    // ── appearance state (estimated linearly each iteration) ──
+    // appearance state (estimated linearly each iteration)
     const int Kb = std::min<int>({kAlbedoCoefficientCount,
                                   static_cast<int>(colorBasis.cols()),
                                   static_cast<int>(colorSigma.size())});
@@ -2279,11 +2223,10 @@ FitParameters CeresFitter::fitPhotometric(
         beta(k) = initialFit.albedoCoefficients(k);
     light::SHCoeffs sh = initialFit.sh;
 
-    // ── precompute each vertex's BFM_TO_CAM-aligned mean + shape basis ONCE ──
-    // (pose/shape change each iteration; this axis alignment does not.) A pixel's
-    // surface point is a barycentric blend of three of these, which — because the
-    // pose is affine and Σbary = 1 — reduces to one effective mean+basis point.
-    // Only needed when geometry is actually solved (53k × 30 — skip otherwise).
+    // Precompute each vertex's BFM→camera-aligned mean + shape basis once (the
+    // axis alignment doesn't change per iteration). A pixel's surface point is a
+    // barycentric blend of three of these which, since the pose is affine and
+    // Σbary = 1, reduces to one effective point. Only when geometry is solved.
     const Eigen::Matrix3d M = proj::BFM_TO_CAM.cast<double>();
     const int N = static_cast<int>(meanShape.rows());
     std::vector<Eigen::Vector3d> vMean;
@@ -2387,23 +2330,19 @@ FitParameters CeresFitter::fitPhotometric(
         //     blend of the triangle's 3 vertices) reprojected into the input
         //     image vs the rendered colour at that pixel.
 #ifdef USE_CUDA
-        // GPU path: collect the fixed per-pixel correspondences and solve the
-        // whole geometry step on the device (see solvePhotometricGpu). Only when
-        // --photo-gpu is set AND geometry is actually solved.
-        // The GPU inner solve does not (yet) include the joint E_lan landmark
-        // anchor. When the caller supplies that anchor (the personalise IDENTITY
-        // refinement, which relies on it to make a low shape reg safe), stay on
-        // the CPU/Ceres path so we never silently drop it. Pose-only / non-anchored
-        // photometric solves still use the GPU.
+        // GPU path (--photo-gpu): collect the fixed per-pixel correspondences and
+        // solve the geometry step on the device (solvePhotometricGpu). The GPU
+        // inner solve doesn't include the joint E_lan anchor, so when the caller
+        // supplies that anchor (the personalise identity refinement) we stay on
+        // the Ceres path; pose-only photometric solves use the GPU.
         const bool gpuSolve = CeresFitter::usePhotometricGpu && solveGeometry &&
                               !(landmarks && landmarkWeight > 0.0);
         std::vector<double> gBase, gBasis, gTarget;
 #endif
-        // Gather the covered pixels first (base grid = pixelStride). If
-        // photoSamples > 0, keep only a random uniform sample of them for this
-        // iteration; re-drawn every outer iteration so across the whole fit all
-        // pixels get used (the stochastic-subsampling speedup). photoSamples==0
-        // keeps every pixel, i.e. the old behaviour.
+        // Gather the covered pixels (grid = pixelStride). If photoSamples > 0,
+        // keep a random uniform subset for this iteration, re-drawn each outer
+        // iteration so all pixels get used over the fit (stochastic subsampling).
+        // photoSamples == 0 keeps every pixel.
         std::vector<cv::Point> pts;
         for (int y = 0; y < H; y += pixelStride)
             for (int x = 0; x < W; x += pixelStride)
@@ -2479,12 +2418,11 @@ FitParameters CeresFitter::fitPhotometric(
                                          angleAxis, translation, shapeCoefficients);
             }
 
-        // (d2) JOINT landmark term (Face2Face E_lan): anchor the shape solve to
+        // (d2) joint landmark term (Face2Face E_lan): anchor the shape solve to
         //      the detected interior landmarks so the low-reg dense photometric
-        //      cannot drift the geometry via shape-from-shading ambiguity. Same
-        //      pose+shape blocks as the pixel residuals. Observations are in
-        //      full-res pixels → scale to the working resolution (K was scaled
-        //      by `scale`). Only when the caller opts in (landmarks + weight>0).
+        //      can't drift the geometry via shape-from-shading ambiguity. Same
+        //      pose+shape blocks as the pixel residuals; observations scale to the
+        //      working resolution. Only when the caller opts in (weight > 0).
         if (solveGeometry && landmarks && landmarkWeight > 0.0) {
             for (const LandmarkObservation& o : *landmarks) {
                 if (o.vertexIndex < 0 || o.vertexIndex >= meanShape.rows()) continue;

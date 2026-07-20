@@ -10,12 +10,12 @@ namespace light {
 // the numbers are the SH basis functions up to l=2 baked in
 // index 0 is the constant ambient band, 1..3 are the linear light direction
 // and 4..8 are the quadratic softer variation
-// n must be a unit vector
+// Crediting this blog for conceptual help: https://gpfault.net/posts/sph.html
 Vector9f shBasis(const Eigen::Vector3f& n)
 {
     const float x = n.x(), y = n.y(), z = n.z();
     Vector9f b;
-    b(0) = 0.282095f;                         // 1/(2√π)
+    b(0) = 0.282095f;                       
     b(1) = 0.488603f * y;
     b(2) = 0.488603f * z;
     b(3) = 0.488603f * x;
@@ -48,7 +48,6 @@ Eigen::MatrixX3f shadeVertices(const Eigen::MatrixX3f& albedo,
         const Eigen::Vector3f n = normalsCam.row(i);
         const Vector9f b = shBasis(n);
 
-        // b^T * sh gives a 1x3 row of shading per colour channel
         const Eigen::RowVector3f shading = b.transpose() * sh;
         out.row(i) = albedo.row(i)
                          .cwiseProduct(shading)
@@ -58,4 +57,4 @@ Eigen::MatrixX3f shadeVertices(const Eigen::MatrixX3f& albedo,
     return out;
 }
 
-}  // namespace light
+} 

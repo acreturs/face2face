@@ -17,14 +17,14 @@ class BFMLoader
 public:
     explicit BFMLoader(const std::string& path);
 
-    // ── geometry (identity + expression) ──
+    // geometry (identity + expression)
     Eigen::MatrixX3f mean_shape() const;                          // alpha = 0
     Eigen::MatrixX3f shape(const Eigen::VectorXf& alpha) const;   // identity only
     // full face once you also feed in expression coeffs
     Eigen::MatrixX3f shape(const Eigen::VectorXf& alpha,
                            const Eigen::VectorXf& delta) const;
 
-    // ── albedo (skin colour) ──
+    // albedo (skin colour)
     Eigen::MatrixX3f albedo() const;                              // mean albedo in [0,1]
     Eigen::MatrixX3f albedo(const Eigen::VectorXf& beta) const;   // mean + basis · (beta .* sigma)
 

@@ -23,11 +23,6 @@ struct PoseParameters {
 
 constexpr int kShapeCoefficientCount = 180;
 constexpr int kAlbedoCoefficientCount = 180;       // BFM colour (albedo) PCA coeffs
-// 30, not 80: only ~10 mouth/brow landmarks constrain expression, and BFM
-// expression modes 30–80 add just ~4% of variance (92%→99%) — 50 nearly-
-// unobservable DOF the solver fills with a high-norm, jittery, asymmetric
-// combination (‖δ‖≈5–7 for a near-closed mouth). Optimising the first 30 keeps
-// 92% of the expression range while removing the instability at its source.
 constexpr int kExpressionCoefficientCount = 30;   // BFM expression PCA coeffs
 
 struct FitParameters {
@@ -51,7 +46,7 @@ struct FitParameters {
 using DenseIterationCallback =
     std::function<void(int iteration, const FitParameters& current, double rmseMM)>;
 
-// ── Non-rigid model-based bundling (Face2Face §6) ────────────────────────────
+// Non-rigid model-based bundling (Face2Face §6)
 // One keyframe fed to fitIdentityBundle: its 2D observations, a per-frame pose
 // init, and (optionally, RGBD) its depth cloud in THIS keyframe's camera frame.
 struct BundleFrame {
@@ -73,17 +68,14 @@ std::vector<LandmarkObservation> loadLandmarkObservations(
 
 class CeresFitter {
 public:
-    // When true (set via --photo-gpu), fitPhotometric's per-pixel GEOMETRY solve
-    // runs on the GPU (CUDA finite-difference Levenberg–Marquardt) instead of
-    // Ceres. Only has an effect in a `make USE_CUDA=1` build and only when the
-    // fit actually solves geometry (optimizePose || optimizeShape). The CPU/Ceres
-    // path is unchanged and remains the reference. See GPU_RENDERER.md.
+    // When true (--photo-gpu), fitPhotometric's per-pixel geometry solve runs on
+    // the GPU (CUDA finite-difference LM) instead of Ceres. Only in a USE_CUDA
+    // build and only when geometry is solved; the Ceres path stays the reference.
     static bool usePhotometricGpu;
 
-    // When usePhotometricGpu is on, selects the GPU Jacobian: false → finite
-    // differences (default, --photo-gpu); true → analytic image-gradient ×
-    // projection × pose/shape chain (--photo-gpu-analytic), with the pose
-    // rotation solved as a local perturbation on SO(3).
+    // With usePhotometricGpu on, selects the GPU Jacobian: false → finite
+    // differences (--photo-gpu); true → analytic image-gradient × projection ×
+    // pose/shape chain (--photo-gpu-analytic).
     static bool photoGpuAnalytic;
 
     // 0 = use every covered pixel (old behaviour). >0 = per outer iteration,
@@ -104,7 +96,7 @@ public:
         double zMin = 100.0,
         double zMax = 10000.0
     );
-    // Stage 2: pose + shape from 2D landmarks (+ L2 shape prior).
+    // Stage 2a: pose + shape from 2D landmarks + shape prior.
     static FitParameters fitPoseAndShape(
       const Eigen::MatrixX3f& meanShape,
       const Eigen::MatrixXf& shapeBasis,
@@ -117,24 +109,10 @@ public:
       double zMax = 600.0
   );
 
-    // Stage 2b: pose + shape with a CONTOUR (silhouette) term. Observations with
-    // vertexIndex >= 0 are fixed named landmarks (interior); observations with
-    // vertexIndex == -1 are contour points (jawline) with NO fixed model vertex.
-    // Because the BFM has no jaw landmarks and the silhouette vertex slides with
-    // pose, we run an ICP-style outer loop: each iteration re-assigns every
-    // contour point to the nearest projected MODEL SILHOUETTE vertex (a vertex
-    // seen near-edge-on, |n_cam.z| small, on the matching side), then Ceres-solves
-    // pose+shape. This is what constrains face WIDTH/outline — the interior
-    // landmarks cannot. Use a lower regularizationWeight than the interior-only
-    // fit so the identity can actually widen.
-    // Also solves EXPRESSION (delta): the expr basis is added to every landmark
-    // residual as a 4th parameter block, so mouth/brow/lip landmarks move the
-    // expression. Returned in result.exprCoefficients.
-    //
-    // FULL fit: if `targetCloud` is non-null (its points expressed in THIS fit's
-    // camera frame), a depth ICP term (point-to-point + point-to-plane) is added
-    // each outer iteration, so pose + identity + expression are solved jointly
-    // from landmarks, jaw-contour AND depth. Pass nullptr for the RGB-only fit.
+    // Stage 2b: pose + shape with a contour term. Interior landmarks
+    // (vertexIndex >= 0) are fixed; contour points (vertexIndex == -1, jawline)
+    // have no fixed model vertex, so an ICP-style outer loop re-assigns each to
+    // the nearest edge-on projected silhouette vertex before every Ceres solve.
     static FitParameters fitPoseAndShapeContour(
         const Eigen::MatrixX3f&                  meanShape,
         const Eigen::MatrixXf&                   shapeBasis,
@@ -154,24 +132,20 @@ public:
         double                                   depthPointToPlaneWeight = 1.0,
         double                                   depthWeight             = 1.0,
         int                                      depthVertexStride       = 8,
-        // ── video tracking ──  seed identity/expression (warm start) and freeze
+        // video tracking    seed identity/expression (warm start) and freeze
         // identity so per-frame tracking only solves pose + expression. Empty
         // observations are allowed when a depth cloud drives the fit.
         const Eigen::VectorXd&                   initialIdentity      = Eigen::VectorXd(),
         const Eigen::VectorXd&                   initialExpr          = Eigen::VectorXd(),
         bool                                     optimizeIdentity     = true,
-        // ── camera focal estimation (realtime plan, Phase 3) ──
-        // When optimizeFocal, a single focal parameter (fx = fy; principal
-        // point fixed) joins the landmark/contour residuals; *focalInOut seeds
-        // it (else intrinsics(0,0)) and receives the estimate. The identity
-        // prior anchors the metric face size, which is what disambiguates
-        // focal from distance. Only sensible during personalisation.
+        // Camera focal estimation. When optimizeFocal, a single focal (fx=fy,
+        // principal point fixed) joins the landmark/contour residuals; *focalInOut
+        // seeds and receives it.
         bool                                     optimizeFocal        = false,
         double*                                  focalInOut           = nullptr,
-        // ── temporal expression prior (tracking) ──  weight on
-        // ‖δ − initialExpr‖²: damps frame-to-frame expression jitter IN the
-        // solve without fighting a held articulation the way the zero-anchored
-        // prior does. 0 = off (personalise / single-frame fits).
+        // Temporal expression prior (tracking): weight on ‖δ − initialExpr‖²,
+        // damps frame-to-frame jitter without fighting a held articulation.
+        // 0 = off (personalise / single-frame).
         double                                   exprTemporalWeight   = 0.0
     );
 
@@ -191,15 +165,10 @@ public:
         const DenseIterationCallback&        onIteration          = nullptr
     );
 
-    // Non-rigid model-based bundling (Face2Face §6). Jointly solves ONE shared
-    // identity α with per-frame {pose, expression} over several keyframes at
-    // different viewing angles, in a single block-dense Ceres problem. Each
-    // keyframe contributes interior-landmark reprojection + jaw-contour (sliding
-    // silhouette, re-matched each outer iteration) + optional depth ICP, all
-    // pointing at the shared α. Multi-view parallax + shared-identity
-    // consistency is what resolves the depth ambiguity that a single view
-    // cannot, so the identity reg can be near-zero without over-fitting.
-    // Returns the shared α and each keyframe's pose/expr.
+    // Model-based bundling : jointly solve one shared identity α
+    // with per-frame {pose, expression} over several keyframes at different
+    // angles, in one Ceres problem. Each keyframe adds interior-landmark
+    // reprojection + jaw contour (+ optional depth ICP) pointing at the shared α.
     static BundleResult fitIdentityBundle(
         const Eigen::MatrixX3f&          meanShape,
         const Eigen::MatrixXf&           shapeBasis,
@@ -219,34 +188,17 @@ public:
         int                              depthVertexStride       = 8
     );
 
-    // Photometric (appearance) fit against a single RGB image — the analysis-by-
-    // synthesis term. Completely independent of fitDense's depth term: it needs
-    // only an RGB image + intrinsics, so it also runs on RGB-only inputs (e.g. an
-    // iPhone selfie, where there is no depth to feed the dense term).
-    //
-    // It alternates three sub-steps each outer iteration, analysis-by-synthesis:
-    //   1. estimate SH LIGHTING (linear least-squares): with geometry + albedo
-    //      fixed, the rendered colour is linear in the 9×3 SH coeffs, so a
-    //      per-channel 9×9 solve recovers the lighting that best explains the
-    //      photo.  (skipped if optimizeLighting == false)
-    //   2. estimate ALBEDO (linear least-squares): with lighting fixed, the
-    //      colour is linear in the BFM colour-basis coeffs β, recovered by a
-    //      regularised Kβ×Kβ solve.  (skipped if optimizeAlbedo == false)
-    //   3. refine GEOMETRY (Ceres, per-pixel): render() gives the predicted
-    //      image + G-buffer (triIdx + perspective-correct bary); each covered
-    //      pixel adds a residual — renderedColour(pixel) vs the input image
-    //      sampled at the reprojection of that pixel's surface point (the
-    //      barycentric blend of its triangle's 3 vertices). The image is sampled
-    //      differentiably (Ceres bicubic interpolator), so the residual has a
-    //      gradient w.r.t. pose and (if optimizeShape) shape.
-    //
-    // Steps 1–2 are what make the appearance actually fit; step 3 aligns the
-    // geometry. The estimated lighting and albedo come back in the result's
-    // `sh` and `albedoCoefficients`. Best run from a sparse (or dense) init.
-    //
-    // `imageBgr` is a normal OpenCV BGR image (8U or 32F); it is downscaled to a
-    // working resolution and normalised to [0,1] internally. `pixelStride`
-    // samples every Nth covered pixel in the geometry step.
+    // Photometric (appearance) fit against a single RGB image (analysis-by-
+    // synthesis). Independent of the depth term, so it also runs on RGB-only
+    // inputs. Each outer iteration alternates three sub-steps:
+    //   1. SH lighting — linear least-squares (skipped if !optimizeLighting)
+    //   2. albedo β    — regularised linear least-squares (skipped if !optimizeAlbedo)
+    //   3. geometry    — per-pixel Ceres solve against render()'s G-buffer, with
+    //                    the input sampled differentiably (bicubic) at each
+    //                    covered pixel's reprojection.
+    // Steps 1–2 fit the appearance, step 3 aligns the geometry. imageBgr is a
+    // normal OpenCV BGR image, downscaled to a working resolution internally;
+    // pixelStride samples every Nth covered pixel in the geometry step.
     static FitParameters fitPhotometric(
         const Eigen::MatrixX3f&           meanShape,
         const Eigen::MatrixXf&            shapeBasis,
@@ -271,29 +223,16 @@ public:
         bool                              optimizePose      = true,
         const DenseIterationCallback&     onIteration       = nullptr,
         // Working-resolution cap (image + intrinsics are downscaled together).
-        // The realtime path calls this per pyramid level (e.g. 100 then 200).
         int                               maxImageWidth     = 400,
-        // ── JOINT E_col + E_lan (Face2Face Eq. 3) ──  When `landmarks` is
-        // non-null and `landmarkWeight` > 0, the interior landmark reprojection
-        // residuals are added to the per-pixel photometric SHAPE solve, on the
-        // same pose+shape blocks. The dense photometric alone is
-        // appearance-limited and shape-from-shading-ambiguous; the landmark
-        // term anchors the shape inside the solve (paper w_lan ≫ w_col), which
-        // is what makes a LOW shapeRegWeight safe — the coupling the paper
-        // relies on. Default (nullptr / 0) reproduces the old behaviour exactly,
-        // so existing callers (tracking lighting refresh) are unaffected.
+        // Joint E_col + E_lan: when landmarks is non-null and
+        // landmarkWeight > 0, the interior landmark residuals join the per-pixel
+        // photometric shape solve on the same blocks.
         const std::vector<LandmarkObservation>* landmarks   = nullptr,
         double                            landmarkWeight    = 0.0
     );
 
-    // Increment 2 — dense-photometric identity BUNDLE (Face2Face §6 + Eq. 4).
-    // Refines the SHARED identity α using the per-pixel photometric term E_col
-    // from ALL keyframes jointly (+ the E_lan landmark anchor), with per-frame
-    // pose+expression FIXED (from the geometric fitIdentityBundle) and shared
-    // albedo β + lighting γ (keyframes from one Biwi room share illumination).
-    // Because α is the only free block, the multi-view dense solve stays
-    // tractable on CPU. Per-frame vectors are parallel. Returns the refined α;
-    // writes the shared β and γ to the out-params (for rendering).
+    // Dense-photometric identity bundle: refine the shared
+    // α using the per-pixel E_col from all keyframes jointly
     static Eigen::VectorXd fitIdentityPhotometricBundle(
         const Eigen::MatrixX3f&          meanShape,
         const Eigen::MatrixXf&           shapeBasis,

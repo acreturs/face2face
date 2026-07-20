@@ -140,7 +140,7 @@ BiwiCalibration BiwiLoader::getCalibration() const
     return cal;
 }
 
-// ─── depth geometry helpers ──────────────────────────────────────────────────
+// depth geometry helpers
 
 // backproject a uint16 mm depth map into camera frame points (mm), opencv axes
 std::vector<Eigen::Vector3d> backprojectDepth(const cv::Mat&         depth,

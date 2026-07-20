@@ -38,12 +38,10 @@
 #include <sys/wait.h>   // MediaPipe landmark coprocess (live mode)
 #include <unistd.h>
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Config — every path and tunable lives here, grouped by concern.
-// ─────────────────────────────────────────────────────────────────────────────
 namespace cfg {
 
-// ── input paths ──  the only supported dataset is Biwi (Kinect RGB-D).
+// input paths    the only supported dataset is Biwi (Kinect RGB-D).
 const std::string kBfmPath = "data/bfm/model2017-1_bfm_nomouth.h5";
 std::string       kBiwiDir = "data/biwi/01";   // set via --biwi-seq / --biwi-dir
 // Pretrained landmark models: LBF for 68-point landmarks, YuNet ONNX for
@@ -57,14 +55,10 @@ std::string modelPath(const std::string& name) {
 const std::string kLbfModelPath = modelPath("lbfmodel.yaml");
 const std::string kYuNetPath    = modelPath("face_detection_yunet.onnx");
 
-// ── landmark detector backend (--detector) ──
-//   yunet     : YuNet CNN face box + 5 pose-robust points, LBF jaw contour (default)
-//   lbf       : Haar face box + LBF 68-point landmarks only (the legacy detector)
-//   mediapipe : read per-frame `landmarks_mp_XXXXX.txt` files written by the
-//               Python pre-pass (python/gen_landmarks_mediapipe.py) — MediaPipe
-//               is Bazel-built and cannot link into this binary, so it runs
-//               offline; its 468-pt mesh adds vertical mouth points + a denser,
-//               more pose-robust jaw than LBF.
+// landmark detector backend (--detector):
+//   yunet     : YuNet face box + 5 points + LBF jaw contour (default)
+//   lbf       : Haar box + LBF 68-point landmarks
+//   mediapipe : per-frame landmarks_mp_XXXXX.txt from the offline pre-pass
 std::string kDetector = "yunet";
 // Whether --detector was passed on the CLI. Live mode upgrades the DEFAULT to
 // the MediaPipe coprocess (best landmarks) but never overrides an explicit
@@ -76,7 +70,7 @@ bool kDetectorExplicit = false;
 bool kBundlePersonalise = false;
 int  kBundleKeyframes   = 7;   // target keyframe count (--bundle-keyframes)
 
-// ── output layout ──  each run writes into data/out/<tag>/ (biwi_video_rgb,
+// output layout    each run writes into data/out/<tag>/ (biwi_video_rgb,
 // biwi_dense, debug, …) so modes never clobber each other.
 const std::string kOutDir = "data/out";
 std::string outDir(const std::string& tag) {
@@ -90,46 +84,32 @@ std::string outDir(const std::string& tag) {
 // fit parameter.
 constexpr float kFrontalRenderDepthMM = 350.0f;
 
-// ── sparse / contour landmark fit ──
-// 30, not 100: the contour fit normalises its reprojection residuals by face
-// size (see reprojW), and its doc explicitly calls for a LOWER identity reg so
-// the silhouette can actually widen the face — 100 kept the identity pinned to
-// the mean. Override per run with --sparse-reg.
+// sparse / contour landmark fit
+// Identity reg is deliberately low: the contour fit normalises residuals by face
+// size, so a low reg lets the silhouette widen the face instead of pinning it to
+// the mean. Override with --sparse-reg.
 constexpr double kDefaultSparseReg  = 30.0;   // identity reg (--sparse-reg)
 constexpr int    kContourOuterIters = 40;
-// Expression prior for the PERSONALISE fit. Stiffer than the identity reg so
-// that identity, not expression, explains the face — but no longer 500: that
-// value dated from the 5-point YuNet era (2 mouth corners = almost no
-// expression signal). With the 21-interior + 14-jaw MediaPipe set the data
-// genuinely observes expression, and an over-stiff prior forces any non-
-// neutral personalise mouth into the IDENTITY (permanently wrong chin).
+// Expression prior for personalise: stiffer than the identity reg so identity,
+// not expression, explains a non-neutral first frame.
 constexpr double kExprRegWeight = 200.0;
-// ZERO-anchored expression prior for TRACKING (identity frozen → expression
-// must carry all articulation). Weak (10, was 120): a fully open mouth needs
-// ‖δ‖ ≈ 4.5 (measured on the BFM basis), and any zero prior strong enough to
-// damp landmark noise also pulls a HELD articulation shut every frame — at
-// 120 the mouth never opened past a few mm, at 30 it stopped halfway. Jitter
-// damping is instead done by the TEMPORAL prior (FaceTracker::Config
-// exprTemporalReg, ‖δ − δ_prev‖²), which costs nothing for a held expression.
+// Expression prior for tracking: weak, so a held articulation isn't pulled shut
+// every frame (jitter is damped by the temporal prior, not this one).
 constexpr double kTrackExprRegWeight = 5.0;
 
-// ── photometric (appearance) fit ──
-// 3, not 50: the albedo LS AtA-diagonal is ~47 (measured on this BFM), so λ=50
-// halved even the strongest colour mode and forced the rest to ~0 — ‖β‖≈0.3,
-// i.e. every reconstruction wore the androgynous MEAN skin/lips/brows (why
-// female subjects failed to read as themselves). λ=3 gives ~0.94 fit factor so
-// the person's actual colouring comes through; still enough to resist baking
-// lighting/beard/background into the skin.
+// photometric (appearance) fit
+// Albedo prior: low, so the person's actual colouring comes through instead of
+// collapsing to the mean skin/lips/brows; still resists baking in lighting.
 constexpr double kAlbedoRegWeight  = 3.0;
 constexpr int    kPhotoIterations  = 20;
 constexpr int    kPhotoPixelStride = 1;
 
-// ── video temporal smoothing ──  EMA on the per-frame pose + expression to
+// video temporal smoothing    EMA on the per-frame pose + expression to
 // damp jitter: new = α·fit + (1−α)·previous. 1 = no smoothing, lower = smoother
 // (but laggier). Paired with velocity prediction so it stays responsive.
 constexpr double kSmoothAlpha = 0.95;   // NOTE: LOW = heavy smoothing (laggy); raise toward 0.9 for responsive
 
-// ── depth term (Biwi "full" fit) ──
+// depth term (Biwi "full" fit)
 constexpr int    kDepthBackprojStride     = 2;    // subsample the depth map
 constexpr double kDepthCropRadiusMM       = 90.0;   // tight → excludes hair/neck
 constexpr double kDepthCropFrontSlabMM    = 90.0;
@@ -142,57 +122,6 @@ constexpr int    kDepthVertexStride       = 8;    // model subsample for ICP
 // This is a single translation unit; pull the config names into scope so call
 // sites read cleanly (kOutDir, outDir(), tunables …).
 using namespace cfg;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Mesh serialisation
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Save the current BFM state as a .obj the viewer (and any mesh tool) can show:
-//   v  x y z r g b        position + per-vertex albedo colour
-//   vn nx ny nz           per-vertex unit normal (area-weighted)
-//   f  v//vn ...          faces with matching normal indices (1-based)
-static void saveCurrentModel(const std::string&      path,
-                             const Eigen::MatrixX3f&  V,
-                             const Eigen::MatrixX3i&  F,
-                             const Eigen::MatrixX3f&  albedo)
-{
-    const Eigen::MatrixX3f N = Renderer::computeNormals(V, F);
-
-    std::ofstream out(path);
-    out << "# face2face current model — written by saveCurrentModel()\n";
-    out << "# " << V.rows() << " vertices, " << F.rows()
-        << " triangles, per-vertex normals + albedo colours\n";
-
-    for (int i = 0; i < V.rows(); ++i)
-        out << "v " << V(i, 0) << ' ' << V(i, 1) << ' ' << V(i, 2) << ' '
-            << albedo(i, 0) << ' ' << albedo(i, 1) << ' ' << albedo(i, 2) << '\n';
-
-    for (int i = 0; i < N.rows(); ++i)
-        out << "vn " << N(i, 0) << ' ' << N(i, 1) << ' ' << N(i, 2) << '\n';
-
-    for (int i = 0; i < F.rows(); ++i) {
-        const int a = F(i, 0) + 1, b = F(i, 1) + 1, c = F(i, 2) + 1;
-        out << "f " << a << "//" << a << ' '
-                    << b << "//" << b << ' '
-                    << c << "//" << c << '\n';
-    }
-
-    std::cout << "saved current model → " << path
-              << "  (" << V.rows() << " v, " << F.rows() << " f, with normals)\n";
-}
-
-// Save a raw point cloud as a .obj (vertices only, no faces). Lets you open it
-// next to a mesh in MeshLab to see the fit sitting on the measured data.
-static void savePointCloud(const std::string&                  path,
-                           const std::vector<Eigen::Vector3d>& points)
-{
-    std::ofstream out(path);
-    out << "# point cloud (camera frame, mm) — " << points.size() << " points\n";
-    for (const Eigen::Vector3d& p : points)
-        out << "v " << p.x() << ' ' << p.y() << ' ' << p.z() << '\n';
-    std::cout << "saved point cloud → " << path
-              << "  (" << points.size() << " points)\n";
-}
 
 // Raw uint16 depth (mm) → 3-channel 8-bit BGR visualisation (near = bright,
 // empty = black). Used as the "background photo" for the dense depth overlay.
@@ -208,9 +137,7 @@ static cv::Mat depthToBgr(const cv::Mat& depthRaw)
     return bgr;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Debug overlays
-// ─────────────────────────────────────────────────────────────────────────────
 
 // Draw the BFM mesh as a wireframe over an input photo. Each edge is coloured
 // by the average albedo of its endpoints; triangles with a vertex behind the
@@ -277,9 +204,7 @@ static void writeColourImage(const RenderOutput& r, const std::string& path)
     std::cout << "wrote rendered image → " << path << "\n";
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Shared render / IO helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 // Draw a small green status label in the top-left corner (panel captions, HUD).
 static void drawLabel(cv::Mat& img, const std::string& text, double scale = 0.6)
@@ -338,9 +263,7 @@ static FaceTracker::Config offlineConfig(double sparseReg)
     return tc;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Pipeline stages
-// ─────────────────────────────────────────────────────────────────────────────
 
 // Alpha-blend a rendered face over the photo. The render MUST have been
 // produced at the photo's resolution (otherwise the two images don't line up
@@ -398,11 +321,9 @@ static void overlayRenderOnPhoto(const RenderOutput& r,
               << "  (" << overlay.cols << "x" << overlay.rows << ")\n";
 }
 
-// 3-panel mask-visualisation strip: overlay | reconstruction @ the fitted pose
-// (face alone on black) | reconstruction frontal (identity+expression,
-// straight-on). Mirrors the per-frame panels the video path emits, so the
-// single-frame geometry modes (dense/full/sparse) get the same "just the mask"
-// views.
+// 3-panel strip: overlay | reconstruction at the fitted pose (on black) |
+// reconstruction frontal. Mirrors the per-frame video panels so the single-frame
+// geometry modes (dense/full) get the same views.
 static cv::Mat renderMaskPanels(
     const cv::Mat&           photo,
     const Eigen::MatrixX3f&  shape,
@@ -551,15 +472,9 @@ static void writeFitOutputs(
     std::cout << "Wrote mask panels: " << maskPath << '\n';
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ENTRY POINT: rgb / rgbd video reconstruction on a Biwi sequence
-// ─────────────────────────────────────────────────────────────────────────────
-// Keyframe selection for the identity bundle (Face2Face §6). Identity is
-// resolved by multi-view PARALLAX, so we pick keyframes spanning the widest
-// range of yaw: farthest-point sampling in yaw-proxy space, seeded with the
-// most frontal frame (anchors metric scale + gives the cleanest albedo). Only
-// well-detected frames (all 3 pose anchors present) are candidates. Returns the
-// selected frame indices; the first is the frontal anchor.
+// Keyframe selection for the identity bundle (Face2Face §6): farthest-point
+// sampling in yaw so the keyframes span the widest range of head rotation,
+// seeded with the most frontal well-detected frame as the anchor (index 0).
 static std::vector<int> selectBundleKeyframes(
     const std::vector<double>& yaw,   // NaN where undetected
     int k)
@@ -587,11 +502,9 @@ static std::vector<int> selectBundleKeyframes(
     return sel;
 }
 
-// Personalise identity + albedo on frame 0 (the expensive full fit), then TRACK
-// only pose + expression (+ lighting) on the rest, warm-started from the
-// previous frame with identity/albedo frozen (see FaceTracker). Dispatched from:
-//   --mode rgb   → useDepth = false (landmarks + jaw contour + photometric)
-//   --mode rgbd  → useDepth = true  (+ the metric Kinect depth ICP term)
+// Personalise identity + albedo on frame 0, then track pose + expression (+
+// lighting) on the rest, warm-started with identity/albedo frozen (see
+// FaceTracker). --mode rgb = no depth; --mode rgbd adds the Kinect depth ICP term.
 static void runVideoReconstruction(
     const BFMLoader& bfm,
     const Eigen::MatrixX3f& albedo,
@@ -684,9 +597,9 @@ static void runVideoReconstruction(
                 ScopedTimer t("personalise");
                 bool ok = false;
                 if (kBundlePersonalise) {
-                    // ── Multi-keyframe bundle: select yaw-diverse keyframes from
+                    // Multi-keyframe bundle: select yaw-diverse keyframes from
                     //    the sequence, gather their landmarks + depth, solve one
-                    //    shared identity jointly, then track the rest. ──
+                    // shared identity jointly, then track the rest.
                     std::vector<double> yaw(frames.size(),
                                             std::numeric_limits<double>::quiet_NaN());
                     std::vector<std::vector<LandmarkObservation>> allObs(frames.size());
@@ -726,7 +639,7 @@ static void runVideoReconstruction(
                           << (kBundlePersonalise ? "BUNDLE" : "single-frame")
                           << " — identity + albedo fixed for the rest\n";
             } else {
-                // BOTH modes track from per-frame landmarks: they are the only
+                // both modes track from per-frame landmarks: they are the only
                 // data term that drives EXPRESSION (the depth cloud drives pose
                 // only — see fitPoseAndShapeContour). In rgbd mode a frame
                 // without landmarks still tracks pose from the cloud alone.
@@ -794,19 +707,10 @@ static void runVideoReconstruction(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MediaPipe landmark coprocess (live mode)
-// ─────────────────────────────────────────────────────────────────────────────
-// MediaPipe is Bazel-built and cannot link into this binary, and the offline
-// pre-pass files obviously don't exist for a camera stream. This client runs
-// python/mp_landmark_server.py as a child process and streams frames to it:
-//   stdin : 8-byte header (int32 width, int32 height) + raw BGR bytes
-//   stdout: "N\n" then N lines "bfm_vertex_index u v"  (-1 = jaw contour)
-// giving live the SAME 21-interior + 14-jaw landmark set as the offline
-// MediaPipe path — the 5-point YuNet set is nearly coplanar (no chin/brows/eye
-// corners), which is what left live pitch/identity so weakly constrained.
-// Falls back cleanly: if no python with mediapipe is found, start() fails and
-// the caller keeps using the in-process YuNet detector.
+// Live MediaPipe landmarks via a child process (mp_landmark_server.py): stream
+// frames on stdin (int32 w,h header + BGR bytes), read back "vertexIndex u v"
+// lines (-1 = jaw contour). Falls back to the in-process YuNet detector if
+// start() fails (e.g. no python with mediapipe installed).
 class MpLandmarkStream {
 public:
     ~MpLandmarkStream() { stop(); }
@@ -923,9 +827,7 @@ private:
     FILE* rx_  = nullptr;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Realtime camera mode (--mode live) — HOST ONLY (Docker has no camera access)
-// ─────────────────────────────────────────────────────────────────────────────
 struct LiveOptions {
     int         camera        = 0;      // --camera
     std::string source;                 // --live-source: video file / image seq
@@ -946,15 +848,10 @@ struct LiveOptions {
     std::string transferTarget;
 };
 
-// Open the driving input — a --live-source image/video, or a live camera — and
-// return the first usable frame in `firstFrame`. Shared by live-cpu and the
-// transfer driver. For a live device this warms the stream up and falls back
-// over device indices, handling the macOS/AVFoundation quirks:
-//  - a stream opened before the camera-permission dialog is answered delivers
-//    BLACK frames until re-opened;
-//  - device 0 is often an inactive iPhone Continuity Camera (black forever);
-//  - forcing FRAME_WIDTH/HEIGHT can blank the stream, so we take native size.
-// `who` tags the diagnostics ("live" / "transfer"). Returns false on failure.
+// Open the driving input (--live-source image/video, or a camera) and return the
+// first usable frame. Warms the camera up and falls back over device indices to
+// dodge macOS/AVFoundation quirks (black frames before the permission dialog,
+// Continuity Camera on device 0, native size only). Returns false on failure.
 static bool openLiveCapture(cv::VideoCapture& cap, const LiveOptions& lo,
                             cv::Mat& firstFrame, const char* who)
 {
@@ -1025,12 +922,10 @@ static FaceTracker::Config liveConfig(double sparseReg, const LiveOptions& lo)
     return tc;
 }
 
-// Personalisation quality gate: the identity (and, with --optimize-focal, the
-// focal) is fitted ONCE and kept for the whole session, so refusing a turned
-// or tiny first face is much cheaper than living with a mis-personalised
-// model. Yaw proxy: on a frontal face the nose tip sits near the horizontal
-// midpoint of the pupils; under yaw it shifts toward one eye. Both the YuNet
-// and MediaPipe sets carry these three vertices (4540/11681 pupils, 8156 nose).
+// Personalise-quality gate: identity (and optional focal) is fit once and kept
+// for the whole session, so refusing a turned/tiny first face is cheap insurance.
+// Yaw proxy: the nose tip sits near the pupil midpoint when frontal and shifts
+// toward one eye under yaw (pupils 4540/11681, nose 8156 in both landmark sets).
 static bool frontalEnough(const std::vector<LandmarkObservation>& obs)
 {
     Eigen::Vector2d nose(-1, -1), eyeR(-1, -1), eyeL(-1, -1);
@@ -1078,14 +973,10 @@ static cv::Mat drawKeypointsDebug(const cv::Mat&                          frame,
     return out;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ENTRY POINT: live-cpu / live-gpu — realtime reconstruction from the camera.
-// ─────────────────────────────────────────────────────────────────────────────
-// Generic over the DISPLAY renderer: Renderer (CPU) or CudaRenderer (GPU); both
-// share the same ctor + render() contract, so the camera/track loop is one body.
-// Tracking + photometric still run on the CPU renderer inside FaceTracker; only
-// the overlay render is swapped here. (--photo-gpu additionally moves the
-// photometric SOLVE to the GPU, for any renderer choice.)
+// Realtime reconstruction from the camera. Templated on the display renderer
+// (CPU Renderer or CudaRenderer); tracking + photometric stay on the CPU inside
+// FaceTracker, only the overlay render is swapped. --photo-gpu moves the
+// photometric solve to the GPU as well.
 template <class RendererT>
 static void runLiveImpl(const BFMLoader& bfm, double sparseReg, const LiveOptions& lo)
 {
@@ -1103,11 +994,9 @@ static void runLiveImpl(const BFMLoader& bfm, double sparseReg, const LiveOption
               << " px" << (lo.optimizeFocal ? " (optimised during personalise)" : "")
               << "\n      keys: q quit | p re-personalise | s snapshot\n";
 
-    // Landmark source. Preferred: the MediaPipe coprocess (same dense 21+14
-    // landmark set as the offline modes — chin/brows/eye corners are what make
-    // pitch and identity observable; YuNet's 5 points are nearly coplanar).
-    // Used by default and for --detector mediapipe; an explicit
-    // --detector yunet|lbf skips it. YuNet stays as the automatic fallback.
+    // Landmark source. Default: the MediaPipe coprocess (same dense 21+14 set as
+    // the offline modes — chin/brows/eye corners make pitch and identity
+    // observable). An explicit --detector yunet|lbf skips it; YuNet is the fallback.
     MpLandmarkStream mpStream;
     if (kDetector == "mediapipe" || !kDetectorExplicit) {
         if (!mpStream.start())
@@ -1253,26 +1142,15 @@ static void runLiveImpl(const BFMLoader& bfm, double sparseReg, const LiveOption
     std::cout << '\n';
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ENTRY POINT: transfer — live EXPRESSION TRANSFER (Face2Face §7, our variant)
-// ─────────────────────────────────────────────────────────────────────────────
-// The named Biwi subject is personalised ONCE as the target avatar; your live
-// camera then drives its expressions. Because the BFM expression basis is a
-// single GLOBAL additive basis (shape = mean + B_id·α + B_exp·δ), transfer is a
-// coefficient copy — no per-person deformation transfer (the paper needs that
-// only for identity-specific blendshapes). We use NEUTRAL-RELATIVE transfer:
-//   δ_target = δ_target_neutral + (δ_you − δ_you_neutral)
-// so each face keeps its own resting shape and only the CHANGE is transferred.
-// Expression-only: the target stays frontal; only the face articulates.
-// Generic over the DISPLAY renderer (Renderer=CPU, CudaRenderer=GPU) so the
-// avatar panels can render on the GPU for the video/live transfer — selected by
-// --gpu-render (requires a USE_CUDA build). Fitting stays as in the CPU path;
-// --photo-gpu additionally moves the one-off personalise photometric to the GPU.
+// Live expression transfer: personalise the target avatar once, then drive its
+// expression from the webcam via a neutral-relative delta copy
+//   δ_target = δ_target_neutral + (δ_driver − δ_driver_neutral).
+// Templated on the display renderer so --gpu-render can draw the avatar on CUDA.
 template <class RendererT>
 static void runTransferLive(const BFMLoader& bfm, double sparseReg,
                             const LiveOptions& lo)
 {
-    // ── 1. Personalise the TARGET avatar (Biwi frame 0, + depth) ─────────────
+    // 1. Personalise the TARGET avatar (Biwi frame 0, + depth)
     Eigen::VectorXd  tgtAlpha, tgtNeutral;
     Eigen::MatrixX3f tgtAlbedo;
     light::SHCoeffs  tgtSh;
@@ -1311,7 +1189,7 @@ static void runTransferLive(const BFMLoader& bfm, double sparseReg,
         std::cerr << "transfer: target load failed: " << e.what() << '\n'; return;
     }
 
-    // ── 2. Camera / source for the DRIVING actor (you) ───────────────────────
+    // 2. Camera / source for the DRIVING actor (you)
     cv::VideoCapture cap; cv::Mat raw;
     if (!openLiveCapture(cap, lo, raw, "transfer")) return;
     cv::Mat frame = resizeToWidth(raw, lo.width);
@@ -1432,9 +1310,7 @@ static void runTransferLive(const BFMLoader& bfm, double sparseReg,
     std::cout << '\n';
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // ENTRY POINTS: live-cpu / live-gpu — thin wrappers over runLiveImpl<>.
-// ─────────────────────────────────────────────────────────────────────────────
 static void runLiveCpu(const BFMLoader& bfm, double sparseReg, const LiveOptions& lo)
 {
     runLiveImpl<Renderer>(bfm, sparseReg, lo);
@@ -1566,15 +1442,11 @@ static void renderMeanFace(const BFMLoader&         bfm,
     writeColourImage(r, dbg + "/render_image.png");
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Biwi: sparse + dense in the SAME camera system
-// ─────────────────────────────────────────────────────────────────────────────
+// Biwi: sparse + dense in the same camera system
 
-// Sparse landmark fit on the Biwi RGB frame, using the real rgb.cal intrinsics.
+// Sparse landmark fit on the Biwi RGB frame using the real rgb.cal intrinsics.
 // The pose is metric and transfers into the depth camera via the extrinsics
-// (see fitDenseOnBiwi). Landmarks per frame (once, in the container):
-//   python3 python/gen_landmarks.py --set dense
-//           data/biwi/01/frame_00003_rgb.png data/biwi/01/landmarks_00003.txt
+// (see fitDenseOnBiwi). Landmarks come from the per-frame pre-pass files.
 static std::optional<FitParameters> fitSparseOnBiwi(
     const BFMLoader&        bfm,
     const Eigen::MatrixX3f& meanShape,
@@ -1613,9 +1485,6 @@ static std::optional<FitParameters> fitSparseOnBiwi(
         const Eigen::MatrixX3f fittedShape =
             bfm.shape(poseAndShape.shapeCoefficients.cast<float>());
 
-        saveCurrentModel(outDir("biwi_sparse") + "/fitted_face.obj",
-                         fittedShape, bfm.faces(), albedo);
-
         writeFitOutputs("sparse", frame.rgb, bfm, fittedShape, albedo,
                         cal.K_rgb, poseAndShape.pose, /*tag=*/"biwi",
                         &observations);
@@ -1644,12 +1513,9 @@ static std::optional<FitParameters> fitSparseOnBiwi(
     }
 }
 
-// Dense ICP fit on the Biwi depth frame:
-//   1. head centre = ground truth from *_pose.txt.
-//   2. sparseInit is transformed into the depth camera via the extrinsics
-//      (only possible with registered cameras).
-//   3. the result is also rendered into the RGB camera and blended over the
-//      photo — the "face copy on the image".
+// Dense ICP fit on the Biwi depth frame: head centre from the GT pose, sparseInit
+// transformed into the depth camera via the extrinsics, and the result rendered
+// back into the RGB camera and blended over the photo.
 static void fitDenseOnBiwi(const BFMLoader&        bfm,
                            const Eigen::MatrixX3f& meanShape,
                            const Eigen::MatrixX3f& albedo,
@@ -1743,11 +1609,10 @@ static void fitDenseOnBiwi(const BFMLoader&        bfm,
                 cv::imwrite(name.str(), progress);
             };
 
-        // Scale the regulariser WITH the point count: E_data grows linearly
-        // with the number of target points, E_reg does not. Biwi yields ~8700
-        // head points (vs ~600 before); a constant reg would rail ~10 coeffs.
-        // Base 150 (not 500): 500·N/600 flattens the shape back to ~1.4 mm from
-        // the mean; 150·N/600 gives ~5 mm real personalisation without railing.
+        // Scale the regulariser with the point count: E_data grows with the number
+        // of target points but E_reg does not, so a constant reg would rail the
+        // coefficients on Biwi's ~8700 head points. Base 150 personalises without
+        // flattening the shape back toward the mean.
         const double regWeight = 150.0 * (static_cast<double>(head.size()) / 600.0);
 
         const FitParameters dense = CeresFitter::fitDense(
@@ -1762,15 +1627,8 @@ static void fitDenseOnBiwi(const BFMLoader&        bfm,
         const Eigen::MatrixX3f fitted =
             bfm.shape(dense.shapeCoefficients.cast<float>());
 
-        saveCurrentModel(outDir("biwi_dense") + "/fitted_face.obj",
-                         fitted, bfm.faces(), albedo);
-
         const Eigen::Matrix3f R = dense.pose.rotationMatrix();
         const Eigen::Vector3f t = dense.pose.translation.cast<float>();
-        const Eigen::MatrixX3f posedCam = proj::toCameraFrame(fitted, R, t);
-        saveCurrentModel(outDir("biwi_dense") + "/fitted_face_camframe.obj",
-                         posedCam, bfm.faces(), albedo);
-        savePointCloud(outDir("biwi_dense") + "/head_cloud.obj", head);
 
         // Overlay 1: depth camera.
         RenderInput depthInput{
@@ -1842,9 +1700,7 @@ static void fitDenseOnBiwi(const BFMLoader&        bfm,
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // CLI usage (Biwi is the only dataset).
-// ─────────────────────────────────────────────────────────────────────────────
 static void printUsage()
 {
     std::cerr <<
@@ -1888,7 +1744,7 @@ static void printUsage()
 
 int main(int argc, char** argv)
 {
-    // ── CLI ──
+    // CLI
     std::string mode      = "rgb";                 // see printUsage()
     double      sparseReg = kDefaultSparseReg;     // --sparse-reg
     int         icpIters  = 30;                     // --icp-iters (dense/full)
@@ -1910,7 +1766,7 @@ int main(int argc, char** argv)
             kDetector = argv[++i];
             kDetectorExplicit = true;
         }
-        // ── live / realtime flags ──
+        // live / realtime flags
         else if (arg == "--camera" && i + 1 < argc) live.camera = std::stoi(argv[++i]);
         else if (arg == "--live-source" && i + 1 < argc) live.source = argv[++i];
         else if (arg == "--live-width" && i + 1 < argc) live.width = std::stoi(argv[++i]);
@@ -1967,7 +1823,7 @@ int main(int argc, char** argv)
     std::cout << "BFM: " << meanShape.rows() << " vertices, "
               << bfm.faces().rows() << " triangles\nMode: " << mode << '\n';
 
-    // ── mode dispatch: one clear entry point per mode ──
+    // mode dispatch: one clear entry point per mode
     if (mode == "rgb" || mode == "rgbd") {
         runVideoReconstruction(bfm, albedo, numFrames, sparseReg,
                                /*useDepth=*/mode == "rgbd");
